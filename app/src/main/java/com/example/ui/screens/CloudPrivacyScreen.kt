@@ -50,6 +50,10 @@ import java.util.Locale
 @Composable
 fun CloudPrivacyScreen(
     hudState: LiveGazeHudState,
+    currentUserId: String = "",
+    currentUserEmail: String = "",
+    currentUserName: String = "",
+    firestoreDatabaseId: String = "",
     profilesState: UiDataState<List<CalibrationProfile>>,
     sessionsState: UiDataState<List<TrackingSession>>,
     onToggleCloudSync: (Boolean) -> Unit,
@@ -67,7 +71,7 @@ fun CloudPrivacyScreen(
             .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // Biometric Privacy, On-Device Persistence & Cloud Sync Control Card
+        // Biometric Privacy, Authenticated Google Session & Cloud Sync Control Card
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -92,13 +96,13 @@ fun CloudPrivacyScreen(
                         Spacer(modifier = Modifier.width(10.dp))
                         Column {
                             Text(
-                                text = "Cloud Firestore Sync + On-Device Vault",
+                                text = "Google Sign-In Session + Cloud Firestore",
                                 style = MaterialTheme.typography.titleMedium,
                                 color = MaterialTheme.colorScheme.onSurface
                             )
                             Text(
                                 text = if (hudState.cloudSyncEnabled) {
-                                    "Active: Profiles & session analytics sync to Firestore AND local storage."
+                                    "Active: User-scoped profiles & sessions sync to Firestore AND local vault."
                                 } else {
                                     "Paused: Profiles & sessions persist privately on-device across restarts."
                                 },
@@ -112,6 +116,45 @@ fun CloudPrivacyScreen(
                         onCheckedChange = onToggleCloudSync,
                         modifier = Modifier.testTag("cloud_sync_toggle")
                     )
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
+                        .padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(3.dp)
+                ) {
+                    val accountHeader = buildString {
+                        if (currentUserName.isNotBlank()) append("$currentUserName • ")
+                        if (currentUserEmail.isNotBlank()) append(currentUserEmail) else append("Authenticated Google Account")
+                    }
+                    Text(
+                        text = accountHeader,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.secondary
+                    )
+                    Text(
+                        text = "FirebaseAuth UID: ${currentUserId.ifBlank { "active-session" }}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = "Scoped Paths: /users/${currentUserId.take(10)}…/calibrations & /sessions",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (firestoreDatabaseId.isNotBlank()) {
+                        Text(
+                            text = "Firestore DB: $firestoreDatabaseId",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(12.dp))
@@ -224,7 +267,7 @@ fun CloudPrivacyScreen(
                                             Text(
                                                 text = String.format(
                                                     Locale.US,
-                                                    "%s • Mean ±%.1f%% (~%.1fmm) • Worst ±%.1f%%",
+                                                    "%s • Mean ±%.1f%% (approx. ~%.1fmm) • Worst ±%.1f%%",
                                                     profile.deviceModel,
                                                     profile.meanErrorPct,
                                                     profile.meanErrorMm,

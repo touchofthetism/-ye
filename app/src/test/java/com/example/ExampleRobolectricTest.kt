@@ -133,4 +133,39 @@ class ExampleRobolectricTest {
         assertEquals("Offline Pixel 10 Pro XL Profile", loaded.first().name)
         assertEquals(12.4, loaded.first().maxErrorPct, 0.01)
     }
+
+    @Test
+    fun `pixel10ProXl resolution tiers and lowLightDegraded iris damping behave as specified`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val dbId = context.getString(R.string.firestore_database_id)
+        assertTrue(dbId.isNotBlank())
+
+        assertEquals(1280, com.example.data.model.AnalysisResolutionTier.TIER_HIGH_1280.targetWidth)
+        assertEquals(960, com.example.data.model.AnalysisResolutionTier.TIER_MED_960.targetWidth)
+        assertEquals(640, com.example.data.model.AnalysisResolutionTier.TIER_LOW_640.targetWidth)
+
+        val brightFeature = GazeFeatureVector(
+            gx = 0.25,
+            gy = -0.20,
+            yaw = 8.0,
+            pitch = -5.0,
+            ambientLuma = 148,
+            isLowLightDegraded = false
+        )
+        val dimFeature = brightFeature.copy(
+            ambientLuma = 38,
+            isLowLightDegraded = true
+        )
+
+        val brightVec = brightFeature.toStandardizedFeatureArray(148.0)
+        val dimVec = dimFeature.toStandardizedFeatureArray(148.0)
+
+        // In low-light degraded mode (no IR illuminator on Pixel 10 Pro XL),
+        // noisy visible-light iris offsets (gx, gy) are damped by 0.45x while 3D head pose is preserved
+        assertEquals(brightVec[1] * 0.45, dimVec[1], 1e-4)
+        assertEquals(brightVec[2] * 0.45, dimVec[2], 1e-4)
+        assertEquals(brightVec[3], dimVec[3], 1e-6)
+        assertEquals(brightVec[4], dimVec[4], 1e-6)
+    }
 }
+

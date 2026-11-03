@@ -5,6 +5,7 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.model.AacActionTile
+import com.example.data.model.AnalysisResolutionTier
 import com.example.data.model.BlinkType
 import com.example.data.model.CalibrationProfile
 import com.example.data.model.DEFAULT_AFFINE_MATRIX_2X6
@@ -77,6 +78,7 @@ data class LiveGazeHudState(
     val hasDistanceDriftWarning: Boolean = false,
     val showRecalibrateNudge: Boolean = false,
     val isPerformanceModeActive: Boolean = false,
+    val resolutionTier: com.example.data.model.AnalysisResolutionTier = com.example.data.model.AnalysisResolutionTier.TIER_HIGH_1280,
     val isSimulatorProxyEnabled: Boolean = false,
     val cloudSyncEnabled: Boolean = false,
     val activeProfileName: String = "Pixel 10 Pro XL Default",
@@ -84,7 +86,7 @@ data class LiveGazeHudState(
     val activeErrorRadiusPct: Float = 10.9f,
     val activeMaxQuadrantErrorPct: Float = 14.2f,
     val activeErrorMm: Double = 13.4,
-    val analyzerFps: Int = 14,
+    val analyzerFps: Int = 15,
     val dwellTriggerMs: Long = 1100L,
     val focusedTileId: String? = null,
     val focusedTileDwellProgress: Float = 0f,
@@ -211,9 +213,11 @@ class EyeTrackingViewModel(
     private var displayWidthMm: Double = GazeCalibrationMath.PIXEL_10_PRO_XL_WIDTH_MM
     private var displayHeightMm: Double = GazeCalibrationMath.PIXEL_10_PRO_XL_HEIGHT_MM
 
-    // Frame cadence, thermal FPS guard & edge-pinning drift tracker
+    // Frame cadence, <15 FPS resolution auto-step-down (1280 -> 960 -> 640), thermal guard & edge-pinning tracker
     private var lastFrameTimestampMs: Long = 0L
-    private var smoothedFrameIntervalMs: Double = 70.0 // ~14 FPS initial estimate
+    private var smoothedFrameIntervalMs: Double = 66.0
+    private var below15FpsDurationMs: Long = 0L
+    private var lastResolutionStepChangeMs: Long = 0L
     private var lowFpsDurationMs: Long = 0L
     private var sessionBaselineFps: Double = 15.0
     private var edgePinnedDurationMs: Long = 0L
@@ -277,6 +281,9 @@ class EyeTrackingViewModel(
         if (localInitial != null) {
             applyProfileToEngine(localInitial)
         }
+        if (isRunningOnEmulatorHardware()) {
+            startOrUpdateSyntheticTicker(forceRun = true)
+        }
     }
 
     fun setTriggerMode(mode: com.example.data.model.GazeTriggerMode) {
@@ -288,6 +295,15 @@ class EyeTrackingViewModel(
         val current = _liveHudState.value.overlayVisualMode
         val next = modes[(modes.indexOf(current) + 1) % modes.size]
         _liveHudState.update { it.copy(overlayVisualMode = next) }
+    }
+
+    fun cycleAnalysisResolutionTier() {
+        val tiers = com.example.data.model.AnalysisResolutionTier.entries
+        val current = _liveHudState.value.resolutionTier
+        val next = tiers[(tiers.indexOf(current) + 1) % tiers.size]
+        below15FpsDurationMs = 0L
+        lastResolutionStepChangeMs = System.currentTimeMillis()
+        _liveHudState.update { it.copy(resolutionTier = next) }
     }
 
     fun calibrateNeutralBrowBaseline() {
@@ -378,8 +394,12 @@ class EyeTrackingViewModel(
 
     fun toggleSimulatorProxyMode(enabled: Boolean) {
         _liveHudState.update { it.copy(isSimulatorProxyEnabled = enabled) }
+        startOrUpdateSyntheticTicker(forceRun = enabled || isRunningOnEmulatorHardware())
+    }
+
+    private fun startOrUpdateSyntheticTicker(forceRun: Boolean) {
         simulatorTickerJob?.cancel()
-        if (enabled) {
+        if (forceRun) {
             simulatorTickerJob = viewModelScope.launch {
                 while (true) {
                     delay(66L) // ~15 FPS realistic cadence
@@ -397,13 +417,15 @@ class EyeTrackingViewModel(
     }
 
     fun updateSimulatorGazeTarget(normX: Float, normY: Float, simulatedEyeOpen: Float = 0.92f) {
-        if (!_liveHudState.value.isSimulatorProxyEnabled) {
+        if (!_liveHudState.value.isSimulatorProxyEnabled && !isRunningOnEmulatorHardware()) {
             toggleSimulatorProxyMode(true)
         }
         val syntheticGx = ((normX - 0.5f) * 0.42f).toDouble()
         val syntheticGy = ((normY - 0.5f) * 0.36f).toDouble()
-        val syntheticYaw = ((0.5f - normX) * 14f).toDouble()
-        val syntheticPitch = ((0.5f - normY) * 12f).toDouble()
+        val syntheticYaw = ((normX - 0.5f) * 14f).toDouble()
+        val syntheticPitch = ((normY - 0.5f) * 12f).toDouble()
+        val shiftX = (normX - 0.5f) * 0.07f
+        val shiftY = (normY - 0.5f) * 0.05f
         val vec = GazeFeatureVector(
             gx = syntheticGx,
             gy = syntheticGy,
@@ -418,6 +440,14 @@ class EyeTrackingViewModel(
             browToEyeRatio = browDetector.neutralBrowRatio,
             hasGlareWarning = false,
             faceDetected = true,
+            leftEyeNormX = 0.38f,
+            leftEyeNormY = 0.42f,
+            rightEyeNormX = 0.62f,
+            rightEyeNormY = 0.42f,
+            leftPupilNormX = (0.38f + shiftX).coerceIn(0.32f, 0.44f),
+            leftPupilNormY = (0.42f + shiftY).coerceIn(0.37f, 0.47f),
+            rightPupilNormX = (0.62f + shiftX).coerceIn(0.56f, 0.68f),
+            rightPupilNormY = (0.42f + shiftY).coerceIn(0.37f, 0.47f),
             timestampMs = System.currentTimeMillis()
         )
         processIncomingFeatureFrame(vec)
@@ -450,6 +480,37 @@ class EyeTrackingViewModel(
             lowFpsDurationMs >= 3000L || thermalDrop -> true
             liveFps >= 20 -> false
             else -> prev.isPerformanceModeActive
+        }
+
+        // Pixel 10 Pro XL FPS Honesty & Thermal Endurance (20+ min session):
+        // Auto-step the analysis resolution down (1280x960 -> 960x720 -> 640x480) whenever
+        // measured analysis rate drops below 15 FPS for >2.5s or thermal throttling is detected.
+        below15FpsDurationMs = if (liveFps < 15 && !prev.isSimulatorProxyEnabled) {
+            (below15FpsDurationMs + dtMs).coerceAtMost(20000L)
+        } else {
+            (below15FpsDurationMs - dtMs / 2).coerceAtLeast(0L)
+        }
+        val canStepResolution = (now - lastResolutionStepChangeMs) >= 6000L
+        val nextTier = if (canStepResolution && (below15FpsDurationMs >= 2500L || thermalDrop)) {
+            when (prev.resolutionTier) {
+                AnalysisResolutionTier.TIER_HIGH_1280 -> {
+                    lastResolutionStepChangeMs = now
+                    below15FpsDurationMs = 0L
+                    _statusBannerMessage.value =
+                        "FPS < 15 (${liveFps} FPS): Auto-stepping camera analysis 1280×960 → 960×720 for Tensor G5 thermal headroom."
+                    AnalysisResolutionTier.TIER_MED_960
+                }
+                AnalysisResolutionTier.TIER_MED_960 -> {
+                    lastResolutionStepChangeMs = now
+                    below15FpsDurationMs = 0L
+                    _statusBannerMessage.value =
+                        "Sustained load (${liveFps} FPS): Auto-stepping camera analysis 960×720 → 640×480 for 20+ min thermal stability."
+                    AnalysisResolutionTier.TIER_LOW_640
+                }
+                AnalysisResolutionTier.TIER_LOW_640 -> AnalysisResolutionTier.TIER_LOW_640
+            }
+        } else {
+            prev.resolutionTier
         }
 
         val (rawPredX, rawPredY) = GazeCalibrationMath.projectGaze(
@@ -545,14 +606,18 @@ class EyeTrackingViewModel(
         val showNudge = edgePinnedDurationMs >= 4000L
 
         val dwellProgress = updateTileHoverDwell(now)
-        val updatedTrail = updateLiveHeatmapTrail(
-            prevTrail = prev.liveTrailPoints,
-            normX = smoothedX,
-            normY = smoothedY,
-            faceDetected = feature.faceDetected,
-            nowMs = now,
-            dtMs = dtMs
-        )
+        val updatedTrail = if (prev.overlayVisualMode == com.example.data.model.GazeOverlayVisualMode.RETICLE_ONLY) {
+            if (prev.liveTrailPoints.isEmpty()) prev.liveTrailPoints else emptyList()
+        } else {
+            updateLiveHeatmapTrail(
+                prevTrail = prev.liveTrailPoints,
+                normX = smoothedX,
+                normY = smoothedY,
+                faceDetected = feature.faceDetected,
+                nowMs = now,
+                dtMs = dtMs
+            )
+        }
 
         _liveHudState.update {
             it.copy(
@@ -569,6 +634,7 @@ class EyeTrackingViewModel(
                 hasDistanceDriftWarning = hasDrift,
                 showRecalibrateNudge = showNudge,
                 isPerformanceModeActive = perfMode,
+                resolutionTier = nextTier,
                 analyzerFps = liveFps,
                 focusedTileDwellProgress = dwellProgress
             )
@@ -583,7 +649,7 @@ class EyeTrackingViewModel(
     /**
      * Maintains a rolling real-time thermal gaze trail where dwelling near an existing node
      * accumulates thermal intensity (Cyan -> Emerald -> Amber -> Crimson) and older nodes
-     * decay smoothly over a 4.5-second window.
+     * decay smoothly over a 4.8-second window with minimal list allocations.
      */
     private fun updateLiveHeatmapTrail(
         prevTrail: List<com.example.data.model.LiveGazeTrailPoint>,
@@ -594,15 +660,16 @@ class EyeTrackingViewModel(
         dtMs: Long
     ): List<com.example.data.model.LiveGazeTrailPoint> {
         val decayFactor = kotlin.math.exp(-dtMs.toDouble() / 2400.0).toFloat().coerceIn(0.82f, 0.99f)
-        val decayed = prevTrail.mapNotNull { pt ->
+        val decayed = ArrayList<com.example.data.model.LiveGazeTrailPoint>(minOf(prevTrail.size + 1, 32))
+        val startIndex = (prevTrail.size - 32).coerceAtLeast(0)
+        for (i in startIndex until prevTrail.size) {
+            val pt = prevTrail[i]
             val age = nowMs - pt.timestampMs
             val nextIntensity = pt.intensity * decayFactor
             if (age <= 4800L && nextIntensity >= 0.08f) {
-                pt.copy(intensity = nextIntensity)
-            } else {
-                null
+                decayed.add(pt.copy(intensity = nextIntensity))
             }
-        }.toMutableList()
+        }
 
         if (!faceDetected) return decayed
 
@@ -619,10 +686,13 @@ class EyeTrackingViewModel(
                     intensity = boosted,
                     timestampMs = nowMs
                 )
-                return decayed.takeLast(32)
+                return decayed
             }
         }
 
+        if (decayed.size >= 32) {
+            decayed.removeAt(0)
+        }
         decayed.add(
             com.example.data.model.LiveGazeTrailPoint(
                 normX = normX,
@@ -631,7 +701,7 @@ class EyeTrackingViewModel(
                 timestampMs = nowMs
             )
         )
-        return decayed.takeLast(32)
+        return decayed
     }
 
     fun updateFocusedTile(tileId: String?) {
@@ -946,6 +1016,9 @@ class EyeTrackingViewModel(
 
         val dt = (nowMs - lastAttentionSampleMs).coerceIn(16L, 250L)
         lastAttentionSampleMs = nowMs
+        if (rawSessionGazeSamples.size >= MAX_SESSION_GAZE_SAMPLES) {
+            rawSessionGazeSamples.subList(0, 600).clear()
+        }
         rawSessionGazeSamples.add(Triple(normX, normY, nowMs))
 
         val topAdd = if (normY < 0.34f) dt else 0L
@@ -1140,5 +1213,30 @@ class EyeTrackingViewModel(
         const val STOP_TIMEOUT_MILLIS = 5000L
         const val SETTLING_DELAY_MS = 400L
         const val SAMPLES_PER_TARGET = 18
+        const val MAX_SESSION_GAZE_SAMPLES = 3600
     }
+}
+
+fun isRunningOnEmulatorHardware(): Boolean {
+    val fingerprint = (Build.FINGERPRINT ?: "").lowercase()
+    val model = (Build.MODEL ?: "").lowercase()
+    val hardware = (Build.HARDWARE ?: "").lowercase()
+    val product = (Build.PRODUCT ?: "").lowercase()
+    val brand = (Build.BRAND ?: "").lowercase()
+    val device = (Build.DEVICE ?: "").lowercase()
+    return fingerprint.startsWith("generic") ||
+        fingerprint.contains("emulator") ||
+        fingerprint.contains("sdk_gphone") ||
+        model.contains("google_sdk") ||
+        model.contains("emulator") ||
+        model.contains("sdk_gphone") ||
+        model.contains("android sdk built for") ||
+        hardware.contains("goldfish") ||
+        hardware.contains("ranchu") ||
+        hardware.contains("cuttlefish") ||
+        hardware.contains("vbox") ||
+        product.contains("sdk_gphone") ||
+        product.contains("emulator") ||
+        product.contains("simulator") ||
+        (brand.startsWith("generic") && device.startsWith("generic"))
 }

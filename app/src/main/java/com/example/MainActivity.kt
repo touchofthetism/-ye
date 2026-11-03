@@ -112,18 +112,29 @@ fun AppRootNavigation(auth: FirebaseAuth = Firebase.auth) {
     val user = currentUser
 
     if (user == null) {
-        AuthScreen(onAuthSuccess = {})
+        AuthScreen(onAuthSuccess = {}, auth = auth)
     } else {
-        AuthenticatedMainWorkbench(currentUserId = user.uid)
+        AuthenticatedMainWorkbench(
+            currentUserId = user.uid,
+            currentUserEmail = user.email.orEmpty(),
+            currentUserName = user.displayName.orEmpty(),
+            auth = auth
+        )
     }
 }
 
 @Composable
-fun AuthenticatedMainWorkbench(currentUserId: String) {
+fun AuthenticatedMainWorkbench(
+    currentUserId: String,
+    currentUserEmail: String = "",
+    currentUserName: String = "",
+    auth: FirebaseAuth = Firebase.auth
+) {
     val context = LocalContext.current
     val hostView = LocalView.current
     val coroutineScope = rememberCoroutineScope()
     val credentialManager = remember { CredentialManager.create(context) }
+    val firestoreDatabaseId = stringResource(R.string.firestore_database_id)
 
     val viewModel: EyeTrackingViewModel = viewModel(
         key = currentUserId,
@@ -184,8 +195,24 @@ fun AuthenticatedMainWorkbench(currentUserId: String) {
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         hasCameraPermission = granted
-        if (!granted) {
+        if (granted) {
+            viewModel.toggleSimulatorProxyMode(false)
+        } else {
             viewModel.toggleSimulatorProxyMode(true)
+        }
+    }
+
+    // Automatically request front-camera permission on first launch so physical devices lock immediately
+    LaunchedEffect(Unit) {
+        val currentlyGranted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
+        hasCameraPermission = currentlyGranted
+        if (currentlyGranted) {
+            viewModel.toggleSimulatorProxyMode(false)
+        } else {
+            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
         }
     }
 
@@ -276,6 +303,7 @@ fun AuthenticatedMainWorkbench(currentUserId: String) {
                     },
                     onToggleSimulator = { viewModel.toggleSimulatorProxyMode(it) },
                     onCycleOverlayMode = { viewModel.cycleOverlayVisualMode() },
+                    onCycleResolutionTier = { viewModel.cycleAnalysisResolutionTier() },
                     onSimulatorDragTarget = { nx, ny ->
                         viewModel.updateSimulatorGazeTarget(nx, ny)
                     },
@@ -363,6 +391,10 @@ fun AuthenticatedMainWorkbench(currentUserId: String) {
                         )
                         3 -> CloudPrivacyScreen(
                             hudState = hudState,
+                            currentUserId = currentUserId,
+                            currentUserEmail = currentUserEmail,
+                            currentUserName = currentUserName,
+                            firestoreDatabaseId = firestoreDatabaseId,
                             profilesState = profilesState,
                             sessionsState = sessionsState,
                             onToggleCloudSync = { viewModel.toggleCloudSync(it) },
@@ -379,7 +411,8 @@ fun AuthenticatedMainWorkbench(currentUserId: String) {
                                     context = context,
                                     credentialManager = credentialManager,
                                     onSignOutComplete = {},
-                                    scope = coroutineScope
+                                    scope = coroutineScope,
+                                    auth = auth
                                 )
                             }
                         )

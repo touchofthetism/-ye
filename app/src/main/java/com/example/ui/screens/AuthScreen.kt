@@ -68,6 +68,7 @@ import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential.Companion.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
 import com.google.firebase.Firebase
+import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.GoogleAuthProvider
 import com.google.firebase.auth.auth
 import kotlinx.coroutines.CoroutineScope
@@ -79,9 +80,10 @@ fun attemptAutoSignIn(
     credentialManager: CredentialManager,
     onAuthSuccess: () -> Unit,
     onUnauthenticated: () -> Unit,
-    scope: CoroutineScope
+    scope: CoroutineScope,
+    auth: FirebaseAuth = Firebase.auth
 ) {
-    if (Firebase.auth.currentUser != null) {
+    if (auth.currentUser != null) {
         onAuthSuccess()
         return
     }
@@ -102,12 +104,13 @@ fun attemptAutoSignIn(
 
     scope.launch {
         try {
-            val result = credentialManager.getCredential(context, request)
+            val activityContext = context as? Activity ?: context
+            val result = credentialManager.getCredential(activityContext, request)
             val credential = result.credential
             if (credential is CustomCredential && credential.type == TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
                 val googleIdToken = GoogleIdTokenCredential.createFrom(credential.data).idToken
                 val authCredential = GoogleAuthProvider.getCredential(googleIdToken, null)
-                Firebase.auth.signInWithCredential(authCredential).await()
+                auth.signInWithCredential(authCredential).await()
                 onAuthSuccess()
             } else {
                 onUnauthenticated()
@@ -124,7 +127,8 @@ fun onGoogleSignInClicked(
     onAuthSuccess: () -> Unit,
     onAuthError: (String) -> Unit,
     scope: CoroutineScope,
-    onAuthCancelled: () -> Unit = {}
+    onAuthCancelled: () -> Unit = {},
+    auth: FirebaseAuth = Firebase.auth
 ) {
     val clientId = try {
         context.getString(R.string.default_web_client_id)
@@ -144,7 +148,7 @@ fun onGoogleSignInClicked(
             if (credential is CustomCredential && credential.type == TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
                 val googleIdToken = GoogleIdTokenCredential.createFrom(credential.data).idToken
                 val authCredential = GoogleAuthProvider.getCredential(googleIdToken, null)
-                Firebase.auth.signInWithCredential(authCredential).await()
+                auth.signInWithCredential(authCredential).await()
                 onAuthSuccess()
             } else {
                 onAuthError("Unexpected credential type")
@@ -163,9 +167,10 @@ fun signOutUser(
     context: Context,
     credentialManager: CredentialManager,
     onSignOutComplete: () -> Unit,
-    scope: CoroutineScope
+    scope: CoroutineScope,
+    auth: FirebaseAuth = Firebase.auth
 ) {
-    Firebase.auth.signOut()
+    auth.signOut()
     scope.launch {
         try {
             credentialManager.clearCredentialState(ClearCredentialStateRequest())
@@ -179,21 +184,30 @@ fun signOutUser(
 
 @Composable
 fun AuthScreen(
-    onAuthSuccess: () -> Unit
+    onAuthSuccess: () -> Unit,
+    auth: FirebaseAuth = Firebase.auth
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val credentialManager = remember { CredentialManager.create(context) }
+    val firestoreDbId = remember {
+        try {
+            context.getString(R.string.firestore_database_id)
+        } catch (_: Exception) {
+            "firestore-named-db"
+        }
+    }
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(auth) {
         attemptAutoSignIn(
             context = context,
             credentialManager = credentialManager,
             onAuthSuccess = onAuthSuccess,
             onUnauthenticated = {},
-            scope = coroutineScope
+            scope = coroutineScope,
+            auth = auth
         )
     }
 
@@ -290,7 +304,7 @@ fun AuthScreen(
                         FeatureRow(
                             icon = Icons.Default.Lock,
                             title = stringResource(R.string.privacy_notice_title),
-                            desc = stringResource(R.string.privacy_notice_body)
+                            desc = "${stringResource(R.string.privacy_notice_body)} User-scoped Firestore collections (/users/{uid}/calibrations & /users/{uid}/sessions on DB $firestoreDbId)."
                         )
                     }
                 }
@@ -333,7 +347,8 @@ fun AuthScreen(
                             scope = coroutineScope,
                             onAuthCancelled = {
                                 isLoading = false
-                            }
+                            },
+                            auth = auth
                         )
                     },
                     enabled = !isLoading,

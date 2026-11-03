@@ -121,7 +121,7 @@ private fun CalibrationIdleOverview(
                     MetricBadgeCard(
                         label = "MEAN SCREEN ERR",
                         value = String.format(Locale.US, "±%.1f%%", hudState.activeErrorRadiusPct),
-                        sub = String.format(Locale.US, "~%.1f mm (approx)", hudState.activeErrorMm),
+                        sub = String.format(Locale.US, "~%.1f mm (approximate)", hudState.activeErrorMm),
                         modifier = Modifier.weight(1f)
                     )
                     MetricBadgeCard(
@@ -158,7 +158,7 @@ private fun CalibrationIdleOverview(
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
                 Text(
-                    text = "Live 6D Feature Vector Telemetry",
+                    text = "Live 6D Feature Vector & Pixel 10 Pro XL Telemetry",
                     style = MaterialTheme.typography.titleMedium,
                     color = MaterialTheme.colorScheme.primary
                 )
@@ -177,11 +177,14 @@ private fun CalibrationIdleOverview(
                 Text(
                     text = String.format(
                         Locale.US,
-                        "Eye Confidence: Left %.0f%% • Right %.0f%% | Inter-Ocular Dist: %.1f px | Eye Open: %.2f",
+                        "Eye Confidence: Left %.0f%% • Right %.0f%% | IOD: %.1f px | Eye Open: %.2f | Tier: %s | Luma: %d/255%s",
                         f.leftEyeConfidence * 100f,
                         f.rightEyeConfidence * 100f,
                         f.eyeDistancePx,
-                        f.combinedEyeOpenProb
+                        f.combinedEyeOpenProb,
+                        hudState.resolutionTier.shortLabel,
+                        f.ambientLuma,
+                        if (f.isLowLightDegraded) " (LOW-LIGHT DEGRADED)" else ""
                     ),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -344,7 +347,7 @@ private fun CalibrationValidationSummaryCard(
                     MetricBadgeCard(
                         label = "MEAN SCREEN ERROR",
                         value = String.format(Locale.US, "±%.1f%%", calibrationState.validationMeanErrorPct),
-                        sub = String.format(Locale.US, "~%.1f mm (approx)", calibrationState.validationMeanErrorMm),
+                        sub = String.format(Locale.US, "~%.1f mm (approximate)", calibrationState.validationMeanErrorMm),
                         modifier = Modifier.weight(1f)
                     )
                     MetricBadgeCard(

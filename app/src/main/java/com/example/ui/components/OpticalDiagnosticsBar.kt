@@ -1,8 +1,12 @@
 package com.example.ui.components
 
+import android.util.Size
+import android.view.View
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedVisibility
@@ -75,10 +79,12 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.example.data.model.AnalysisResolutionTier
 import com.example.data.model.GazeFeatureVector
 import com.example.data.model.GazeOverlayVisualMode
 import com.example.domain.CameraGazeAnalyzerEngine
 import com.example.ui.viewmodel.LiveGazeHudState
+import com.example.ui.viewmodel.isRunningOnEmulatorHardware
 import java.util.concurrent.Executors
 import kotlin.math.roundToInt
 
@@ -89,6 +95,7 @@ fun OpticalDiagnosticsBar(
     onRequestCameraPermission: () -> Unit,
     onToggleSimulator: (Boolean) -> Unit,
     onCycleOverlayMode: () -> Unit = {},
+    onCycleResolutionTier: () -> Unit = {},
     onSimulatorDragTarget: (Float, Float) -> Unit,
     onSimulateCommandBlink: () -> Unit,
     onSimulateBrowRaise: () -> Unit = {},
@@ -97,6 +104,7 @@ fun OpticalDiagnosticsBar(
     onFeatureFrame: (GazeFeatureVector) -> Unit
 ) {
     var showSimulatorPad by remember { mutableStateOf(false) }
+    var expandCameraPreview by remember { mutableStateOf(true) }
 
     Card(
         modifier = Modifier
@@ -115,57 +123,45 @@ fun OpticalDiagnosticsBar(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.weight(1f)
                 ) {
-                    if (hasCameraPermission && !hudState.isSimulatorProxyEnabled) {
-                        MiniFrontCameraPreview(
-                            isPerformanceMode = hudState.isPerformanceModeActive,
-                            onFeatureFrame = onFeatureFrame,
-                            modifier = Modifier
-                                .size(48.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .border(1.5.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(10.dp))
-                        )
-                        Spacer(modifier = Modifier.width(10.dp))
-                    } else {
-                        Box(
-                            modifier = Modifier
-                                .size(44.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(MaterialTheme.colorScheme.surfaceVariant),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = if (hudState.isSimulatorProxyEnabled) Icons.Default.TouchApp else Icons.Default.CameraFront,
-                                contentDescription = "Sensor source",
-                                tint = MaterialTheme.colorScheme.primary
+                    Box(
+                        modifier = Modifier
+                            .size(10.dp)
+                            .clip(CircleShape)
+                            .background(
+                                if (hudState.rawFeature.faceDetected) MaterialTheme.colorScheme.secondary
+                                else MaterialTheme.colorScheme.tertiary
                             )
-                        }
-                        Spacer(modifier = Modifier.width(10.dp))
-                    }
-
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
                     Column {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(8.dp)
-                                    .clip(CircleShape)
-                                    .background(
-                                        if (hudState.rawFeature.faceDetected) MaterialTheme.colorScheme.secondary
-                                        else MaterialTheme.colorScheme.tertiary
-                                    )
-                            )
                             Text(
                                 text = if (hudState.isSimulatorProxyEnabled) {
                                     "SIM PROXY • ${hudState.analyzerFps} FPS"
                                 } else if (hudState.rawFeature.faceDetected) {
                                     "OPTICAL LOCK • ${hudState.analyzerFps} FPS"
                                 } else {
-                                    "SEARCHING FACE..."
+                                    "SEARCHING FACE... • ${hudState.analyzerFps} FPS"
                                 },
                                 style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "${hudState.resolutionTier.targetWidth}×${hudState.resolutionTier.targetHeight}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.16f))
+                                    .pointerInput(Unit) {
+                                        detectTapGestures { onCycleResolutionTier() }
+                                    }
+                                    .padding(horizontal = 5.dp, vertical = 1.dp)
+                                    .testTag("resolution_tier_badge")
                             )
                             if (hudState.rawFeature.isSingleEyeMode) {
                                 Text(
@@ -193,7 +189,7 @@ fun OpticalDiagnosticsBar(
                         val lConf = (hudState.rawFeature.leftEyeConfidence * 100).roundToInt()
                         val rConf = (hudState.rawFeature.rightEyeConfidence * 100).roundToInt()
                         Text(
-                            text = "Gaze (${(hudState.normX * 100).roundToInt()}%, ${(hudState.normY * 100).roundToInt()}%) • L:$lConf% R:$rConf% • ±${String.format("%.1f", hudState.activeErrorRadiusPct)}% (Max ${String.format("%.1f", hudState.activeMaxQuadrantErrorPct)}%)",
+                            text = "Gaze (${(hudState.normX * 100).roundToInt()}%, ${(hudState.normY * 100).roundToInt()}%) • L:$lConf% R:$rConf% • ±${String.format(java.util.Locale.US, "%.1f", hudState.activeErrorRadiusPct)}% • Luma:${hudState.rawFeature.ambientLuma}",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -204,15 +200,24 @@ fun OpticalDiagnosticsBar(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    if (!hasCameraPermission && !hudState.isSimulatorProxyEnabled) {
-                        Button(
-                            onClick = onRequestCameraPermission,
-                            modifier = Modifier.testTag("request_camera_button"),
-                            contentPadding = ButtonDefaults.ContentPadding
-                        ) {
-                            Text("Camera", style = MaterialTheme.typography.labelSmall)
-                        }
-                    }
+                    FilterChip(
+                        selected = expandCameraPreview,
+                        onClick = { expandCameraPreview = !expandCameraPreview },
+                        leadingIcon = {
+                            Icon(
+                                imageVector = Icons.Default.CameraFront,
+                                contentDescription = "Toggle Camera Viewfinder Size",
+                                modifier = Modifier.size(14.dp)
+                            )
+                        },
+                        label = {
+                            Text(
+                                text = if (expandCameraPreview) "Cam Full" else "Cam Mini",
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        },
+                        modifier = Modifier.testTag("toggle_camera_feed_size_chip")
+                    )
                     FilterChip(
                         selected = true,
                         onClick = onCycleOverlayMode,
@@ -249,6 +254,228 @@ fun OpticalDiagnosticsBar(
                 }
             }
 
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // Real-Time CameraX PreviewView + ML Kit Face Detection Pipeline Monitor in Main UI
+            if (hasCameraPermission) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
+                        .border(
+                            width = 1.dp,
+                            color = if (hudState.rawFeature.faceDetected && !hudState.isSimulatorProxyEnabled) {
+                                MaterialTheme.colorScheme.secondary.copy(alpha = 0.65f)
+                            } else {
+                                MaterialTheme.colorScheme.outline.copy(alpha = 0.45f)
+                            },
+                            shape = RoundedCornerShape(12.dp)
+                        )
+                        .padding(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    val previewW = if (expandCameraPreview) 116.dp else 56.dp
+                    val previewH = if (expandCameraPreview) 150.dp else 72.dp
+
+                    Box(
+                        modifier = Modifier
+                            .size(width = previewW, height = previewH)
+                            .clip(RoundedCornerShape(10.dp))
+                            .border(
+                                width = 1.5.dp,
+                                color = if (hudState.rawFeature.faceDetected && !hudState.isSimulatorProxyEnabled) {
+                                    MaterialTheme.colorScheme.secondary
+                                } else {
+                                    MaterialTheme.colorScheme.primary
+                                },
+                                shape = RoundedCornerShape(10.dp)
+                            )
+                            .pointerInput(hudState.isSimulatorProxyEnabled) {
+                                detectTapGestures {
+                                    if (hudState.isSimulatorProxyEnabled) {
+                                        onToggleSimulator(false)
+                                        showSimulatorPad = false
+                                    } else {
+                                        expandCameraPreview = !expandCameraPreview
+                                    }
+                                }
+                            }
+                            .testTag("live_camera_preview_box")
+                    ) {
+                        MiniFrontCameraPreview(
+                            isPerformanceMode = hudState.isPerformanceModeActive,
+                            resolutionTier = hudState.resolutionTier,
+                            onFeatureFrame = { frame ->
+                                if (!hudState.isSimulatorProxyEnabled) {
+                                    onFeatureFrame(frame)
+                                }
+                            },
+                            modifier = Modifier.fillMaxSize()
+                        )
+
+                        // Real-time ML Kit Face Bounding Box, Eye ROI, Pupil Centroid & Brow Overlay
+                        MlKitFaceOverlayCanvas(
+                            feature = hudState.rawFeature,
+                            isSimulatorActive = hudState.isSimulatorProxyEnabled,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(12.dp))
+
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        val f = hudState.rawFeature
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = if (hudState.isSimulatorProxyEnabled) {
+                                    "CAMERAX STANDBY (TAP PREVIEW FOR LIVE)"
+                                } else {
+                                    "PIXEL 10 PRO XL 42MP (~103° FOV) PIPELINE"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = if (f.faceDetected && !hudState.isSimulatorProxyEnabled) {
+                                    MaterialTheme.colorScheme.secondary
+                                } else {
+                                    MaterialTheme.colorScheme.primary
+                                }
+                            )
+                            Text(
+                                text = "${f.frameWidthPx}×${f.frameHeightPx} @ ${f.sensorRotationDeg}°",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        Text(
+                            text = String.format(
+                                java.util.Locale.US,
+                                "Iris Centroid: gx=%+.3f, gy=%+.3f • IOD=%.0f px",
+                                f.gx,
+                                f.gy,
+                                f.eyeDistancePx
+                            ),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+
+                        Text(
+                            text = String.format(
+                                java.util.Locale.US,
+                                "Head Euler: Yaw %+.1f° • Pitch %+.1f° • Roll %+.1f°",
+                                f.yaw,
+                                f.pitch,
+                                f.roll
+                            ),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        if (expandCameraPreview) {
+                            Text(
+                                text = String.format(
+                                    java.util.Locale.US,
+                                    "Eye Open: L %.0f%% / R %.0f%% • Brow Ratio: %.2f (Trigger ≥ %.2f)",
+                                    f.leftEyeOpenProb * 100f,
+                                    f.rightEyeOpenProb * 100f,
+                                    f.browToEyeRatio,
+                                    (hudState.neutralBrowRatio + hudState.raisedBrowRatio) * 0.5f
+                                ),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            if (hudState.isSimulatorProxyEnabled) {
+                                OutlinedButton(
+                                    onClick = {
+                                        onToggleSimulator(false)
+                                        showSimulatorPad = false
+                                    },
+                                    modifier = Modifier.padding(top = 2.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.CameraFront,
+                                        contentDescription = "Switch to Live Camera",
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Switch to Live Front Camera", style = MaterialTheme.typography.labelSmall)
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.CameraFront,
+                            contentDescription = "Camera Permission Required",
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "Grant front-camera access to enable the live CameraX PreviewView & ML Kit face-tracking feed.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = onRequestCameraPermission,
+                        modifier = Modifier.testTag("request_camera_button"),
+                        contentPadding = ButtonDefaults.ContentPadding
+                    ) {
+                        Text("Enable Camera", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
+
+            // Honest Low-Light Degraded Mode Banner (Pixel 10 Pro XL has no IR illuminator or front depth sensor)
+            if (hudState.rawFeature.isLowLightDegraded) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.error.copy(alpha = 0.14f))
+                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                        .testTag("low_light_degraded_banner"),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Warning,
+                        contentDescription = "Low-Light Degraded Mode",
+                        tint = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "LOW-LIGHT DEGRADED MODE (Luma ${hudState.rawFeature.ambientLuma}/255): No IR illuminator on Pixel 10 Pro XL — visible-light iris contrast is physics-limited; damping noisy iris offsets and prioritizing head-pose + region dwell.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            }
+
             // Per-eye glare or >15% head-distance drift warnings
             if (hudState.rawFeature.hasGlareWarning || hudState.hasDistanceDriftWarning) {
                 Spacer(modifier = Modifier.height(6.dp))
@@ -272,7 +499,7 @@ fun OpticalDiagnosticsBar(
                             append("Eyeglass specular glare detected (using unoccluded eye). ")
                         }
                         if (hudState.hasDistanceDriftWarning) {
-                            append("Head distance shifted >15% from calibration baseline.")
+                            append("Head distance (IOD) shifted >15% from calibration baseline.")
                         }
                     }
                     Text(
@@ -296,7 +523,7 @@ fun OpticalDiagnosticsBar(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = "Position changed — Recalibrate without losing session?",
+                        text = "Handheld geometry shifted — Recalibrate without losing session?",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.primary,
                         modifier = Modifier.weight(1f)
@@ -451,21 +678,117 @@ fun OpticalDiagnosticsBar(
 @Composable
 private fun MiniFrontCameraPreview(
     isPerformanceMode: Boolean,
+    resolutionTier: AnalysisResolutionTier,
     onFeatureFrame: (GazeFeatureVector) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
-    val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
-    val analyzer = remember { CameraGazeAnalyzerEngine(onFeatureFrame) }
+    val latestOnFeatureFrame by androidx.compose.runtime.rememberUpdatedState(onFeatureFrame)
+    val latestResolutionTier by androidx.compose.runtime.rememberUpdatedState(resolutionTier)
+    val isEmulator = remember { isRunningOnEmulatorHardware() }
+    val analyzer = remember {
+        CameraGazeAnalyzerEngine { vector ->
+            latestOnFeatureFrame(vector)
+        }
+    }
+
+    var boundCameraProvider by remember { mutableStateOf<ProcessCameraProvider?>(null) }
+    var boundImageAnalysis by remember { mutableStateOf<ImageAnalysis?>(null) }
+    var previewViewRef by remember { mutableStateOf<PreviewView?>(null) }
+    var boundTier by remember { mutableStateOf<AnalysisResolutionTier?>(null) }
 
     LaunchedEffect(isPerformanceMode) {
         analyzer.isPerformanceModeEnabled = isPerformanceMode
     }
 
+    fun bindCameraUseCases(view: PreviewView, tier: AnalysisResolutionTier) {
+        if (isEmulator || !view.isAttachedToWindow || view.width <= 0 || view.height <= 0) {
+            return
+        }
+        if (boundTier == tier && boundCameraProvider != null) {
+            return
+        }
+        val ctx = view.context
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
+        cameraProviderFuture.addListener({
+            try {
+                if (!view.isAttachedToWindow) return@addListener
+                val cameraProvider = cameraProviderFuture.get()
+                boundCameraProvider = cameraProvider
+                boundTier = tier
+
+                val previewResolutionSelector = ResolutionSelector.Builder()
+                    .setResolutionStrategy(
+                        ResolutionStrategy(
+                            Size(640, 480),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                        )
+                    )
+                    .build()
+
+                // Pixel 10 Pro XL 42 MP autofocus front camera (~103° wide FOV):
+                // Deliberately request high-resolution analysis frames (1280×960 default) so iris
+                // detail at arm's length is preserved, and step down (1280 -> 960 -> 640) when FPS < 15.
+                val analysisResolutionSelector = ResolutionSelector.Builder()
+                    .setResolutionStrategy(
+                        ResolutionStrategy(
+                            Size(tier.targetWidth, tier.targetHeight),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                        )
+                    )
+                    .build()
+
+                val preview = Preview.Builder()
+                    .setResolutionSelector(previewResolutionSelector)
+                    .build()
+                    .also {
+                        it.surfaceProvider = view.surfaceProvider
+                    }
+
+                boundImageAnalysis?.clearAnalyzer()
+                val imageAnalysis = ImageAnalysis.Builder()
+                    .setResolutionSelector(analysisResolutionSelector)
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+                    .build()
+                    .also {
+                        it.setAnalyzer(analyzer.analysisExecutor, analyzer)
+                    }
+                boundImageAnalysis = imageAnalysis
+
+                val selector = when {
+                    cameraProvider.hasCamera(CameraSelector.DEFAULT_FRONT_CAMERA) ->
+                        CameraSelector.DEFAULT_FRONT_CAMERA
+                    cameraProvider.hasCamera(CameraSelector.DEFAULT_BACK_CAMERA) ->
+                        CameraSelector.DEFAULT_BACK_CAMERA
+                    else -> CameraSelector.DEFAULT_FRONT_CAMERA
+                }
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(
+                    lifecycleOwner,
+                    selector,
+                    preview,
+                    imageAnalysis
+                )
+            } catch (e: Exception) {
+                android.util.Log.w("ÆyeCamera", "CameraX bind skipped or failed: ${e.message}")
+            }
+        }, ContextCompat.getMainExecutor(ctx))
+    }
+
+    LaunchedEffect(resolutionTier, previewViewRef) {
+        val view = previewViewRef ?: return@LaunchedEffect
+        bindCameraUseCases(view, resolutionTier)
+    }
+
     DisposableEffect(lifecycleOwner) {
         onDispose {
+            try {
+                boundImageAnalysis?.clearAnalyzer()
+                boundCameraProvider?.unbindAll()
+            } catch (_: Exception) {
+            }
             analyzer.close()
-            cameraExecutor.shutdown()
         }
     }
 
@@ -476,33 +799,174 @@ private fun MiniFrontCameraPreview(
                 implementationMode = PreviewView.ImplementationMode.COMPATIBLE
                 scaleType = PreviewView.ScaleType.FILL_CENTER
             }
-            val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
-            cameraProviderFuture.addListener({
-                try {
-                    val cameraProvider = cameraProviderFuture.get()
-                    val preview = Preview.Builder().build().also {
-                        it.surfaceProvider = previewView.surfaceProvider
+            previewViewRef = previewView
+
+            if (!isEmulator) {
+                previewView.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+                    if (v is PreviewView && v.width > 0 && v.height > 0) {
+                        bindCameraUseCases(v, latestResolutionTier)
                     }
-                    val imageAnalysis = ImageAnalysis.Builder()
-                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .build()
-                        .also {
-                            it.setAnalyzer(cameraExecutor, analyzer)
-                        }
-                    val selector = CameraSelector.DEFAULT_FRONT_CAMERA
-                    cameraProvider.unbindAll()
-                    cameraProvider.bindToLifecycle(
-                        lifecycleOwner,
-                        selector,
-                        preview,
-                        imageAnalysis
-                    )
-                } catch (_: Exception) {
                 }
-            }, ContextCompat.getMainExecutor(ctx))
+                previewView.post {
+                    bindCameraUseCases(previewView, latestResolutionTier)
+                }
+            }
             previewView
         }
     )
+}
+
+/**
+ * Real-time ML Kit Face Detection Overlay rendered directly over the CameraX `PreviewView`.
+ * Maps normalized upright mirrored coordinates `[0, 1]` through the exact `ScaleType.FILL_CENTER`
+ * aspect-fill transform (`frameWidthPx × frameHeightPx`) to draw:
+ * 1. ML Kit Face Bounding Box with corner brackets (`#10B981` Emerald when locked).
+ * 2. Left & Right Eye ROI rings and `#00E5FF` Cyan dark-iris pupil centroid crosshairs.
+ * 3. Left & Right Eyebrow top contour bars for visual brow-raise feedback.
+ */
+@Composable
+private fun MlKitFaceOverlayCanvas(
+    feature: GazeFeatureVector,
+    isSimulatorActive: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val isEmulator = remember { isRunningOnEmulatorHardware() }
+    Canvas(modifier = modifier) {
+        val dstW = size.width
+        val dstH = size.height
+        if (dstW <= 1f || dstH <= 1f) return@Canvas
+
+        val srcW = feature.frameWidthPx.toFloat().coerceAtLeast(1f)
+        val srcH = feature.frameHeightPx.toFloat().coerceAtLeast(1f)
+        val scale = maxOf(dstW / srcW, dstH / srcH)
+        val scaledW = srcW * scale
+        val scaledH = srcH * scale
+        val offsetX = (dstW - scaledW) * 0.5f
+        val offsetY = (dstH - scaledH) * 0.5f
+
+        fun mapX(nx: Float): Float = (offsetX + nx * scaledW).coerceIn(2f, dstW - 2f)
+        fun mapY(ny: Float): Float = (offsetY + ny * scaledH).coerceIn(2f, dstH - 2f)
+
+        val emerald = Color(0xFF10B981)
+        val cyan = Color(0xFF00E5FF)
+        val amber = Color(0xFFF59E0B)
+
+        // When running on a headless emulator or in simulator mode, render an optical sensor grid
+        // and head silhouette inside the PreviewView so the viewport is visually informative
+        if (isEmulator || isSimulatorActive) {
+            drawRect(color = Color(0xFF0B1220).copy(alpha = 0.82f))
+            val stepX = dstW / 4f
+            val stepY = dstH / 4f
+            for (i in 1..3) {
+                drawLine(
+                    color = cyan.copy(alpha = 0.10f),
+                    start = Offset(stepX * i, 0f),
+                    end = Offset(stepX * i, dstH),
+                    strokeWidth = 1f
+                )
+                drawLine(
+                    color = cyan.copy(alpha = 0.10f),
+                    start = Offset(0f, stepY * i),
+                    end = Offset(dstW, stepY * i),
+                    strokeWidth = 1f
+                )
+            }
+        }
+
+        if (!feature.faceDetected) {
+            val ovalW = dstW * 0.62f
+            val ovalH = dstH * 0.68f
+            drawOval(
+                color = amber.copy(alpha = 0.75f),
+                topLeft = Offset((dstW - ovalW) * 0.5f, (dstH - ovalH) * 0.5f),
+                size = androidx.compose.ui.geometry.Size(ovalW, ovalH),
+                style = Stroke(
+                    width = 1.5.dp.toPx(),
+                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f), 0f)
+                )
+            )
+            return@Canvas
+        }
+
+        // 1. ML Kit Face Bounding Box Corner Brackets
+        val bLeft = mapX(feature.faceBoxLeft)
+        val bTop = mapY(feature.faceBoxTop)
+        val bRight = mapX(feature.faceBoxRight)
+        val bBottom = mapY(feature.faceBoxBottom)
+        val bracketLen = minOf(bRight - bLeft, bBottom - bTop).coerceAtLeast(12f) * 0.24f
+        val boxStroke = 2.dp.toPx()
+
+        if (isEmulator || isSimulatorActive) {
+            drawOval(
+                color = emerald.copy(alpha = 0.14f),
+                topLeft = Offset(bLeft, bTop),
+                size = androidx.compose.ui.geometry.Size((bRight - bLeft).coerceAtLeast(8f), (bBottom - bTop).coerceAtLeast(8f))
+            )
+        }
+
+        // Top-Left corner
+        drawLine(emerald, Offset(bLeft, bTop), Offset(bLeft + bracketLen, bTop), boxStroke, StrokeCap.Round)
+        drawLine(emerald, Offset(bLeft, bTop), Offset(bLeft, bTop + bracketLen), boxStroke, StrokeCap.Round)
+        // Top-Right corner
+        drawLine(emerald, Offset(bRight, bTop), Offset(bRight - bracketLen, bTop), boxStroke, StrokeCap.Round)
+        drawLine(emerald, Offset(bRight, bTop), Offset(bRight, bTop + bracketLen), boxStroke, StrokeCap.Round)
+        // Bottom-Left corner
+        drawLine(emerald, Offset(bLeft, bBottom), Offset(bLeft + bracketLen, bBottom), boxStroke, StrokeCap.Round)
+        drawLine(emerald, Offset(bLeft, bBottom), Offset(bLeft, bBottom - bracketLen), boxStroke, StrokeCap.Round)
+        // Bottom-Right corner
+        drawLine(emerald, Offset(bRight, bBottom), Offset(bRight - bracketLen, bBottom), boxStroke, StrokeCap.Round)
+        drawLine(emerald, Offset(bRight, bBottom), Offset(bRight, bBottom - bracketLen), boxStroke, StrokeCap.Round)
+
+        // 2. Left & Right Eye Centers + Dark-Iris Pupil Centroid Crosshairs
+        val lEye = Offset(mapX(feature.leftEyeNormX), mapY(feature.leftEyeNormY))
+        val rEye = Offset(mapX(feature.rightEyeNormX), mapY(feature.rightEyeNormY))
+        val lPupil = Offset(mapX(feature.leftPupilNormX), mapY(feature.leftPupilNormY))
+        val rPupil = Offset(mapX(feature.rightPupilNormX), mapY(feature.rightPupilNormY))
+
+        val eyeRadius = ((bRight - bLeft) * 0.11f).coerceIn(5.dp.toPx(), 14.dp.toPx())
+        drawCircle(
+            color = emerald.copy(alpha = 0.65f),
+            radius = eyeRadius,
+            center = lEye,
+            style = Stroke(width = 1.2.dp.toPx())
+        )
+        drawCircle(
+            color = emerald.copy(alpha = 0.65f),
+            radius = eyeRadius,
+            center = rEye,
+            style = Stroke(width = 1.2.dp.toPx())
+        )
+
+        // Pupil centroids in high-contrast Electric Cyan
+        val crossLen = 4.dp.toPx()
+        drawCircle(color = cyan, radius = 2.5.dp.toPx(), center = lPupil)
+        drawLine(cyan, Offset(lPupil.x - crossLen, lPupil.y), Offset(lPupil.x + crossLen, lPupil.y), 1.2.dp.toPx())
+        drawLine(cyan, Offset(lPupil.x, lPupil.y - crossLen), Offset(lPupil.x, lPupil.y + crossLen), 1.2.dp.toPx())
+
+        drawCircle(color = cyan, radius = 2.5.dp.toPx(), center = rPupil)
+        drawLine(cyan, Offset(rPupil.x - crossLen, rPupil.y), Offset(rPupil.x + crossLen, rPupil.y), 1.2.dp.toPx())
+        drawLine(cyan, Offset(rPupil.x, rPupil.y - crossLen), Offset(rPupil.x, rPupil.y + crossLen), 1.2.dp.toPx())
+
+        // 3. Eyebrow Top Contour Bars above Left & Right Eyes
+        val lBrowY = mapY(feature.leftBrowNormY)
+        val rBrowY = mapY(feature.rightBrowNormY)
+        val browHalfW = eyeRadius * 1.15f
+        val browColor = if (feature.browToEyeRatio >= 0.38f) amber else cyan.copy(alpha = 0.80f)
+        drawLine(
+            color = browColor,
+            start = Offset(lEye.x - browHalfW, lBrowY),
+            end = Offset(lEye.x + browHalfW, lBrowY),
+            strokeWidth = 2.dp.toPx(),
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = browColor,
+            start = Offset(rEye.x - browHalfW, rBrowY),
+            end = Offset(rEye.x + browHalfW, rBrowY),
+            strokeWidth = 2.dp.toPx(),
+            cap = StrokeCap.Round
+        )
+    }
 }
 
 /**
@@ -525,25 +989,43 @@ fun RegionConfidenceReticleOverlay(
     val secondaryColor = MaterialTheme.colorScheme.secondary
     val textMeasurer = rememberTextMeasurer()
 
+    val targetNormX by androidx.compose.runtime.rememberUpdatedState(hudState.normX)
+    val targetNormY by androidx.compose.runtime.rememberUpdatedState(hudState.normY)
+    val latestOnReticleRootPositionChanged by androidx.compose.runtime.rememberUpdatedState(onReticleRootPositionChanged)
+
     var displayNormX by remember { mutableFloatStateOf(hudState.normX) }
     var displayNormY by remember { mutableFloatStateOf(hudState.normY) }
     var overlayRootBounds by remember { mutableStateOf(Rect.Zero) }
 
-    // 120Hz display-refresh interpolation loop decoupled from 10-20 FPS camera inference
-    LaunchedEffect(hudState.normX, hudState.normY) {
+    // Continuous 120Hz display-refresh interpolation loop decoupled from 10-20 FPS camera inference.
+    // Keyed on Unit so the coroutine never cancels/restarts when new camera samples arrive.
+    LaunchedEffect(Unit) {
         var lastNanos = 0L
+        var lastReportedRootX = -1f
+        var lastReportedRootY = -1f
         while (true) {
             withFrameNanos { nowNanos ->
                 val dtSec = if (lastNanos == 0L) 0.008f else ((nowNanos - lastNanos) / 1_000_000_000f).coerceIn(0.004f, 0.05f)
                 lastNanos = nowNanos
-                val lerpFactor = (dtSec * 16f).coerceIn(0.08f, 0.45f)
-                displayNormX += (hudState.normX - displayNormX) * lerpFactor
-                displayNormY += (hudState.normY - displayNormY) * lerpFactor
+                val dx = targetNormX - displayNormX
+                val dy = targetNormY - displayNormY
+                if (kotlin.math.abs(dx) > 0.0003f || kotlin.math.abs(dy) > 0.0003f) {
+                    val lerpFactor = (dtSec * 16f).coerceIn(0.08f, 0.45f)
+                    displayNormX += dx * lerpFactor
+                    displayNormY += dy * lerpFactor
+                } else {
+                    displayNormX = targetNormX
+                    displayNormY = targetNormY
+                }
 
                 if (overlayRootBounds.width > 0f && overlayRootBounds.height > 0f) {
                     val rootX = overlayRootBounds.left + displayNormX * overlayRootBounds.width
                     val rootY = overlayRootBounds.top + displayNormY * overlayRootBounds.height
-                    onReticleRootPositionChanged(Offset(rootX, rootY))
+                    if (kotlin.math.abs(rootX - lastReportedRootX) > 0.5f || kotlin.math.abs(rootY - lastReportedRootY) > 0.5f) {
+                        lastReportedRootX = rootX
+                        lastReportedRootY = rootY
+                        latestOnReticleRootPositionChanged(Offset(rootX, rootY))
+                    }
                 }
             }
         }

@@ -1,0 +1,91 @@
+name: Build Æye Android APK (Pixel 10 Pro XL)
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Publish a GitHub Release with the built APK attached'
+        required: false
+        default: true
+        type: boolean
+      release_tag:
+        description: 'Release tag name (if create_release is true)'
+        required: false
+        default: 'v1.0.0-pixel10proxl'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    name: Assemble Signed APK & Run Robolectric Suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Restore Signing Keystore & Environment Fallbacks
+        run: |
+          if [ ! -f debug.keystore ] && [ -f debug.keystore.base64 ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
+          fi
+          if [ ! -f .env ] && [ -f .env.example ]; then
+            cp .env.example .env
+          fi
+
+      - name: Run Unit & Robolectric Verification Suite
+        run: gradle :app:testDebugUnitTest
+
+      - name: Assemble Installable Signed APK
+        run: |
+          gradle :app:assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/AEye-Pixel10ProXL-debug.apk
+          ls -lh app/build/outputs/apk/debug/AEye-Pixel10ProXL-debug.apk
+
+      - name: Upload Installable APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AEye-Pixel10ProXL-APK
+          path: app/build/outputs/apk/debug/AEye-Pixel10ProXL-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish APK to GitHub Releases (on Tag or Manual Dispatch)
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.create_release == true)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.release_tag }}
+          name: "Æye (${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.release_tag }}) — Pixel 10 Pro XL Build"
+          body: |
+            ### Æye — Optical Gaze, AAC & Reading Telemetry Workbench
+            Tuned for **Google Pixel 10 Pro XL** (Tensor G5, 16 GB RAM, Android 16 `compileSdk 36`, 6.8" LTPO 1–120 Hz display, 42 MP ~103° wide-FOV front camera).
+
+            #### Direct Installation on Pixel 10 Pro XL
+            1. Download **`AEye-Pixel10ProXL-debug.apk`** from the **Assets** section below.
+            2. Open the downloaded `.apk` on your Pixel 10 Pro XL and allow installation.
+            3. Grant front-camera permission on first launch to engage the `1280×960` high-resolution iris ROI pipeline.
+          files: |
+            app/build/outputs/apk/debug/AEye-Pixel10ProXL-debug.apk
+          draft: false
+          prerelease: false

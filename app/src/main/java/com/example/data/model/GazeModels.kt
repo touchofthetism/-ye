@@ -9,10 +9,12 @@ import com.google.firebase.firestore.ServerTimestamp
 /**
  * Default 2x6 affine matrix mapping standardized feature vector:
  * f_std = [1, gx/0.25, gy/0.20, yaw/20.0, pitch/15.0, (roll/15.0) + 0.5 * distScale] -> (x_screen, y_screen).
+ * Sign convention (front camera mirrored to user's perspective):
+ * +gx / +yaw = looking right (+x_screen); +gy / +pitch = looking down (+y_screen).
  */
 val DEFAULT_AFFINE_MATRIX_2X6: List<Double> = listOf(
-    0.50, 0.28, 0.00, -0.22, 0.00, 0.02,
-    0.50, 0.00, 0.30, 0.00, -0.25, -0.02
+    0.50, 0.30, 0.00, 0.24, 0.00, 0.02,
+    0.50, 0.00, 0.32, 0.00, 0.26, -0.02
 )
 
 @IgnoreExtraProperties
@@ -81,6 +83,25 @@ data class GazeFeatureVector(
     val activeEyeLabel: String = "BINOCULAR",
     val hasGlareWarning: Boolean = false,
     val faceDetected: Boolean = false,
+    val faceBoxLeft: Float = 0.25f,
+    val faceBoxTop: Float = 0.18f,
+    val faceBoxRight: Float = 0.75f,
+    val faceBoxBottom: Float = 0.82f,
+    val leftEyeNormX: Float = 0.38f,
+    val leftEyeNormY: Float = 0.42f,
+    val rightEyeNormX: Float = 0.62f,
+    val rightEyeNormY: Float = 0.42f,
+    val leftPupilNormX: Float = 0.38f,
+    val leftPupilNormY: Float = 0.42f,
+    val rightPupilNormX: Float = 0.62f,
+    val rightPupilNormY: Float = 0.42f,
+    val leftBrowNormY: Float = 0.33f,
+    val rightBrowNormY: Float = 0.33f,
+    val frameWidthPx: Int = 960,
+    val frameHeightPx: Int = 1280,
+    val sensorRotationDeg: Int = 270,
+    val ambientLuma: Int = 142,
+    val isLowLightDegraded: Boolean = false,
     val timestampMs: Long = System.currentTimeMillis()
 ) {
     val combinedEyeOpenProb: Float
@@ -93,17 +114,36 @@ data class GazeFeatureVector(
     /**
      * Converts raw physical measurements into a dimensionless, unit-scaled 6D feature vector
      * so Ridge regularization penalizes iris offsets, Euler angles, and inter-ocular scale evenly.
+     * In Low-Light Degraded Mode (Pixel 10 Pro XL has no IR illuminator), noisy visible-light iris
+     * offsets (gx, gy) are damped by 0.45x so head-pose (yaw, pitch) keeps region tracking stable.
      */
     fun toStandardizedFeatureArray(baselineEyeDistPx: Double = 148.0): DoubleArray {
         val safeBaseDist = baselineEyeDistPx.coerceAtLeast(30.0)
         val distScale = ((eyeDistancePx - safeBaseDist) / safeBaseDist).coerceIn(-0.6, 0.6)
-        val stdGx = (gx / 0.25).coerceIn(-2.5, 2.5)
-        val stdGy = (gy / 0.20).coerceIn(-2.5, 2.5)
+        val irisDamping = if (isLowLightDegraded) 0.45 else 1.0
+        val stdGx = ((gx * irisDamping) / 0.25).coerceIn(-2.5, 2.5)
+        val stdGy = ((gy * irisDamping) / 0.20).coerceIn(-2.5, 2.5)
         val stdYaw = (yaw / 20.0).coerceIn(-2.5, 2.5)
         val stdPitch = (pitch / 15.0).coerceIn(-2.5, 2.5)
         val stdRollAndDist = ((roll / 15.0) + 0.5 * distScale).coerceIn(-2.5, 2.5)
         return doubleArrayOf(1.0, stdGx, stdGy, stdYaw, stdPitch, stdRollAndDist)
     }
+}
+
+/**
+ * Adaptive 3-tier analysis resolution controller for Google Pixel 10 Pro XL's 42 MP (~103° FOV)
+ * autofocus front camera. Starts at 1280×960 so iris ROIs retain high spatial detail despite the
+ * wide 103° FOV, and steps down automatically (1280 → 960 → 640) whenever measured FPS < 15 or
+ * Tensor G5 thermal throttling is detected over a 20+ minute continuous session.
+ */
+enum class AnalysisResolutionTier(
+    val targetWidth: Int,
+    val targetHeight: Int,
+    val shortLabel: String
+) {
+    TIER_HIGH_1280(1280, 960, "1280w (42MP Sharp)"),
+    TIER_MED_960(960, 720, "960w (Step-Down 1)"),
+    TIER_LOW_640(640, 480, "640w (Thermal Saver)")
 }
 
 /**
