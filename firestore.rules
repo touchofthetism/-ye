@@ -1,0 +1,145 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1 & Phase 4.1: Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidCalibrationProfile(data) {
+      return data.userId is string &&
+             data.userId == request.auth.uid &&
+             data.name is string && data.name.size() >= 1 && data.name.size() <= 80 &&
+             data.deviceModel is string && data.deviceModel.size() >= 1 && data.deviceModel.size() <= 80 &&
+             data.matrixCoeffs is list && data.matrixCoeffs.size() == 12 && data.matrixCoeffs[0] is number &&
+             data.baselineEyeDistancePx is number && data.baselineEyeDistancePx >= 0 && data.baselineEyeDistancePx <= 5000 &&
+             data.meanErrorMm is number && data.meanErrorMm >= 0 && data.meanErrorMm <= 500 &&
+             data.meanErrorPct is number && data.meanErrorPct >= 0 && data.meanErrorPct <= 100 &&
+             data.maxErrorPct is number && data.maxErrorPct >= 0 && data.maxErrorPct <= 100 &&
+             data.closeBlinkThreshold is number && data.closeBlinkThreshold >= 0.05 && data.closeBlinkThreshold <= 0.80 &&
+             data.openBlinkThreshold is number && data.openBlinkThreshold >= 0.15 && data.openBlinkThreshold <= 0.98 &&
+             data.intentionalBlinkMinMs is int && data.intentionalBlinkMinMs >= 150 && data.intentionalBlinkMinMs <= 2000 &&
+             data.isActive is bool &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidTrackingSession(data) {
+      return data.userId is string &&
+             data.userId == request.auth.uid &&
+             data.title is string && data.title.size() >= 1 && data.title.size() <= 120 &&
+             data.deviceModel is string && data.deviceModel.size() >= 1 && data.deviceModel.size() <= 80 &&
+             data.contentType is string && data.contentType in ['READING_SECTIONS', 'AAC_CONTROL_DECK'] &&
+             data.durationSeconds is int && data.durationSeconds >= 1 && data.durationSeconds <= 86400 &&
+             data.naturalBlinkCount is int && data.naturalBlinkCount >= 0 && data.naturalBlinkCount <= 100000 &&
+             data.intentionalBlinkCount is int && data.intentionalBlinkCount >= 0 && data.intentionalBlinkCount <= 100000 &&
+             data.blinksPerMinute is number && data.blinksPerMinute >= 0 && data.blinksPerMinute <= 300 &&
+             data.effectiveWordsPerMinute is int && data.effectiveWordsPerMinute >= 0 && data.effectiveWordsPerMinute <= 2000 &&
+             data.fixationClusterCount is int && data.fixationClusterCount >= 0 && data.fixationClusterCount <= 5000 &&
+             data.topZonePercentage is int && data.topZonePercentage >= 0 && data.topZonePercentage <= 100 &&
+             data.middleZonePercentage is int && data.middleZonePercentage >= 0 && data.middleZonePercentage <= 100 &&
+             data.bottomZonePercentage is int && data.bottomZonePercentage >= 0 && data.bottomZonePercentage <= 100 &&
+             data.sectionLoads is list && data.sectionLoads.size() <= 12 &&
+             (data.sectionLoads.size() == 0 || (data.sectionLoads[0] is string && data.sectionLoads[0].size() <= 120)) &&
+             data.clusterPoints is list && data.clusterPoints.size() <= 40 &&
+             (data.clusterPoints.size() == 0 || (data.clusterPoints[0] is string && data.clusterPoints[0].size() <= 80)) &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    match /users/{userId}/calibrations/{profileId} {
+      allow get: if isSignedIn() && isValidId(userId) && isValidId(profileId) && request.auth.uid == userId && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && request.auth.uid == userId && existing().userId == request.auth.uid;
+
+      allow create: if isSignedIn() &&
+                       isValidId(userId) &&
+                       isValidId(profileId) &&
+                       request.auth.uid == userId &&
+                       incoming().keys().hasAll([
+                         'userId', 'name', 'deviceModel', 'matrixCoeffs', 'baselineEyeDistancePx',
+                         'meanErrorMm', 'meanErrorPct', 'maxErrorPct', 'closeBlinkThreshold', 'openBlinkThreshold',
+                         'intentionalBlinkMinMs', 'isActive', 'createdAt', 'updatedAt'
+                       ]) &&
+                       incoming().keys().hasOnly([
+                         'userId', 'name', 'deviceModel', 'matrixCoeffs', 'baselineEyeDistancePx',
+                         'meanErrorMm', 'meanErrorPct', 'maxErrorPct', 'closeBlinkThreshold', 'openBlinkThreshold',
+                         'intentionalBlinkMinMs', 'isActive', 'createdAt', 'updatedAt'
+                       ]) &&
+                       isValidCalibrationProfile(incoming());
+
+      allow update: if isSignedIn() &&
+                       isValidCalibrationProfile(incoming()) &&
+                       isValidId(userId) &&
+                       isValidId(profileId) &&
+                       request.auth.uid == userId &&
+                       existing().userId == request.auth.uid &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       (
+                         // Action 1: Toggle active status or rename/recalibrate profile
+                         incoming().diff(existing()).affectedKeys().hasOnly([
+                           'name', 'matrixCoeffs', 'baselineEyeDistancePx', 'meanErrorMm', 'meanErrorPct', 'maxErrorPct',
+                           'closeBlinkThreshold', 'openBlinkThreshold', 'intentionalBlinkMinMs', 'isActive', 'updatedAt'
+                         ])
+                       );
+
+      allow delete: if isSignedIn() && isValidId(userId) && isValidId(profileId) && request.auth.uid == userId && existing().userId == request.auth.uid;
+    }
+
+    match /users/{userId}/sessions/{sessionId} {
+      allow get: if isSignedIn() && isValidId(userId) && isValidId(sessionId) && request.auth.uid == userId && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && request.auth.uid == userId && existing().userId == request.auth.uid;
+
+      allow create: if isSignedIn() &&
+                       isValidId(userId) &&
+                       isValidId(sessionId) &&
+                       request.auth.uid == userId &&
+                       incoming().keys().hasAll([
+                         'userId', 'title', 'deviceModel', 'contentType', 'durationSeconds',
+                         'naturalBlinkCount', 'intentionalBlinkCount', 'blinksPerMinute',
+                         'effectiveWordsPerMinute', 'fixationClusterCount',
+                         'topZonePercentage', 'middleZonePercentage', 'bottomZonePercentage',
+                         'sectionLoads', 'clusterPoints', 'createdAt', 'updatedAt'
+                       ]) &&
+                       incoming().keys().hasOnly([
+                         'userId', 'title', 'deviceModel', 'contentType', 'durationSeconds',
+                         'naturalBlinkCount', 'intentionalBlinkCount', 'blinksPerMinute',
+                         'effectiveWordsPerMinute', 'fixationClusterCount',
+                         'topZonePercentage', 'middleZonePercentage', 'bottomZonePercentage',
+                         'sectionLoads', 'clusterPoints', 'createdAt', 'updatedAt'
+                       ]) &&
+                       isValidTrackingSession(incoming());
+
+      allow update: if isSignedIn() &&
+                       isValidTrackingSession(incoming()) &&
+                       isValidId(userId) &&
+                       isValidId(sessionId) &&
+                       request.auth.uid == userId &&
+                       existing().userId == request.auth.uid &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       (
+                         // Action 1: Rename session title
+                         incoming().diff(existing()).affectedKeys().hasOnly(['title', 'updatedAt'])
+                       );
+
+      allow delete: if isSignedIn() && isValidId(userId) && isValidId(sessionId) && request.auth.uid == userId && existing().userId == request.auth.uid;
+    }
+  }
+}

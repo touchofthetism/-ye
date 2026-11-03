@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer eye contour silhouette -->
+    <path
+        android:fillColor="#00E5FF"
+        android:pathData="M54,32C37.5,32 23.4,41.2 17,54C23.4,66.8 37.5,76 54,76C70.5,76 84.6,66.8 91,54C84.6,41.2 70.5,32 54,32ZM54,69C45.7,69 39,62.3 39,54C39,45.7 45.7,39 54,39C62.3,39 69,45.7 69,54C69,62.3 62.3,69 54,69Z" />
+    <!-- Inner calibration iris ring -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M54,44C48.5,44 44,48.5 44,54C44,59.5 48.5,64 54,64C59.5,64 64,59.5 64,54C64,48.5 59.5,44 54,44ZM54,58C51.8,58 50,56.2 50,54C50,51.8 51.8,50 54,50C56.2,50 58,51.8 58,54C58,56.2 56.2,58 54,58Z" />
+    <!-- Reticle crosshair ticks -->
+    <path
+        android:fillColor="#00E5FF"
+        android:pathData="M52.5,24h3v5h-3zM52.5,79h3v5h-3zM20,52.5h5v3h-5zM83,52.5h5v3h-5z" />
+</vector>

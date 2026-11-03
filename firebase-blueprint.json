@@ -1,0 +1,199 @@
+{
+  "entities": {
+    "CalibrationProfile": {
+      "title": "CalibrationProfile",
+      "description": "Device-tagged 5-point + 4-point validated eye-tracking affine regression profile owned by an authenticated user.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "UID of the authenticated owner (must match request.auth.uid)."
+        },
+        "name": {
+          "type": "string",
+          "description": "User-facing profile name (1 to 80 chars)."
+        },
+        "deviceModel": {
+          "type": "string",
+          "description": "Android Build.MODEL identifier for camera geometry matching (1 to 80 chars)."
+        },
+        "matrixCoeffs": {
+          "type": "array",
+          "description": "12-element flattened 2x6 regularized least-squares regression matrix mapping standardized [1, gx, gy, yaw, pitch, roll+distance] to normalized screen (x, y)."
+        },
+        "baselineEyeDistancePx": {
+          "type": "number",
+          "description": "Reference inter-ocular pixel distance measured during calibration."
+        },
+        "meanErrorMm": {
+          "type": "number",
+          "description": "Held-out 4-point validation approximate mean Euclidean error in millimeters."
+        },
+        "meanErrorPct": {
+          "type": "number",
+          "description": "Held-out 4-point validation mean Euclidean error as percentage of screen."
+        },
+        "maxErrorPct": {
+          "type": "number",
+          "description": "Held-out 4-point validation worst-quadrant error as percentage of screen."
+        },
+        "closeBlinkThreshold": {
+          "type": "number",
+          "description": "Lower Schmitt-trigger eye-open probability threshold for blink start."
+        },
+        "openBlinkThreshold": {
+          "type": "number",
+          "description": "Upper Schmitt-trigger eye-open probability threshold for blink end."
+        },
+        "intentionalBlinkMinMs": {
+          "type": "integer",
+          "description": "Minimum eye closure duration in milliseconds for an intentional command blink (default 350 ms; natural blink is 80-349 ms)."
+        },
+        "isActive": {
+          "type": "boolean",
+          "description": "Whether this profile is currently active."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp via FieldValue.serverTimestamp()."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp via FieldValue.serverTimestamp()."
+        }
+      },
+      "required": [
+        "userId",
+        "name",
+        "deviceModel",
+        "matrixCoeffs",
+        "baselineEyeDistancePx",
+        "meanErrorMm",
+        "meanErrorPct",
+        "maxErrorPct",
+        "closeBlinkThreshold",
+        "openBlinkThreshold",
+        "intentionalBlinkMinMs",
+        "isActive",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "TrackingSession": {
+      "title": "TrackingSession",
+      "description": "Recorded section-level screen attention and blink telemetry session owned by an authenticated user.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "UID of the authenticated owner (must match request.auth.uid)."
+        },
+        "title": {
+          "type": "string",
+          "description": "Title of the reading passage or control deck session (1 to 120 chars)."
+        },
+        "deviceModel": {
+          "type": "string",
+          "description": "Android Build.MODEL identifier (1 to 80 chars)."
+        },
+        "contentType": {
+          "type": "string",
+          "enum": [
+            "READING_SECTIONS",
+            "AAC_CONTROL_DECK"
+          ],
+          "description": "Session category."
+        },
+        "durationSeconds": {
+          "type": "integer",
+          "description": "Active tracking duration in seconds."
+        },
+        "naturalBlinkCount": {
+          "type": "integer",
+          "description": "Count of natural involuntary blinks (80-349 ms)."
+        },
+        "intentionalBlinkCount": {
+          "type": "integer",
+          "description": "Count of intentional command blinks (350-900 ms)."
+        },
+        "blinksPerMinute": {
+          "type": "number",
+          "description": "Natural blink rate per minute."
+        },
+        "effectiveWordsPerMinute": {
+          "type": "integer",
+          "description": "Passage word count divided by active reading time in minutes."
+        },
+        "fixationClusterCount": {
+          "type": "integer",
+          "description": "Count of dispersion-grouped coarse fixation centroids."
+        },
+        "topZonePercentage": {
+          "type": "integer",
+          "description": "Percentage of active gaze time in top screen third (0-100)."
+        },
+        "middleZonePercentage": {
+          "type": "integer",
+          "description": "Percentage of active gaze time in middle screen third (0-100)."
+        },
+        "bottomZonePercentage": {
+          "type": "integer",
+          "description": "Percentage of active gaze time in bottom screen third (0-100)."
+        },
+        "sectionLoads": {
+          "type": "array",
+          "description": "Bounded list (max 12) of section dwell summary strings (e.g. 'sec_1:Intro:42')."
+        },
+        "clusterPoints": {
+          "type": "array",
+          "description": "Bounded list (max 40) of coarse fixation cluster strings encoded as 'x,y,dwellMs'."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp via FieldValue.serverTimestamp()."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp via FieldValue.serverTimestamp()."
+        }
+      },
+      "required": [
+        "userId",
+        "title",
+        "deviceModel",
+        "contentType",
+        "durationSeconds",
+        "naturalBlinkCount",
+        "intentionalBlinkCount",
+        "blinksPerMinute",
+        "effectiveWordsPerMinute",
+        "fixationClusterCount",
+        "topZonePercentage",
+        "middleZonePercentage",
+        "bottomZonePercentage",
+        "sectionLoads",
+        "clusterPoints",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/calibrations/{profileId}": {
+      "schema": {
+        "$ref": "#/entities/CalibrationProfile"
+      },
+      "description": "User-scoped calibration profiles containing standardized 2x6 regression matrices and held-out validation metrics (mean and worst-quadrant)."
+    },
+    "/users/{userId}/sessions/{sessionId}": {
+      "schema": {
+        "$ref": "#/entities/TrackingSession"
+      },
+      "description": "User-scoped eye tracking and section attention analytics sessions."
+    }
+  }
+}

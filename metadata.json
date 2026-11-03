@@ -1,0 +1,6 @@
+{
+  "name": "Æye",
+  "description": "Region-level front-camera gaze tracking, 5-point calibration with 4-point held-out validation, brow-raise & command-blink control, and section attention analytics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

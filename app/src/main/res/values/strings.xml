@@ -1,0 +1,16 @@
+<resources>
+    <string name="app_name">Æye</string>
+    <string name="auth_title">Æye Optical Workbench</string>
+    <string name="auth_subtitle">Region-level front-camera gaze tracking, 5-point calibration + 4-point held-out validation, pitch-compensated brow-raise &amp; command-blink triggers, and section attention analytics.</string>
+    <string name="sign_in_google">Sign in with Google</string>
+    <string name="privacy_notice_title">Biometric Telemetry &amp; Privacy Architecture</string>
+    <string name="privacy_notice_body">Raw front-camera frames are analyzed strictly in volatile device RAM to extract Eye-ROI pupil centroids, eyebrow displacement, and 3D head Euler angles—camera images are never saved or transmitted. Derived calibration matrices and session summaries persist locally on-device by default and sync to your private Cloud Firestore vault only when Cloud Sync is explicitly enabled.</string>
+    <string name="nav_calibrate">Calibrate</string>
+    <string name="nav_control">Control Deck</string>
+    <string name="nav_attention">Attention Lab</string>
+    <string name="nav_cloud">Cloud &amp; Privacy</string>
+    <string name="camera_permission_required">Front Camera Permission Required</string>
+    <string name="grant_camera_permission">Grant Camera Access</string>
+    <string name="simulator_mode_label">Simulator Proxy</string>
+    <string name="erase_all_cloud_data">Erase All Cloud Telemetry</string>
+</resources>

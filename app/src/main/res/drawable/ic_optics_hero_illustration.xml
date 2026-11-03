@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="360dp"
+    android:height="160dp"
+    android:viewportWidth="360"
+    android:viewportHeight="160">
+    <!-- Background Frame -->
+    <path
+        android:fillColor="#0E1525"
+        android:pathData="M0,0h360v160h-360z" />
+    <!-- Optical Calibration Grid Lines -->
+    <path
+        android:strokeColor="#1E293B"
+        android:strokeWidth="1"
+        android:pathData="M0,40h360M0,80h360M0,120h360M60,0v160M120,0v160M180,0v160M240,0v160M300,0v160" />
+    <!-- Outer Eye Contour Polygon -->
+    <path
+        android:strokeColor="#00E5FF"
+        android:strokeWidth="2.5"
+        android:fillColor="#1400E5FF"
+        android:pathData="M90,80 Q135,34 180,34 Q225,34 270,80 Q225,126 180,126 Q135,126 90,80 Z" />
+    <!-- Iris Boundary Ring -->
+    <path
+        android:strokeColor="#00E5FF"
+        android:strokeWidth="2"
+        android:fillColor="#2200E5FF"
+        android:pathData="M180,80m-32,0a32,32 0,1 1,64 0a32,32 0,1 1,-64 0" />
+    <!-- Pupil Centroid & Error Confidence Circle -->
+    <path
+        android:strokeColor="#10B981"
+        android:strokeWidth="2"
+        android:fillColor="#4410B981"
+        android:pathData="M180,80m-14,0a14,14 0,1 1,28 0a14,14 0,1 1,-28 0" />
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M180,80m-4,0a4,4 0,1 1,8 0a4,4 0,1 1,-8 0" />
+    <!-- 5-Point Calibration Targets & 4-Point Held-Out Validation Crosses -->
+    <path
+        android:fillColor="#00E5FF"
+        android:pathData="M40,26m-5,0a5,5 0,1 1,10 0a5,5 0,1 1,-10 0M320,26m-5,0a5,5 0,1 1,10 0a5,5 0,1 1,-10 0M40,134m-5,0a5,5 0,1 1,10 0a5,5 0,1 1,-10 0M320,134m-5,0a5,5 0,1 1,10 0a5,5 0,1 1,-10 0" />
+    <path
+        android:fillColor="#F59E0B"
+        android:pathData="M105,48m-4,0a4,4 0,1 1,8 0a4,4 0,1 1,-8 0M255,48m-4,0a4,4 0,1 1,8 0a4,4 0,1 1,-8 0M105,112m-4,0a4,4 0,1 1,8 0a4,4 0,1 1,-8 0M255,112m-4,0a4,4 0,1 1,8 0a4,4 0,1 1,-8 0" />
+</vector>
