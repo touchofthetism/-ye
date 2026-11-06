@@ -38,8 +38,12 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
+      # The action's default package list includes the legacy 'tools' package, which the SDK repository no longer
+      # serves ("Failed to find package 'tools'"), so request only platform-tools. AGP installs the compile SDK itself.
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
 
       # AGP 9.1.1 needs Gradle 9.x. This matches gradle/wrapper/gradle-wrapper.properties
       # (gradlew and the wrapper jar are not committed, so the wrapper itself cannot be used).
