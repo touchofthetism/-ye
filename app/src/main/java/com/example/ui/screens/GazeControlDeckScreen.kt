@@ -109,6 +109,34 @@ internal fun resolveFocusedDeckTile(
     }?.key
 }
 
+/**
+ * Centres of the visible, laid-out tiles normalized to [gazeFrameRootBounds]: the root content Box
+ * that hosts the reticle overlay, i.e. the frame gaze normX/normY are normalized to. These are the
+ * ViewModel's reference for background drift correction. Empty while that frame is unknown (zero
+ * size); tiles with empty (fully clipped) bounds or outside [visibleTileIds] are left out.
+ */
+internal fun tileCentersInGazeFrame(
+    tileBounds: Map<String, Rect>,
+    visibleTileIds: Set<String>,
+    gazeFrameRootBounds: Rect
+): Map<String, Pair<Float, Float>> {
+    if (gazeFrameRootBounds.width <= 0f || gazeFrameRootBounds.height <= 0f) return emptyMap()
+    val centers = HashMap<String, Pair<Float, Float>>(tileBounds.size)
+    for ((id, rect) in tileBounds) {
+        if (id !in visibleTileIds || rect.width <= 0f || rect.height <= 0f) continue
+        val center = rect.center
+        centers[id] = ((center.x - gazeFrameRootBounds.left) / gazeFrameRootBounds.width) to
+            ((center.y - gazeFrameRootBounds.top) / gazeFrameRootBounds.height)
+    }
+    return centers
+}
+
+/**
+ * [gazeFrameRootBounds] is the root-coordinate bounds of the Box that hosts the reticle overlay (the
+ * frame gaze normX/normY are normalized to); with it, [onUpdateTileCentersNorm] receives the visible
+ * tiles' centres in that frame whenever tile bounds, the visible tile set or the frame change, and an
+ * empty map when the deck leaves composition. With the default [Rect.Zero] only empty maps are sent.
+ */
 @Composable
 fun GazeControlDeckScreen(
     hudState: LiveGazeHudState,
@@ -125,7 +153,9 @@ fun GazeControlDeckScreen(
     onEditTilePhrase: (String, String, String) -> Unit = { _, _, _ -> },
     onSelectPosture: (com.example.data.model.GazePostureProfile) -> Unit = {},
     onSelectFilterMode: (com.example.data.model.GazeFilterMode) -> Unit = {},
-    onRunBenchmark: () -> Unit = {}
+    onRunBenchmark: () -> Unit = {},
+    gazeFrameRootBounds: Rect = Rect.Zero,
+    onUpdateTileCentersNorm: (Map<String, Pair<Float, Float>>) -> Unit = {}
 ) {
     // The reticle position changes up to every display frame. Only the hit-test coroutine reads it
     // (through this State), so a move recomposes just this wrapper: the deck body skips and the
@@ -146,7 +176,9 @@ fun GazeControlDeckScreen(
         onEditTilePhrase = onEditTilePhrase,
         onSelectPosture = onSelectPosture,
         onSelectFilterMode = onSelectFilterMode,
-        onRunBenchmark = onRunBenchmark
+        onRunBenchmark = onRunBenchmark,
+        gazeFrameRootBounds = gazeFrameRootBounds,
+        onUpdateTileCentersNorm = onUpdateTileCentersNorm
     )
 }
 
@@ -166,7 +198,9 @@ private fun GazeControlDeckContent(
     onEditTilePhrase: (String, String, String) -> Unit,
     onSelectPosture: (com.example.data.model.GazePostureProfile) -> Unit,
     onSelectFilterMode: (com.example.data.model.GazeFilterMode) -> Unit,
-    onRunBenchmark: () -> Unit
+    onRunBenchmark: () -> Unit,
+    gazeFrameRootBounds: Rect,
+    onUpdateTileCentersNorm: (Map<String, Pair<Float, Float>>) -> Unit
 ) {
     val tileBoundsMap = remember { mutableStateMapOf<String, Rect>() }
     var editingTile by remember { mutableStateOf<AacActionTile?>(null) }
@@ -195,6 +229,14 @@ private fun GazeControlDeckContent(
     val latestFocusedTileId by rememberUpdatedState(hudState.focusedTileId)
     val latestVisibleTileIds by rememberUpdatedState(visibleTileIds)
     val latestFocusHysteresisPx by rememberUpdatedState(focusHysteresisPx)
+    val latestOnUpdateTileCentersNorm by rememberUpdatedState(onUpdateTileCentersNorm)
+
+    // Drift-correction reference: the visible tiles' centres in the gaze frame, re-sent whenever a
+    // tile's bounds, the visible tile set or the frame change (snapshotFlow skips equal maps).
+    LaunchedEffect(gazeFrameRootBounds) {
+        snapshotFlow { tileCentersInGazeFrame(tileBoundsMap.toMap(), latestVisibleTileIds, gazeFrameRootBounds) }
+            .collect { latestOnUpdateTileCentersNorm(it) }
+    }
 
     // Hit-test using the exact root-window pixel coordinate of the rendered confidence reticle,
     // re-run whenever the reticle moves or a tile's bounds change, with focus hysteresis expansion
@@ -221,9 +263,12 @@ private fun GazeControlDeckContent(
     }
 
     // Leaving the deck (tab switch, back) must clear the hovered tile, or dwell, command blink and
-    // brow raise keep firing (and speaking) it on other tabs.
+    // brow raise keep firing (and speaking) it on other tabs. Its tile centres go stale with it.
     DisposableEffect(Unit) {
-        onDispose { latestOnUpdateFocusedTile(null) }
+        onDispose {
+            latestOnUpdateFocusedTile(null)
+            latestOnUpdateTileCentersNorm(emptyMap())
+        }
     }
 
     if (showDwellSettingsDialog) {

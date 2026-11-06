@@ -25,8 +25,10 @@ import com.example.ui.screens.AttentionAnalyticsScreen
 import com.example.ui.screens.CloudPrivacyScreen
 import com.example.ui.screens.PassageLayoutSnapshot
 import com.example.ui.screens.formatEstimatedWpm
+import com.example.ui.screens.formatSectionDwellLabel
 import com.example.ui.screens.formatSensitivityLabel
 import com.example.ui.screens.formatSessionSummaryLine
+import com.example.ui.screens.formatZoneSummary
 import com.example.ui.screens.indexOfActiveProfile
 import com.example.ui.screens.passageLocalGazePoint
 import com.example.ui.screens.resolveLayoutHitReport
@@ -103,10 +105,10 @@ class AnalyticsprivacyRegressionTest {
         assertFalse(shouldShowThermalGuard(AttentionSessionLiveState(isRecording = true, thermalThrottleDetected = false)))
     }
 
-    // A179 / A201: WPM is labelled as an estimate and a 0 (not enough on-passage gaze) is not shown as a speed.
+    // A179 / A201 / B57 / B58: WPM is labelled as an estimate; a 0 WPM or 0/0/0 zones (no gaze data) is shown as n/a.
     @Test
-    fun `session summary labels wpm as an estimate and shows a dash for zero`() {
-        assertEquals("est. WPM —", formatEstimatedWpm(0))
+    fun `session summary labels wpm as an estimate and shows n-a for sessions without data`() {
+        assertEquals("est. WPM n/a", formatEstimatedWpm(0))
         assertTrue(formatEstimatedWpm(184).startsWith("184 est. WPM"))
         val line = formatSessionSummaryLine(
             TrackingSession(
@@ -122,9 +124,22 @@ class AnalyticsprivacyRegressionTest {
             )
         )
         assertFalse(line, line.contains("eff. WPM"))
-        assertTrue(line, line.contains("est. WPM —"))
+        assertTrue(line, line.contains("est. WPM n/a"))
         assertTrue(line, line.startsWith("30s • "))
         assertTrue(line, line.contains("12.5 blinks/min"))
+        assertTrue(line, line.endsWith("Zones n/a"))
+        assertFalse(line, line.contains("0%"))
+
+        assertEquals("Zones T:50% M:30% B:20%", formatZoneSummary(50, 30, 20))
+        assertEquals("Zones T:0% M:0% B:100%", formatZoneSummary(0, 0, 100))
+    }
+
+    // B57: section dwell shares that sum to 0 are "no data", not "0% dwell" on every section.
+    @Test
+    fun `section dwell label shows n-a when no section has dwell`() {
+        assertEquals("dwell n/a", formatSectionDwellLabel(0, anySectionDwell = false))
+        assertEquals("0% dwell", formatSectionDwellLabel(0, anySectionDwell = true))
+        assertEquals("64% dwell", formatSectionDwellLabel(64, anySectionDwell = true))
     }
 
     // A181: M3 slider ticks come back as e.g. 1899.9999f; truncation turned the MOTOR_ASSIST 1900 ms tick into 1899.

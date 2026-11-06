@@ -123,8 +123,12 @@ fun OpticalDiagnosticsBar(
     var showSimulatorPad by remember { mutableStateOf(false) }
     var expandCameraPreview by remember { mutableStateOf(true) }
     val isEmulator = remember { isRunningOnEmulatorHardware() }
+    // analyzerFps is 0 only when no frame has arrived recently (the ViewModel watchdog zeroes it), so the
+    // last rawFeature is stale then and must not be shown as a face lock.
+    val hasRecentFrames = hudState.analyzerFps > 0
     // "Locked" styling only for real camera frames: emulator frames come from the synthetic ticker.
-    val isLiveOpticalLock = hudState.rawFeature.faceDetected && !hudState.isSimulatorProxyEnabled && !isEmulator
+    val isLiveOpticalLock = hasRecentFrames && hudState.rawFeature.faceDetected &&
+        !hudState.isSimulatorProxyEnabled && !isEmulator
     val browRaiseThreshold = remember(hudState.neutralBrowRatio, hudState.raisedBrowRatio) {
         browRaiseTriggerThreshold(hudState.neutralBrowRatio, hudState.raisedBrowRatio)
     }
@@ -159,7 +163,7 @@ fun OpticalDiagnosticsBar(
                             .size(10.dp)
                             .clip(CircleShape)
                             .background(
-                                if (hudState.rawFeature.faceDetected) MaterialTheme.colorScheme.secondary
+                                if (hasRecentFrames && hudState.rawFeature.faceDetected) MaterialTheme.colorScheme.secondary
                                 else MaterialTheme.colorScheme.tertiary
                             )
                     )
@@ -417,14 +421,7 @@ fun OpticalDiagnosticsBar(
 
                         if (expandCameraPreview) {
                             Text(
-                                text = String.format(
-                                    java.util.Locale.US,
-                                    "Eye Open: L %.0f%% / R %.0f%% • Brow Ratio: %.2f (Trigger ≥ %.2f)",
-                                    f.leftEyeOpenProb * 100f,
-                                    f.rightEyeOpenProb * 100f,
-                                    f.browToEyeRatio,
-                                    browRaiseThreshold
-                                ),
+                                text = eyeOpenBrowLine(f, browRaiseThreshold),
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -1349,10 +1346,27 @@ private class HeatmapSplat(val center: Offset, val radius: Float, val brush: Bru
  * (neutral + 0.60 * max(raised - neutral, 0.035)), so the HUD and overlay show the real trigger.
  */
 internal fun browRaiseTriggerThreshold(neutralBrowRatio: Float, raisedBrowRatio: Float): Float =
-    BrowRaiseHysteresisDetector(
-        neutralBrowRatio = neutralBrowRatio,
-        raisedBrowRatio = raisedBrowRatio
-    ).raiseThreshold
+    BrowRaiseHysteresisDetector.raiseThresholdFor(neutralBrowRatio, raisedBrowRatio)
+
+/**
+ * Expanded-preview eye-open / brow line. No-face frames carry placeholder values (0 eye-open probability,
+ * default brow ratio), so they show "--" instead of reading as closed eyes or a neutral brow.
+ */
+internal fun eyeOpenBrowLine(feature: GazeFeatureVector, browRaiseThreshold: Float): String {
+    val trigger = String.format(java.util.Locale.US, "%.2f", browRaiseThreshold)
+    return if (feature.faceDetected) {
+        String.format(
+            java.util.Locale.US,
+            "Eye Open: L %.0f%% / R %.0f%% • Brow Ratio: %.2f (Trigger ≥ %s)",
+            feature.leftEyeOpenProb * 100f,
+            feature.rightEyeOpenProb * 100f,
+            feature.browToEyeRatio,
+            trigger
+        )
+    } else {
+        "Eye Open: L -- / R -- • Brow Ratio: -- (Trigger ≥ $trigger)"
+    }
+}
 
 /** Error % used for the reticle when accuracy has not been validated (deliberately wide). */
 internal const val UNCALIBRATED_RETICLE_ERROR_PCT = 20f
@@ -1399,14 +1413,20 @@ internal fun gazeTelemetryLine(hudState: LiveGazeHudState): String {
     return "$gaze • $eyes • $accuracy • $luma"
 }
 
-/** Header status: says where the frames come from instead of claiming an optical lock for synthetic data. */
-internal fun analyzerStatusLabel(isSimulator: Boolean, isEmulator: Boolean, faceDetected: Boolean, fps: Int): String =
-    when {
-        isSimulator -> "SIM PROXY • $fps FPS"
-        isEmulator -> "EMULATOR SYNTHETIC • $fps FPS"
-        faceDetected -> "OPTICAL LOCK • $fps FPS"
-        else -> "SEARCHING FACE... • $fps FPS"
+/**
+ * Header status: says where the frames come from instead of claiming an optical lock for synthetic data.
+ * fps <= 0 means no frame arrived recently (the last face result is stale), shown as "NO FRAMES", never "0 FPS".
+ */
+internal fun analyzerStatusLabel(isSimulator: Boolean, isEmulator: Boolean, faceDetected: Boolean, fps: Int): String {
+    val rate = if (fps > 0) "$fps FPS" else "NO FRAMES"
+    return when {
+        isSimulator -> "SIM PROXY • $rate"
+        isEmulator -> "EMULATOR SYNTHETIC • $rate"
+        fps <= 0 -> "CAMERA • NO FRAMES"
+        faceDetected -> "OPTICAL LOCK • $rate"
+        else -> "SEARCHING FACE... • $rate"
     }
+}
 
 /** Camera pipeline label: device-neutral, no unverified sensor/FOV claims. */
 internal fun cameraPipelineLabel(isSimulator: Boolean, isEmulator: Boolean, deviceModel: String?): String =

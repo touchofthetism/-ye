@@ -16,7 +16,8 @@ import kotlin.math.min
  * Mathematical engine implementing:
  * 1. Standardized-Feature Ridge-Regularized 2x6 Cross-Coupled Ordinary Least Squares (OLS)
  *    mapping standardized f_std = [1, gx/0.25, gy/0.20, yaw/20, pitch/15, roll/15 + 0.5*distScale]^T
- *    to normalized screen coordinates (x_screen, y_screen) with uniform penalty lambda = 1e-2.
+ *    to normalized screen coordinates (x_screen, y_screen) with per-sample penalty lambda = 2.5e-2
+ *    (iris terms scaled by their own mean square, see [fitRidgeAffineMatrix2x6]).
  * 2. 4-Point Held-Out Validation reporting Primary Normalized Screen Error (meanErrorPct),
  *    Worst-Quadrant Error (maxErrorPct), and Approximate Physical Error (~mm, calibrated for
  *    Google Pixel 10 Pro XL 6.8" LTPO OLED 71.3mm x 158.4mm active area or DisplayMetrics fallback).
@@ -207,11 +208,23 @@ object GazeCalibrationMath {
             }
         }
 
-        // Uniform Ridge penalty on standardized unit-scale features + prior shrinkage toward default weights
+        // Ridge penalty + prior shrinkage toward the default weights. The fixed divisors leave real
+        // phone-distance iris offsets far below unit scale (gx/0.25 is often within +/-0.15), so a uniform
+        // penalty would dominate their tiny sum of squares and pull the fit back to the prior, compressing
+        // the corners toward the centre. The iris features (1, 2) are therefore penalized relative to their
+        // own mean square (clamped to 0.02..1.0 so a near-constant feature still shrinks to the prior).
+        // Head-pose features (3..5) keep the full penalty and the intercept the light 0.05 penalty. The
+        // divisors themselves are unchanged, so stored matrices remain valid.
         val prior = DEFAULT_AFFINE_MATRIX_2X6
-        val effectiveLambda = ridgeLambda * activeSamples.size.coerceAtLeast(1)
+        val sampleCount = activeSamples.size.coerceAtLeast(1)
+        val effectiveLambda = ridgeLambda * sampleCount
         for (i in 0 until dim) {
-            val reg = if (i == 0) effectiveLambda * 0.05 else effectiveLambda
+            val reg = when (i) {
+                0 -> effectiveLambda * 0.05
+                // a[i][i] is still the raw sum of f[i]^2 here (reg is added below)
+                1, 2 -> effectiveLambda * (a[i][i] / sampleCount).coerceIn(0.02, 1.0)
+                else -> effectiveLambda
+            }
             a[i][i] += reg
             bx[i] += reg * prior[i]
             by[i] += reg * prior[6 + i]

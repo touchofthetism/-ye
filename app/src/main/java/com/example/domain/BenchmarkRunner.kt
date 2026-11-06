@@ -161,11 +161,7 @@ object BenchmarkRunner {
         val blinkDetector = BlinkHysteresisDetector()
         val browDetector = BrowRaiseHysteresisDetector()
         // Same tuning as the engine's pupil filter and the ViewModel's screen filter.
-        val pupilFilter = OneEuroFilter2D(
-            minCutoff = CameraGazeAnalyzerEngine.PUPIL_FILTER_MIN_CUTOFF_HZ,
-            beta = CameraGazeAnalyzerEngine.PUPIL_FILTER_BETA,
-            dCutoff = CameraGazeAnalyzerEngine.PUPIL_FILTER_D_CUTOFF_HZ
-        )
+        val pupilFilter = CameraGazeAnalyzerEngine.newPupilGazeFilter()
         val screenFilter = OneEuroFilter2D(
             minCutoff = SCREEN_FILTER_MIN_CUTOFF_HZ,
             beta = SCREEN_FILTER_BETA,

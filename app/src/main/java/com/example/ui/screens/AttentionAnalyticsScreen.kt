@@ -105,7 +105,14 @@ internal fun shouldShowThermalGuard(state: AttentionSessionLiveState): Boolean =
 
 /** Words of the sections the gaze dwelled on per minute of on-passage time; 0 means not enough on-passage gaze. */
 internal fun formatEstimatedWpm(wordsPerMinute: Int): String =
-    if (wordsPerMinute > 0) "$wordsPerMinute est. WPM (dwelled sections)" else "est. WPM —"
+    if (wordsPerMinute > 0) "$wordsPerMinute est. WPM (dwelled sections)" else "est. WPM n/a"
+
+/**
+ * Per-section dwell label. When no section has any dwell (the shares sum to 0: nothing recorded yet, or a saved
+ * session without on-passage gaze) there is no share to show, so every section reads "n/a" instead of "0%".
+ */
+internal fun formatSectionDwellLabel(percentage: Int, anySectionDwell: Boolean): String =
+    if (anySectionDwell) "$percentage% dwell" else "dwell n/a"
 
 /** Compatibility overload for callers that read the reticle state in their own scope. */
 @Composable
@@ -303,6 +310,7 @@ fun AttentionAnalyticsScreen(
                     .padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
+                val anySectionDwell = sectionSummaries.sumOf { it.percentage } > 0
                 passageSections.forEach { section ->
                     val summary = sectionSummaries.firstOrNull { it.sectionId == section.sectionId }
                     val isCurrentlyLookedAt = attentionState.isRecording && attentionState.activeSectionId == section.sectionId
@@ -343,7 +351,7 @@ fun AttentionAnalyticsScreen(
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "$pct% dwell",
+                                text = formatSectionDwellLabel(pct, anySectionDwell),
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.primary
                             )

@@ -150,8 +150,11 @@ tasks.withType<Test> {
   failFast = true
   // Task-wide limit (not per test): a cold run downloads the Robolectric SDK 36 jar and makes emulator round trips.
   timeout.set(Duration.ofMinutes(if (benchmarkEnabled) 30 else 20))
-  // EyeTrackingRepositoryRuleTest / RoundTripTest exercise firestore.rules through the Firebase emulator, so the
-  // rules and emulator config are test inputs, and a cached or up-to-date result must never stand in for a run.
+  // EyeTrackingRepositoryRuleTest / RoundTripTest and regression.CloudEmulatorRegressionTest exercise firestore.rules
+  // through the Firebase emulator, so the rules and emulator config are test inputs, and a cached or up-to-date result
+  // must never stand in for a run. Gradle does not manage the emulator: when you run one yourself, restart it after
+  // editing firestore.rules (its hot reload did not apply the new rules to the named database). CI starts a fresh
+  // emulator per run with `firebase emulators:exec`.
   inputs.files(rootProject.file("firestore.rules"), rootProject.file("firebase.json"))
     .withPathSensitivity(PathSensitivity.RELATIVE)
     .withPropertyName("firebaseEmulatorConfig")

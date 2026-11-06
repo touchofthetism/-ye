@@ -52,6 +52,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.data.model.CalibrationProfile
 import com.example.data.model.TrackingSession
+import com.example.ui.components.DWELL_DURATION_SLIDER_RANGE_MS
 import com.example.ui.viewmodel.LiveGazeHudState
 import com.example.ui.viewmodel.UiDataState
 import java.util.Locale
@@ -91,15 +92,21 @@ internal fun formatProfileErrorLine(profile: CalibrationProfile): String = Strin
     profile.maxErrorPct
 )
 
+/** A session without gaze samples saves 0/0/0 zones; that is "no zone data", not a 0% share of every zone. */
+internal fun formatZoneSummary(topPct: Int, middlePct: Int, bottomPct: Int): String =
+    if (topPct + middlePct + bottomPct <= 0) {
+        "Zones n/a"
+    } else {
+        String.format(Locale.US, "Zones T:%d%% M:%d%% B:%d%%", topPct, middlePct, bottomPct)
+    }
+
 internal fun formatSessionSummaryLine(session: TrackingSession): String = String.format(
     Locale.US,
-    "%ds • %s • %.1f blinks/min • Zones T:%d%% M:%d%% B:%d%%",
+    "%ds • %s • %.1f blinks/min • %s",
     session.durationSeconds,
     formatEstimatedWpm(session.effectiveWordsPerMinute),
     session.blinksPerMinute,
-    session.topZonePercentage,
-    session.middleZonePercentage,
-    session.bottomZonePercentage
+    formatZoneSummary(session.topZonePercentage, session.middleZonePercentage, session.bottomZonePercentage)
 )
 
 /**
@@ -322,7 +329,7 @@ private fun DwellSettingsCard(
                 androidx.compose.material3.Slider(
                     value = dwellTriggerMs.toFloat(),
                     onValueChange = { onChangeDwellDurationMs(sliderValueToDwellMs(it)) },
-                    valueRange = 400f..2200f,
+                    valueRange = DWELL_DURATION_SLIDER_RANGE_MS,
                     steps = 17,
                     modifier = Modifier
                         .fillMaxWidth()

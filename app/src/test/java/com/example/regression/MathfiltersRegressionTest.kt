@@ -214,6 +214,46 @@ class MathfiltersRegressionTest {
         assertEquals(40, GazeCalibrationMath.clusterFixations(samples).size)
     }
 
+    // A57: physical-scale iris offsets are not shrunk back to the prior, so the corners stay at the corners.
+    @Test
+    fun `ridge fit on physical-scale iris offsets reaches the corner targets`() {
+        val fitSamples = GazeCalibrationMath.FIVE_POINT_CALIBRATION_TARGETS.flatMap { t ->
+            List(18) { k ->
+                val jitter = kotlin.math.sin(k * 1.7) * 0.002
+                Pair(
+                    GazeFeatureVector(
+                        gx = (t.normX - 0.5) * 0.08 + jitter,
+                        gy = (t.normY - 0.5) * 0.06 - jitter,
+                        faceDetected = true,
+                        timestampMs = 0L
+                    ),
+                    Pair(t.normX, t.normY)
+                )
+            }
+        }
+        val matrix = GazeCalibrationMath.fitRidgeAffineMatrix2x6(fitSamples, 148.0)
+
+        GazeCalibrationMath.FIVE_POINT_CALIBRATION_TARGETS.forEach { t ->
+            val feature = GazeFeatureVector(gx = (t.normX - 0.5) * 0.08, gy = (t.normY - 0.5) * 0.06, timestampMs = 0L)
+            val (x, y) = GazeCalibrationMath.projectGaze(feature, matrix, 148.0)
+            assertEquals("x for ${t.shortName}", t.normX, x, 0.03f)
+            assertEquals("y for ${t.shortName}", t.normY, y, 0.03f)
+        }
+
+        val heldOut = GazeCalibrationMath.HELD_OUT_VALIDATION_TARGETS.map { t ->
+            Pair(
+                GazeFeatureVector(gx = (t.normX - 0.5) * 0.08, gy = (t.normY - 0.5) * 0.06, timestampMs = 0L),
+                Pair(t.normX, t.normY)
+            )
+        }
+        val metrics = GazeCalibrationMath.evaluateHeldOutValidation(matrix, heldOut, 148.0)
+        assertTrue("held-out mean error ${metrics.meanErrorPct}% should be small", metrics.meanErrorPct < 5.0)
+
+        // Head-pose terms keep the full penalty: with no head movement they stay at the prior weights.
+        assertEquals(DEFAULT_AFFINE_MATRIX_2X6[3], matrix[3], 1e-9)
+        assertEquals(DEFAULT_AFFINE_MATRIX_2X6[10], matrix[10], 1e-9)
+    }
+
     // A18: a long gap re-initializes the filters from the current sample instead of a stale state.
     @Test
     fun `filters re-initialize after a stale gap`() {

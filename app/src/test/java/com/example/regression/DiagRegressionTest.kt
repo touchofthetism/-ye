@@ -8,6 +8,7 @@ import com.example.ui.components.UNCALIBRATED_RETICLE_ERROR_PCT
 import com.example.ui.components.analyzerStatusLabel
 import com.example.ui.components.browRaiseTriggerThreshold
 import com.example.ui.components.cameraPipelineLabel
+import com.example.ui.components.eyeOpenBrowLine
 import com.example.ui.components.gazeTelemetryLine
 import com.example.ui.components.glareWarningSentence
 import com.example.ui.components.lowLightWarningSentence
@@ -136,6 +137,72 @@ class DiagRegressionTest {
             browRaiseTriggerThreshold(0.30f, 0.32f),
             1e-6f
         )
+    }
+
+    @Test
+    fun browTriggerThresholdUsesDetectorCompanionFormula() {
+        assertEquals(
+            BrowRaiseHysteresisDetector.raiseThresholdFor(0.31f, 0.47f),
+            browRaiseTriggerThreshold(0.31f, 0.47f),
+            0f
+        )
+    }
+
+    // --- B62: a stopped frame stream is shown as NO FRAMES, never as "0 FPS" or a stale optical lock ---
+
+    @Test
+    fun statusLabelSaysNoFramesInsteadOfZeroFps() {
+        val live = analyzerStatusLabel(isSimulator = false, isEmulator = false, faceDetected = true, fps = 0)
+        assertEquals("CAMERA • NO FRAMES", live)
+        assertFalse(live, live.contains("0 FPS"))
+        assertFalse(live, live.contains("OPTICAL LOCK"))
+        assertEquals(
+            "CAMERA • NO FRAMES",
+            analyzerStatusLabel(isSimulator = false, isEmulator = false, faceDetected = false, fps = 0)
+        )
+        assertEquals("SIM PROXY • NO FRAMES", analyzerStatusLabel(isSimulator = true, isEmulator = false, faceDetected = true, fps = 0))
+        assertEquals("EMULATOR SYNTHETIC • NO FRAMES", analyzerStatusLabel(isSimulator = false, isEmulator = true, faceDetected = true, fps = 0))
+        // Default HUD state (no frame ever delivered) does not claim a frame rate.
+        val initial = LiveGazeHudState()
+        val label = analyzerStatusLabel(
+            isSimulator = initial.isSimulatorProxyEnabled,
+            isEmulator = false,
+            faceDetected = initial.rawFeature.faceDetected,
+            fps = initial.analyzerFps
+        )
+        assertFalse(label, label.contains("FPS"))
+    }
+
+    // --- Engine no-face frames carry 0 eye-open probability: show "--", not closed eyes ---
+
+    @Test
+    fun eyeOpenLineHidesNoFacePlaceholders() {
+        val noFace = eyeOpenBrowLine(
+            GazeFeatureVector(faceDetected = false, leftEyeOpenProb = 0f, rightEyeOpenProb = 0f),
+            0.388f
+        )
+        assertEquals("Eye Open: L -- / R -- • Brow Ratio: -- (Trigger ≥ 0.39)", noFace)
+        assertFalse(noFace, noFace.contains("0%"))
+    }
+
+    @Test
+    fun eyeOpenLineShowsMeasuredValuesWithUsLocale() {
+        val previous = Locale.getDefault()
+        Locale.setDefault(Locale.GERMANY)
+        try {
+            val line = eyeOpenBrowLine(
+                GazeFeatureVector(
+                    faceDetected = true,
+                    leftEyeOpenProb = 0.81f,
+                    rightEyeOpenProb = 0.64f,
+                    browToEyeRatio = 0.4123f
+                ),
+                0.388f
+            )
+            assertEquals("Eye Open: L 81% / R 64% • Brow Ratio: 0.41 (Trigger ≥ 0.39)", line)
+        } finally {
+            Locale.setDefault(previous)
+        }
     }
 
     // --- C3 / A214 / A23 / A55: no fabricated accuracy or placeholder per-eye/luma values in the HUD ---
