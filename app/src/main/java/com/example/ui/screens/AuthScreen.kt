@@ -62,6 +62,9 @@ import androidx.credentials.CredentialManager
 import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
 import androidx.credentials.exceptions.GetCredentialCancellationException
+import androidx.credentials.exceptions.GetCredentialInterruptedException
+import androidx.credentials.exceptions.GetCredentialProviderConfigurationException
+import androidx.credentials.exceptions.NoCredentialException
 import com.example.R
 import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
@@ -72,8 +75,35 @@ import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.GoogleAuthProvider
 import com.google.firebase.auth.auth
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.cancellation.CancellationException
+
+/** Upper bound on the credential-state clear that runs before the Firebase sign-out. */
+internal const val CREDENTIAL_CLEAR_TIMEOUT_MS = 3_000L
+
+/**
+ * Suppresses the returning-user auto sign-in for the rest of the process after an explicit
+ * sign-out, so the AuthScreen shown next does not immediately offer (or auto-select) the account
+ * the user just left. A cold start resets it; a successful explicit sign-in clears it.
+ */
+internal object AutoSignInGate {
+    @Volatile
+    var suppressedAfterSignOut: Boolean = false
+}
+
+/**
+ * Rethrows when this coroutine itself was cancelled (its scope went away), so structured
+ * cancellation is never reported as a sign-in or sign-out failure. A [CancellationException] from
+ * elsewhere (for example a cancelled Task) while the coroutine is still active falls through and is
+ * handled as an ordinary failure, so the caller's loading state still clears.
+ */
+private fun CoroutineScope.rethrowIfCancelled(e: Exception) {
+    if (e is CancellationException) ensureActive()
+}
 
 fun attemptAutoSignIn(
     context: Context,
@@ -85,6 +115,10 @@ fun attemptAutoSignIn(
 ) {
     if (auth.currentUser != null) {
         onAuthSuccess()
+        return
+    }
+    if (AutoSignInGate.suppressedAfterSignOut) {
+        onUnauthenticated()
         return
     }
     val clientId = try {
@@ -115,7 +149,15 @@ fun attemptAutoSignIn(
             } else {
                 onUnauthenticated()
             }
+        } catch (e: NoCredentialException) {
+            Log.d("Auth", "Auto sign-in: no authorized Google account on this device")
+            onUnauthenticated()
+        } catch (e: GetCredentialCancellationException) {
+            Log.d("Auth", "Auto sign-in dismissed")
+            onUnauthenticated()
         } catch (e: Exception) {
+            rethrowIfCancelled(e)
+            Log.w("Auth", "Auto sign-in did not complete", e)
             onUnauthenticated()
         }
     }
@@ -149,6 +191,7 @@ fun onGoogleSignInClicked(
                 val googleIdToken = GoogleIdTokenCredential.createFrom(credential.data).idToken
                 val authCredential = GoogleAuthProvider.getCredential(googleIdToken, null)
                 auth.signInWithCredential(authCredential).await()
+                AutoSignInGate.suppressedAfterSignOut = false
                 onAuthSuccess()
             } else {
                 onAuthError("Unexpected credential type")
@@ -156,7 +199,17 @@ fun onGoogleSignInClicked(
         } catch (e: GetCredentialCancellationException) {
             Log.w("Auth", "Google Sign-In cancelled or dismissed: ${e.message}", e)
             onAuthCancelled()
+        } catch (e: NoCredentialException) {
+            Log.w("Auth", "Google Sign-In found no usable credential", e)
+            onAuthError("No Google account is available on this device. Add one in system Settings > Accounts, then try again.")
+        } catch (e: GetCredentialProviderConfigurationException) {
+            Log.w("Auth", "Google Sign-In credential provider unavailable", e)
+            onAuthError("Google sign-in needs an up-to-date version of Google Play services on this device.")
+        } catch (e: GetCredentialInterruptedException) {
+            Log.w("Auth", "Google Sign-In interrupted", e)
+            onAuthError("Sign-in was interrupted. Please try again.")
         } catch (e: Exception) {
+            rethrowIfCancelled(e)
             Log.e("Auth", "Google Sign-In failed", e)
             onAuthError(e.localizedMessage ?: "Sign in failed")
         }
@@ -170,13 +223,25 @@ fun signOutUser(
     scope: CoroutineScope,
     auth: FirebaseAuth = Firebase.auth
 ) {
-    auth.signOut()
-    scope.launch {
+    AutoSignInGate.suppressedAfterSignOut = true
+    // UNDISPATCHED: the body starts right here, so the finally block below (the Firebase sign-out)
+    // runs even when [scope] is cancelled before a dispatch would have started it.
+    scope.launch(start = CoroutineStart.UNDISPATCHED) {
         try {
-            credentialManager.clearCredentialState(ClearCredentialStateRequest())
+            // Clear first: it turns off Google auto-select for the next sign-in. The Firebase
+            // sign-out waits for it because it removes the composition that may own [scope].
+            val cleared = withTimeoutOrNull(CREDENTIAL_CLEAR_TIMEOUT_MS) {
+                credentialManager.clearCredentialState(ClearCredentialStateRequest())
+            }
+            if (cleared == null) {
+                Log.w("Auth", "Clearing credential state timed out after $CREDENTIAL_CLEAR_TIMEOUT_MS ms")
+            }
         } catch (e: Exception) {
+            rethrowIfCancelled(e)
             Log.e("Auth", "Failed to clear credential state", e)
         } finally {
+            // Sign out even on failure, timeout or cancellation.
+            auth.signOut()
             onSignOutComplete()
         }
     }
@@ -201,11 +266,17 @@ fun AuthScreen(
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(auth) {
+        // Disable the button while the auto attempt runs so a tap cannot start a second,
+        // overlapping sign-in. Every path of attemptAutoSignIn ends in one of the callbacks.
+        isLoading = true
         attemptAutoSignIn(
             context = context,
             credentialManager = credentialManager,
-            onAuthSuccess = onAuthSuccess,
-            onUnauthenticated = {},
+            onAuthSuccess = {
+                isLoading = false
+                onAuthSuccess()
+            },
+            onUnauthenticated = { isLoading = false },
             scope = coroutineScope,
             auth = auth
         )
@@ -224,8 +295,8 @@ fun AuthScreen(
         ) {
             Column(
                 modifier = Modifier
-                    .fillMaxWidth()
                     .widthIn(max = 520.dp)
+                    .fillMaxWidth()
                     .verticalScroll(rememberScrollState())
                     .padding(vertical = 24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
@@ -298,7 +369,7 @@ fun AuthScreen(
                         FeatureRow(
                             icon = Icons.Outlined.Analytics,
                             title = "Schmitt-Trigger Blink & Section Dwell Lab",
-                            desc = "Disambiguates 80–349ms natural blinks from 350–900ms command blinks and tracks paragraph dwell."
+                            desc = "Disambiguates 80–349ms natural blinks from 350–800ms command blinks and tracks paragraph dwell."
                         )
                         Spacer(modifier = Modifier.height(12.dp))
                         FeatureRow(

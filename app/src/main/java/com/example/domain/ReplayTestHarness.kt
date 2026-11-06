@@ -1,10 +1,13 @@
 package com.example.domain
 
+import com.example.data.model.BlinkType
 import com.example.data.model.GazeFeatureVector
+import java.util.Locale
 import kotlin.math.PI
+import kotlin.math.ceil
 import kotlin.math.cos
-import kotlin.math.hypot
 import kotlin.math.sin
+import kotlin.math.sqrt
 import kotlin.random.Random
 
 /**
@@ -42,11 +45,24 @@ enum class ReplayScenario(val label: String, val category: String) {
     NO_FACE_IN_FRAME("Empty Room / No Face Detected", "SCENE"),
     MULTIPLE_FACES_PRIMARY_LOCK("Two Faces / Primary User Area Lock", "SCENE"),
 
-    ENDURANCE_60_MIN("Continuous 60-Minute Session Stream", "ENDURANCE")
+    // The enum name is kept for compatibility; the replayed segment is short (see BenchmarkRunner), not 60 min.
+    ENDURANCE_60_MIN("Long-Session Mix: Saccades, Blinks & Holds (short replay segment)", "ENDURANCE")
 }
 
 /**
  * Result record from a replay scenario evaluation.
+ *
+ * @property falseActivations Blink-command or brow-raise triggers the scenario did not ask for: every
+ *   trigger outside COMMAND scenarios, and any wrong-gesture or repeated trigger inside them.
+ * @property validActivations Expected deliberate gesture captured in a COMMAND scenario (at most 1).
+ * @property rmsJitterPx RMS displacement of the filtered gaze around its mean over the middle half of
+ *   the emitted gaze points, in screen pixels per axis (x scaled by width, y by height). NaN when the
+ *   pipeline emitted fewer than 10 gaze points, so no jitter could be measured.
+ * @property latencySamplesMs Per-frame post-feature processing times (ascending), for pooled statistics.
+ * @property gazeFramesEmitted Frames on which the pipeline produced a fresh gaze sample (face present
+ *   and eyelids open); on the other frames the reticle holds its previous position, as the live app does.
+ * @property edgeClampedFramePct Percentage of [gazeFramesEmitted] whose projection hit the screen-edge
+ *   clamp on either axis, i.e. frames whose output position is a clamp value rather than a mapping result.
  */
 data class ScenarioEvaluationResult(
     val scenario: ReplayScenario,
@@ -57,7 +73,10 @@ data class ScenarioEvaluationResult(
     val meanLatencyMs: Double,
     val p95LatencyMs: Double,
     val rmsJitterPx: Double,
-    val notes: String
+    val notes: String,
+    val latencySamplesMs: List<Double> = emptyList(),
+    val gazeFramesEmitted: Int = 0,
+    val edgeClampedFramePct: Double = 0.0
 )
 
 /**
@@ -66,6 +85,37 @@ data class ScenarioEvaluationResult(
  * facial contractions, and system disturbances, feeding them into the tracking pipeline.
  */
 object ReplayTestHarness {
+
+    /** Cadence of the synthetic traces (~30 FPS). */
+    const val FRAME_INTERVAL_MS = 33L
+
+    /**
+     * EYES_CLOSED_REST_5S keeps the eyes closed for this many frames (152 x 33 ms = 5.016 s) and then
+     * reopens them, so the detector has to classify a real 5 s closure. Shorter traces never reopen.
+     */
+    const val EYES_CLOSED_REST_CLOSED_FRAMES = 152
+
+    // Same bounds GazeCalibrationMath.projectGaze clamps its output to.
+    private const val PROJECTION_CLAMP_MIN = 0.02f
+    private const val PROJECTION_CLAMP_MAX = 0.98f
+
+    /** Number of frames that cover [durationMs] at [FRAME_INTERVAL_MS]. */
+    fun framesForDurationMs(durationMs: Long): Int =
+        ceil(durationMs.toDouble() / FRAME_INTERVAL_MS.toDouble()).toInt()
+
+    /** Median of an ascending list (mean of the two middle values for an even size); 0.0 when empty. */
+    fun medianOfSorted(sorted: List<Double>): Double {
+        if (sorted.isEmpty()) return 0.0
+        val mid = sorted.size / 2
+        return if (sorted.size % 2 == 1) sorted[mid] else (sorted[mid - 1] + sorted[mid]) / 2.0
+    }
+
+    /** Nearest-rank percentile ([quantile] in 0..1) of an ascending list; 0.0 when empty. */
+    fun percentileOfSorted(sorted: List<Double>, quantile: Double): Double {
+        if (sorted.isEmpty()) return 0.0
+        val rank = ceil(quantile.coerceIn(0.0, 1.0) * sorted.size).toInt()
+        return sorted[(rank - 1).coerceIn(0, sorted.size - 1)]
+    }
 
     /**
      * Synthesizes a deterministic frame sequence for a given scenario.
@@ -79,7 +129,7 @@ object ReplayTestHarness {
     ): List<GazeFeatureVector> {
         val frames = mutableListOf<GazeFeatureVector>()
         val random = Random(42 + scenario.ordinal)
-        val dtMs = 33L // ~30 FPS default cadence
+        val dtMs = FRAME_INTERVAL_MS // ~30 FPS default cadence
 
         for (i in 0 until frameCount) {
             val ts = startTs + i * dtMs
@@ -210,8 +260,10 @@ object ReplayTestHarness {
                     yaw = 28.0
                 }
                 ReplayScenario.EYES_CLOSED_REST_5S -> {
-                    // Closed eyes for entire duration
-                    leftOpen = 0.02f; rightOpen = 0.02f
+                    // Eyes closed for 5 s, then reopened: the reopening is what the blink detector classifies.
+                    if (i < EYES_CLOSED_REST_CLOSED_FRAMES) {
+                        leftOpen = 0.02f; rightOpen = 0.02f
+                    }
                 }
                 ReplayScenario.INTENTIONAL_SELECTION_BLINK -> {
                     // Deliberate command blink: frames 40 to 54 closed (14 frames * 33ms = 462 ms)
@@ -277,11 +329,16 @@ object ReplayTestHarness {
     }
 
     /**
-     * Executes a trace through the gaze pipeline, evaluating:
-     * - Number of false activations (MUST be 0 for Midas Touch scenarios)
-     * - Successful valid command detections (for deliberate command blinks/brow raises)
-     * - Filtered jitter suppression (RMS displacement)
-     * - End-to-end pipeline processing latency
+     * Executes a trace through the post-feature gaze pipeline (pupil filter, projection, screen filter,
+     * blink and brow detectors; no camera or face detection), evaluating:
+     * - Unintended blink-command / brow-raise triggers (MUST be 0 in every non-COMMAND scenario)
+     * - Exactly one trigger of the expected gesture in COMMAND scenarios (wrong-gesture or repeated
+     *   triggers count as false activations). Dwell selection is not modelled.
+     * - Filtered jitter (RMS displacement in screen pixels) and how often the projection is edge-clamped
+     * - Per-frame processing time of these stages on the current JVM
+     *
+     * Like the live ViewModel, no gaze is emitted while the face is absent or the eyelids are closing:
+     * the last emitted position is held, and nothing is emitted before the first valid frame.
      */
     fun evaluateTrace(
         scenario: ReplayScenario,
@@ -290,7 +347,9 @@ object ReplayTestHarness {
         browDetector: BrowRaiseHysteresisDetector,
         pupilFilter: OneEuroFilter2D,
         screenFilter: OneEuroFilter2D,
-        matrixCoeffs: List<Double>
+        matrixCoeffs: List<Double>,
+        screenWidthPx: Double = 1344.0,
+        screenHeightPx: Double = 2992.0
     ): ScenarioEvaluationResult {
         blinkDetector.reset()
         browDetector.reset()
@@ -300,47 +359,53 @@ object ReplayTestHarness {
         var falseActivations = 0
         var validActivations = 0
         var sumLatency = 0.0
+        var gazeFramesEmitted = 0
+        var edgeClampedFrames = 0
         val latencies = mutableListOf<Double>()
         val filteredPoints = mutableListOf<Pair<Double, Double>>()
 
         val isMidasTouchScenario = scenario.category == "MIDAS_TOUCH"
         val isCommandScenario = scenario.category == "COMMAND"
+        val expectsCommandBlink = scenario == ReplayScenario.INTENTIONAL_SELECTION_BLINK
+        val expectsBrowRaise = scenario == ReplayScenario.INTENTIONAL_BROW_RAISE
 
         for (frame in trace) {
             val startNs = System.nanoTime()
 
-            // 1. Pupil 1€ Filter
-            val (filteredGx, filteredGy) = if (frame.faceDetected && frame.combinedEyeOpenProb >= 0.40f) {
+            // 1. Pupil 1€ Filter (held while the face is absent or the eyes are nearly closed)
+            val pupil = if (frame.faceDetected && frame.combinedEyeOpenProb >= 0.40f) {
                 pupilFilter.filter(frame.gx, frame.gy, frame.timestampMs)
             } else {
-                pupilFilter.lastPosition ?: Pair(frame.gx, frame.gy)
+                pupilFilter.lastPosition
             }
 
-            // 2. Gaze Projection with filtered pupil offsets
-            val cleanFeature = frame.copy(gx = filteredGx, gy = filteredGy)
-            val (rawX, rawY) = GazeCalibrationMath.projectGaze(cleanFeature, matrixCoeffs)
-
-            // 3. Screen Gaze 1€ Filter
+            // 2-3. Gaze projection with filtered pupil offsets, then the screen gaze 1€ filter
             val isEyelidClosing = frame.combinedEyeOpenProb < 0.50f
-            val (screenX, screenY) = if (frame.faceDetected && !isEyelidClosing) {
+            val screenPoint = if (frame.faceDetected && !isEyelidClosing && pupil != null) {
+                val cleanFeature = frame.copy(gx = pupil.first, gy = pupil.second)
+                val (rawX, rawY) = GazeCalibrationMath.projectGaze(cleanFeature, matrixCoeffs)
+                gazeFramesEmitted++
+                if (rawX <= PROJECTION_CLAMP_MIN || rawX >= PROJECTION_CLAMP_MAX ||
+                    rawY <= PROJECTION_CLAMP_MIN || rawY >= PROJECTION_CLAMP_MAX
+                ) {
+                    edgeClampedFrames++
+                }
                 screenFilter.filter(rawX.toDouble(), rawY.toDouble(), frame.timestampMs)
             } else {
-                screenFilter.lastPosition ?: Pair(rawX.toDouble(), rawY.toDouble())
+                // No raw fallback: the live app holds the previous reticle position here.
+                screenFilter.lastPosition
             }
-            filteredPoints.add(Pair(screenX, screenY))
+            if (screenPoint != null) filteredPoints.add(screenPoint)
 
             // 4. Expression & Gesture classification
             val (_, blinkEvent) = blinkDetector.update(frame.combinedEyeOpenProb, frame.timestampMs)
             val (_, browFired) = browDetector.update(frame.browToEyeRatio, frame.timestampMs)
 
-            val actionTriggered = (blinkEvent?.type == com.example.data.model.BlinkType.INTENTIONAL_COMMAND) || browFired
-
-            if (actionTriggered) {
-                if (isMidasTouchScenario) {
-                    falseActivations++
-                } else if (isCommandScenario) {
-                    validActivations++
-                }
+            if (blinkEvent?.type == BlinkType.INTENTIONAL_COMMAND) {
+                if (expectsCommandBlink && validActivations == 0) validActivations++ else falseActivations++
+            }
+            if (browFired) {
+                if (expectsBrowRaise && validActivations == 0) validActivations++ else falseActivations++
             }
 
             val elapsedMs = (System.nanoTime() - startNs) / 1_000_000.0
@@ -350,34 +415,59 @@ object ReplayTestHarness {
 
         latencies.sort()
         val meanLatency = if (latencies.isNotEmpty()) sumLatency / latencies.size else 0.0
-        val p95Index = (latencies.size * 0.95).toInt().coerceIn(0, latencies.size - 1)
-        val p95Latency = if (latencies.isNotEmpty()) latencies[p95Index] else 0.0
+        val p95Latency = percentileOfSorted(latencies, 0.95)
 
-        // Calculate RMS jitter across middle steady segment
-        var rmsJitter = 0.0
+        // RMS jitter across the middle steady segment, in screen pixels per axis
+        var rmsJitter = Double.NaN
         if (filteredPoints.size >= 10) {
             val steady = filteredPoints.subList(filteredPoints.size / 4, (filteredPoints.size * 3) / 4)
             val meanX = steady.map { it.first }.average()
             val meanY = steady.map { it.second }.average()
-            var sumDistSq = 0.0
+            var sumSq = 0.0
             for (p in steady) {
-                val d = hypot(p.first - meanX, p.second - meanY)
-                sumDistSq += d * d
+                val dxPx = (p.first - meanX) * screenWidthPx
+                val dyPx = (p.second - meanY) * screenHeightPx
+                sumSq += dxPx * dxPx + dyPx * dyPx
             }
-            rmsJitter = kotlin.math.sqrt(sumDistSq / steady.size) * 1000.0 // Scaled in permille
+            rmsJitter = sqrt(sumSq / steady.size)
+        }
+        val edgeClampedPct = if (gazeFramesEmitted > 0) 100.0 * edgeClampedFrames / gazeFramesEmitted else 0.0
+
+        val passed = if (isCommandScenario) {
+            validActivations == 1 && falseActivations == 0
+        } else {
+            falseActivations == 0
         }
 
-        val passed = when {
-            isMidasTouchScenario -> falseActivations == 0
-            isCommandScenario -> validActivations >= 1 && falseActivations == 0
-            else -> true
+        val trackingSummary = when {
+            !rmsJitter.isNaN() -> String.format(
+                Locale.US,
+                if (scenario.category == "ENDURANCE") {
+                    "RMS gaze spread %.2f px incl. deliberate saccades; %.0f%% of gaze frames clamped at the screen edge"
+                } else {
+                    "RMS jitter %.2f px; %.0f%% of gaze frames clamped at the screen edge"
+                },
+                rmsJitter,
+                edgeClampedPct
+            )
+            gazeFramesEmitted == 0 -> "no gaze output: face absent or eyelids below the open threshold on every frame"
+            else -> "too few gaze frames ($gazeFramesEmitted) to estimate jitter"
         }
+        val expectedGesture = if (expectsBrowRaise) "brow raise" else "command blink"
 
         val notes = when {
-            !passed && isMidasTouchScenario -> "FAILED: Triggered $falseActivations accidental activation(s) during involuntary facial motion."
-            passed && isMidasTouchScenario -> "PASSED: Zero false activations across ${trace.size} frames of involuntary gestures."
-            passed && isCommandScenario -> "PASSED: Captured $validActivations deliberate action(s) with 0 false triggers."
-            else -> "PASSED: Stable tracking under ${scenario.label} (RMS Jitter: ${String.format("%.2f", rmsJitter)}‰)."
+            isCommandScenario && passed ->
+                "PASSED: Captured 1 deliberate $expectedGesture with 0 false triggers ($trackingSummary)."
+            isCommandScenario ->
+                "FAILED: Expected exactly 1 deliberate $expectedGesture; captured $validActivations, plus $falseActivations unintended trigger(s)."
+            isMidasTouchScenario && passed ->
+                "PASSED: Zero false blink/brow activations across ${trace.size} frames of involuntary gestures (dwell not modelled; $trackingSummary)."
+            isMidasTouchScenario ->
+                "FAILED: Triggered $falseActivations accidental activation(s) during involuntary facial motion."
+            passed ->
+                "PASSED: No unintended blink/brow triggers under ${scenario.label} (no gaze ground truth; $trackingSummary)."
+            else ->
+                "FAILED: $falseActivations unintended blink/brow trigger(s) under ${scenario.label} ($trackingSummary)."
         }
 
         return ScenarioEvaluationResult(
@@ -389,7 +479,10 @@ object ReplayTestHarness {
             meanLatencyMs = meanLatency,
             p95LatencyMs = p95Latency,
             rmsJitterPx = rmsJitter,
-            notes = notes
+            notes = notes,
+            latencySamplesMs = latencies.toList(),
+            gazeFramesEmitted = gazeFramesEmitted,
+            edgeClampedFramePct = edgeClampedPct
         )
     }
 }

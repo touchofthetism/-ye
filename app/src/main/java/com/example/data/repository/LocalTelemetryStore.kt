@@ -13,18 +13,66 @@ import java.util.Date
  * On-device persistent local store (SharedPreferences + JSON) ensuring that when a user disables
  * Cloud Sync for biometric privacy, their calibrated 2x6 regression profiles and session history
  * survive app restarts on-device without requiring recalibration every launch.
+ *
+ * Everything lives in the SharedPreferences file [VAULT_PREFS_NAME] (shared_prefs/oculagaze_local_vault.xml).
+ * That file must stay excluded from Android Auto Backup and device-to-device transfer
+ * (res/xml/backup_rules.xml and res/xml/data_extraction_rules.xml); keep the name in sync with those rules.
+ *
+ * The local vault is bounded: it keeps the [MAX_LOCAL_PROFILES] most recent calibration profiles and the
+ * [MAX_LOCAL_SESSIONS] most recent sessions, and saving beyond that evicts the oldest entry.
  */
 class LocalTelemetryStore(context: Context) {
 
     private val prefs = context.applicationContext.getSharedPreferences(
-        "oculagaze_local_vault",
+        VAULT_PREFS_NAME,
         Context.MODE_PRIVATE
     )
 
+    /**
+     * Cloud-sync consent of [userId]. Consent is per account: a device-wide flag would let the next account
+     * that signs in inherit the previous account's opt-in. Defaults to opted out.
+     */
+    fun isCloudSyncEnabled(userId: String): Boolean =
+        prefs.getBoolean("${KEY_CLOUD_SYNC_ENABLED}_$userId", false)
+
+    /**
+     * Stores [userId]'s cloud-sync consent. Also drops the legacy device-wide flag written by older versions:
+     * it cannot be attributed to an account, so it is not migrated and every account starts opted out.
+     */
+    fun setCloudSyncEnabled(userId: String, enabled: Boolean) {
+        prefs.edit()
+            .putBoolean("${KEY_CLOUD_SYNC_ENABLED}_$userId", enabled)
+            .remove(KEY_CLOUD_SYNC_ENABLED)
+            .apply()
+    }
+
+    @Deprecated(
+        "Device-wide consent leaks one account's opt-in to the next account; use isCloudSyncEnabled(userId).",
+        ReplaceWith("isCloudSyncEnabled(userId)")
+    )
     fun isCloudSyncEnabled(): Boolean = prefs.getBoolean(KEY_CLOUD_SYNC_ENABLED, false)
 
+    @Deprecated(
+        "Device-wide consent leaks one account's opt-in to the next account; use setCloudSyncEnabled(userId, enabled).",
+        ReplaceWith("setCloudSyncEnabled(userId, enabled)")
+    )
     fun setCloudSyncEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_CLOUD_SYNC_ENABLED, enabled).apply()
+    }
+
+    /**
+     * Id of the profile [userId] last activated or saved (local or cloud id), or null when none is recorded.
+     * Written by [saveLocalProfile] and [setActiveLocalProfile], cleared when that profile is deleted.
+     */
+    fun getActiveProfileId(userId: String): String? =
+        prefs.getString("${KEY_ACTIVE_PROFILE_ID_PREFIX}_$userId", null)?.takeIf { it.isNotBlank() }
+
+    /** Records [profileId] as [userId]'s chosen active profile; null or blank clears it. */
+    fun setActiveProfileId(userId: String, profileId: String?) {
+        val key = "${KEY_ACTIVE_PROFILE_ID_PREFIX}_$userId"
+        val editor = prefs.edit()
+        if (profileId.isNullOrBlank()) editor.remove(key) else editor.putString(key, profileId)
+        editor.apply()
     }
 
     fun loadLocalProfiles(userId: String): List<CalibrationProfile> {
@@ -68,7 +116,13 @@ class LocalTelemetryStore(context: Context) {
         }
     }
 
-    fun saveLocalProfile(userId: String, profile: CalibrationProfile) {
+    /**
+     * Saves [profile] as [userId]'s active local profile and returns the entry exactly as persisted,
+     * including the `local_cal_<ms>` id assigned when [profile] has a blank id. Callers that also upload the
+     * profile should upload the returned entry so the local and cloud copies share one id.
+     * Keeps at most [MAX_LOCAL_PROFILES] entries; the oldest is evicted beyond that.
+     */
+    fun saveLocalProfile(userId: String, profile: CalibrationProfile): CalibrationProfile {
         val existing = loadLocalProfiles(userId).toMutableList()
         val updated = existing.map { it.copy(isActive = false) }.toMutableList()
         val newEntry = profile.copy(
@@ -78,20 +132,28 @@ class LocalTelemetryStore(context: Context) {
         )
         updated.removeAll { it.id == newEntry.id }
         updated.add(0, newEntry)
-        writeProfiles(userId, updated.take(20))
+        writeProfiles(userId, updated.take(MAX_LOCAL_PROFILES))
+        setActiveProfileId(userId, newEntry.id)
+        return newEntry
     }
 
+    /**
+     * Marks [profileId] active among the local entries and records it as the chosen active profile, even when
+     * it is a cloud-only id with no local entry.
+     */
     fun setActiveLocalProfile(userId: String, profileId: String): List<CalibrationProfile> {
         val updated = loadLocalProfiles(userId).map {
             it.copy(isActive = it.id == profileId)
         }
         writeProfiles(userId, updated)
+        setActiveProfileId(userId, profileId)
         return updated
     }
 
     fun deleteLocalProfile(userId: String, profileId: String): List<CalibrationProfile> {
         val updated = loadLocalProfiles(userId).filterNot { it.id == profileId }
         writeProfiles(userId, updated)
+        if (getActiveProfileId(userId) == profileId) setActiveProfileId(userId, null)
         return updated
     }
 
@@ -159,7 +221,13 @@ class LocalTelemetryStore(context: Context) {
         }
     }
 
-    fun saveLocalSession(userId: String, session: TrackingSession) {
+    /**
+     * Saves [session] for [userId] and returns the entry exactly as persisted, including the
+     * `local_sess_<ms>` id assigned when [session] has a blank id. Callers that also upload the session should
+     * upload the returned entry so the local and cloud copies share one id.
+     * Keeps at most [MAX_LOCAL_SESSIONS] entries; the oldest is evicted beyond that.
+     */
+    fun saveLocalSession(userId: String, session: TrackingSession): TrackingSession {
         val existing = loadLocalSessions(userId).toMutableList()
         val entry = session.copy(
             id = session.id.ifBlank { "local_sess_${System.currentTimeMillis()}" },
@@ -167,7 +235,8 @@ class LocalTelemetryStore(context: Context) {
         )
         existing.removeAll { it.id == entry.id }
         existing.add(0, entry)
-        writeSessions(userId, existing.take(30))
+        writeSessions(userId, existing.take(MAX_LOCAL_SESSIONS))
+        return entry
     }
 
     fun deleteLocalSession(userId: String, sessionId: String): List<TrackingSession> {
@@ -176,10 +245,16 @@ class LocalTelemetryStore(context: Context) {
         return updated
     }
 
+    /**
+     * Wipes [userId]'s vault: calibration profiles, sessions, the recorded active profile id and the
+     * user-authored AAC phrase tiles (which can hold personal or medical text).
+     */
     fun clearAllLocalData(userId: String) {
         prefs.edit()
             .remove("${KEY_PROFILES_PREFIX}_$userId")
             .remove("${KEY_SESSIONS_PREFIX}_$userId")
+            .remove("${KEY_AAC_TILES_PREFIX}_$userId")
+            .remove("${KEY_ACTIVE_PROFILE_ID_PREFIX}_$userId")
             .apply()
     }
 
@@ -252,10 +327,20 @@ class LocalTelemetryStore(context: Context) {
         prefs.edit().putString("${KEY_AAC_TILES_PREFIX}_$userId", arr.toString()).apply()
     }
 
-    private companion object {
-        const val KEY_CLOUD_SYNC_ENABLED = "cloud_sync_enabled"
-        const val KEY_PROFILES_PREFIX = "local_profiles"
-        const val KEY_SESSIONS_PREFIX = "local_sessions"
-        const val KEY_AAC_TILES_PREFIX = "local_aac_tiles"
+    companion object {
+        /** SharedPreferences file holding the vault; excluded from backup by name in res/xml. */
+        const val VAULT_PREFS_NAME = "oculagaze_local_vault"
+
+        /** The vault keeps this many most-recent calibration profiles; saving more evicts the oldest. */
+        const val MAX_LOCAL_PROFILES = 20
+
+        /** The vault keeps this many most-recent sessions; saving more evicts the oldest. */
+        const val MAX_LOCAL_SESSIONS = 30
+
+        private const val KEY_CLOUD_SYNC_ENABLED = "cloud_sync_enabled"
+        private const val KEY_PROFILES_PREFIX = "local_profiles"
+        private const val KEY_SESSIONS_PREFIX = "local_sessions"
+        private const val KEY_AAC_TILES_PREFIX = "local_aac_tiles"
+        private const val KEY_ACTIVE_PROFILE_ID_PREFIX = "local_active_profile_id"
     }
 }

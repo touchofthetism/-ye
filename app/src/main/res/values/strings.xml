@@ -23,6 +23,7 @@
     <string name="confirm_delete_cloud_dialog_body">This permanently deletes all calibration profiles and attention session telemetry stored under /users/%1$s in Cloud Firestore. Your on-device local calibration profile will remain intact.</string>
     <string name="confirm_delete_cloud_action">Delete from Firestore</string>
     <string name="cancel_action">Cancel</string>
+    <string name="tts_unavailable_warning">Speech output unavailable: install or enable a text-to-speech engine in system settings. Tile phrases are shown but not spoken.</string>
     <string name="calibration_5_point_title">5-Point Guided Screen Calibration</string>
     <string name="calibration_5_point_subtitle">Fixate on each of the 5 screen coordinates (Center, Top-Left, Top-Right, Bottom-Left, Bottom-Right) as the target ring pulses to collect binocular iris &amp; 3D head-pose gaze data points.</string>
     <string name="calibration_mode_5_point_only">5-Point Quick Fit</string>

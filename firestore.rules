@@ -22,19 +22,52 @@ service cloud.firestore {
       return resource.data;
     }
 
+    // Owner check that also holds when the document does not exist (resource == null). A get of a
+    // missing document then returns "not found" and deleting an already-deleted document is an
+    // idempotent no-op instead of PERMISSION_DENIED. Callers still require request.auth.uid == userId.
+    function isOwnedOrAbsent() {
+      return resource == null || existing().userId == request.auth.uid;
+    }
+
+    // Every element of matrixCoeffs must be a number (the Android mapper reads List<Double>).
+    function isValidMatrixCoeffs(m) {
+      return m is list && m.size() == 12 &&
+             m[0] is number && m[1] is number && m[2] is number && m[3] is number && m[4] is number && m[5] is number &&
+             m[6] is number && m[7] is number && m[8] is number && m[9] is number && m[10] is number && m[11] is number;
+    }
+
+    // A list of at most maxItems strings, each at most maxLen characters, checked for EVERY element
+    // (the Android mapper reads List<String>, so one non-string element breaks the whole listener).
+    // Rules have no loops and an unrolled per-index check exceeds the 1000-expression budget, so the
+    // list is joined with U+001F (never written by the client): join() stringifies numbers, bools and
+    // null and fails on maps/lists, so the split round trip only equals the list when every element
+    // is a string without U+001F (the '.' sentinel keeps trailing empty strings). The anchored regex
+    // then bounds every segment, i.e. every element.
+    function isBoundedStringList(l, maxItems, maxLen) {
+      let joined = l.join('\u001f');
+      let segment = '[^\u001f]{0,' + string(maxLen) + '}';
+      return l is list && l.size() <= maxItems &&
+             (l.size() == 0 || (joined + '\u001f.').split('\u001f') == l.concat(['.'])) &&
+             joined.matches(segment + '(\u001f' + segment + ')*');
+    }
+
     function isValidCalibrationProfile(data) {
       return data.userId is string &&
              data.userId == request.auth.uid &&
              data.name is string && data.name.size() >= 1 && data.name.size() <= 80 &&
              data.deviceModel is string && data.deviceModel.size() >= 1 && data.deviceModel.size() <= 80 &&
-             data.matrixCoeffs is list && data.matrixCoeffs.size() == 12 && data.matrixCoeffs[0] is number &&
+             isValidMatrixCoeffs(data.matrixCoeffs) &&
              data.baselineEyeDistancePx is number && data.baselineEyeDistancePx >= 0 && data.baselineEyeDistancePx <= 5000 &&
              data.meanErrorMm is number && data.meanErrorMm >= 0 && data.meanErrorMm <= 500 &&
              data.meanErrorPct is number && data.meanErrorPct >= 0 && data.meanErrorPct <= 100 &&
              data.maxErrorPct is number && data.maxErrorPct >= 0 && data.maxErrorPct <= 100 &&
              data.closeBlinkThreshold is number && data.closeBlinkThreshold >= 0.05 && data.closeBlinkThreshold <= 0.80 &&
              data.openBlinkThreshold is number && data.openBlinkThreshold >= 0.15 && data.openBlinkThreshold <= 0.98 &&
-             data.intentionalBlinkMinMs is int && data.intentionalBlinkMinMs >= 150 && data.intentionalBlinkMinMs <= 2000 &&
+             // Schmitt-trigger hysteresis: the re-open threshold must sit above the close threshold.
+             data.closeBlinkThreshold + 0.05 <= data.openBlinkThreshold &&
+             // BlinkHysteresisDetector classifies command blinks as intentionalBlinkMinMs..800 ms, so the
+             // minimum must stay below 800 ms; 700 ms matches the client's blink-timing setter.
+             data.intentionalBlinkMinMs is int && data.intentionalBlinkMinMs >= 150 && data.intentionalBlinkMinMs <= 700 &&
              data.isActive is bool &&
              data.createdAt is timestamp && data.createdAt <= request.time &&
              data.updatedAt is timestamp && data.updatedAt <= request.time;
@@ -55,16 +88,14 @@ service cloud.firestore {
              data.topZonePercentage is int && data.topZonePercentage >= 0 && data.topZonePercentage <= 100 &&
              data.middleZonePercentage is int && data.middleZonePercentage >= 0 && data.middleZonePercentage <= 100 &&
              data.bottomZonePercentage is int && data.bottomZonePercentage >= 0 && data.bottomZonePercentage <= 100 &&
-             data.sectionLoads is list && data.sectionLoads.size() <= 12 &&
-             (data.sectionLoads.size() == 0 || (data.sectionLoads[0] is string && data.sectionLoads[0].size() <= 120)) &&
-             data.clusterPoints is list && data.clusterPoints.size() <= 40 &&
-             (data.clusterPoints.size() == 0 || (data.clusterPoints[0] is string && data.clusterPoints[0].size() <= 80)) &&
+             isBoundedStringList(data.sectionLoads, 12, 120) &&
+             isBoundedStringList(data.clusterPoints, 40, 80) &&
              data.createdAt is timestamp && data.createdAt <= request.time &&
              data.updatedAt is timestamp && data.updatedAt <= request.time;
     }
 
     match /users/{userId}/calibrations/{profileId} {
-      allow get: if isSignedIn() && isValidId(userId) && isValidId(profileId) && request.auth.uid == userId && existing().userId == request.auth.uid;
+      allow get: if isSignedIn() && isValidId(userId) && isValidId(profileId) && request.auth.uid == userId && isOwnedOrAbsent();
       allow list: if isSignedIn() && request.auth.uid == userId && existing().userId == request.auth.uid;
 
       allow create: if isSignedIn() &&
@@ -81,6 +112,9 @@ service cloud.firestore {
                          'meanErrorMm', 'meanErrorPct', 'maxErrorPct', 'closeBlinkThreshold', 'openBlinkThreshold',
                          'intentionalBlinkMinMs', 'isActive', 'createdAt', 'updatedAt'
                        ]) &&
+                       // Server timestamps only (FieldValue.serverTimestamp()); client clocks cannot backdate records.
+                       incoming().createdAt == request.time &&
+                       incoming().updatedAt == request.time &&
                        isValidCalibrationProfile(incoming());
 
       allow update: if isSignedIn() &&
@@ -91,6 +125,7 @@ service cloud.firestore {
                        existing().userId == request.auth.uid &&
                        incoming().userId == existing().userId &&
                        incoming().createdAt == existing().createdAt &&
+                       incoming().updatedAt == request.time &&
                        (
                          // Action 1: Toggle active status or rename/recalibrate profile
                          incoming().diff(existing()).affectedKeys().hasOnly([
@@ -99,11 +134,11 @@ service cloud.firestore {
                          ])
                        );
 
-      allow delete: if isSignedIn() && isValidId(userId) && isValidId(profileId) && request.auth.uid == userId && existing().userId == request.auth.uid;
+      allow delete: if isSignedIn() && isValidId(userId) && isValidId(profileId) && request.auth.uid == userId && isOwnedOrAbsent();
     }
 
     match /users/{userId}/sessions/{sessionId} {
-      allow get: if isSignedIn() && isValidId(userId) && isValidId(sessionId) && request.auth.uid == userId && existing().userId == request.auth.uid;
+      allow get: if isSignedIn() && isValidId(userId) && isValidId(sessionId) && request.auth.uid == userId && isOwnedOrAbsent();
       allow list: if isSignedIn() && request.auth.uid == userId && existing().userId == request.auth.uid;
 
       allow create: if isSignedIn() &&
@@ -124,6 +159,8 @@ service cloud.firestore {
                          'topZonePercentage', 'middleZonePercentage', 'bottomZonePercentage',
                          'sectionLoads', 'clusterPoints', 'createdAt', 'updatedAt'
                        ]) &&
+                       incoming().createdAt == request.time &&
+                       incoming().updatedAt == request.time &&
                        isValidTrackingSession(incoming());
 
       allow update: if isSignedIn() &&
@@ -134,12 +171,13 @@ service cloud.firestore {
                        existing().userId == request.auth.uid &&
                        incoming().userId == existing().userId &&
                        incoming().createdAt == existing().createdAt &&
+                       incoming().updatedAt == request.time &&
                        (
                          // Action 1: Rename session title
                          incoming().diff(existing()).affectedKeys().hasOnly(['title', 'updatedAt'])
                        );
 
-      allow delete: if isSignedIn() && isValidId(userId) && isValidId(sessionId) && request.auth.uid == userId && existing().userId == request.auth.uid;
+      allow delete: if isSignedIn() && isValidId(userId) && isValidId(sessionId) && request.auth.uid == userId && isOwnedOrAbsent();
     }
   }
 }

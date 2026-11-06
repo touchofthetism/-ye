@@ -4,6 +4,7 @@ import android.os.Build
 import com.google.firebase.Timestamp
 import com.google.firebase.firestore.DocumentId
 import com.google.firebase.firestore.IgnoreExtraProperties
+import com.google.firebase.firestore.PropertyName
 import com.google.firebase.firestore.ServerTimestamp
 
 /**
@@ -31,7 +32,10 @@ data class CalibrationProfile(
     val closeBlinkThreshold: Double = 0.45,
     val openBlinkThreshold: Double = 0.65,
     val intentionalBlinkMinMs: Long = 350L,
-    val isActive: Boolean = true,
+    // Firestore's mapper strips the "is" prefix from the Kotlin getter isActive() and would map it to
+    // "active", so the stored "isActive" key never deserialized and every cloud profile read back
+    // active. Naming the getter's property explicitly binds the stored key (and the backing field).
+    @get:PropertyName("isActive") val isActive: Boolean = true,
     @ServerTimestamp val createdAt: Timestamp? = null,
     @ServerTimestamp val updatedAt: Timestamp? = null
 )
@@ -66,6 +70,8 @@ data class TrackingSession(
  *   eye-openness, local ROI contrast, and specular eyeglass glare rejection.
  * - browToEyeRatio: Vertical distance from eyebrow top contour to eye center normalized by inter-ocular distance,
  *   compensated for upward head pitch and upward gaze so looking at top-row tiles does not false-trigger.
+ * - isSimulated: true for frames synthesized by the simulator proxy / emulator ticker rather than measured
+ *   by the camera pipeline, so calibration and session code can tell them apart from real telemetry.
  */
 data class GazeFeatureVector(
     val gx: Double = 0.0,
@@ -102,7 +108,8 @@ data class GazeFeatureVector(
     val sensorRotationDeg: Int = 270,
     val ambientLuma: Int = 142,
     val isLowLightDegraded: Boolean = false,
-    val timestampMs: Long = System.currentTimeMillis()
+    val timestampMs: Long = System.currentTimeMillis(),
+    val isSimulated: Boolean = false
 ) {
     val combinedEyeOpenProb: Float
         get() = when {
@@ -112,17 +119,21 @@ data class GazeFeatureVector(
         }
 
     /**
-     * Converts raw physical measurements into a dimensionless, unit-scaled 6D feature vector
-     * so Ridge regularization penalizes iris offsets, Euler angles, and inter-ocular scale evenly.
-     * In Low-Light Degraded Mode (Pixel 10 Pro XL has no IR illuminator), noisy visible-light iris
-     * offsets (gx, gy) are damped by 0.45x so head-pose (yaw, pitch) keeps region tracking stable.
+     * Converts raw measurements into the dimensionless 6D feature vector used by both the ridge fit
+     * and runtime projection: [1, gx/0.25, gy/0.20, yaw/20, pitch/15, roll/15 + 0.5 * distScale].
+     * The divisors are fixed nominal ranges, not per-user unit variances: real phone-distance iris
+     * offsets (especially gx) span far less than +/-1 after scaling, so a uniform ridge penalty does
+     * NOT weigh the features evenly. The divisors stay fixed because DEFAULT_AFFINE_MATRIX_2X6 and every
+     * stored matrix were fitted in these units.
+     * The mapping is identical in every lighting state. Low light (isLowLightDegraded) is reported for
+     * diagnostics only; rescaling the inputs per frame would change the regressor's gain relative to the
+     * lighting the matrix was fitted under.
      */
     fun toStandardizedFeatureArray(baselineEyeDistPx: Double = 148.0): DoubleArray {
         val safeBaseDist = baselineEyeDistPx.coerceAtLeast(30.0)
         val distScale = ((eyeDistancePx - safeBaseDist) / safeBaseDist).coerceIn(-0.6, 0.6)
-        val irisDamping = if (isLowLightDegraded) 0.45 else 1.0
-        val stdGx = ((gx * irisDamping) / 0.25).coerceIn(-2.5, 2.5)
-        val stdGy = ((gy * irisDamping) / 0.20).coerceIn(-2.5, 2.5)
+        val stdGx = (gx / 0.25).coerceIn(-2.5, 2.5)
+        val stdGy = (gy / 0.20).coerceIn(-2.5, 2.5)
         val stdYaw = (yaw / 20.0).coerceIn(-2.5, 2.5)
         val stdPitch = (pitch / 15.0).coerceIn(-2.5, 2.5)
         val stdRollAndDist = ((roll / 15.0) + 0.5 * distScale).coerceIn(-2.5, 2.5)
@@ -131,17 +142,18 @@ data class GazeFeatureVector(
 }
 
 /**
- * Adaptive 3-tier analysis resolution controller for Google Pixel 10 Pro XL's 42 MP (~103° FOV)
- * autofocus front camera. Starts at 1280×960 so iris ROIs retain high spatial detail despite the
- * wide 103° FOV, and steps down automatically (1280 → 960 → 640) whenever measured FPS < 15 or
- * Tensor G5 thermal throttling is detected over a 20+ minute continuous session.
+ * Adaptive 3-tier ImageAnalysis resolution controller. Each tier is the stream size REQUESTED from
+ * CameraX (at most 1280×960, about 1.2 MP); CameraX may pick the closest size the device supports,
+ * and the sensor's full resolution is never used for analysis. Starts at 1280×960 so iris ROIs keep
+ * as many pixels as possible, and steps down (1280 → 960 → 640) when measured FPS drops or thermal
+ * throttling is detected over a long continuous session.
  */
 enum class AnalysisResolutionTier(
     val targetWidth: Int,
     val targetHeight: Int,
     val shortLabel: String
 ) {
-    TIER_HIGH_1280(1280, 960, "1280w (42MP Sharp)"),
+    TIER_HIGH_1280(1280, 960, "1280w (High)"),
     TIER_MED_960(960, 720, "960w (Step-Down 1)"),
     TIER_LOW_640(640, 480, "640w (Thermal Saver)")
 }
@@ -150,7 +162,7 @@ enum class AnalysisResolutionTier(
  * Canonical Blink Classification Timing Specification:
  * - NATURAL: 80 ms .. 349 ms (logged for blink-rate telemetry only)
  * - INTENTIONAL_COMMAND: 350 ms .. 800 ms (triggers focused in-app tile)
- * - EXTENDED_REST: > 900 ms (cancelled to prevent false triggers during eye rest)
+ * - EXTENDED_REST: > 800 ms (cancelled to prevent false triggers during eye rest)
  */
 enum class BlinkType {
     NATURAL,
@@ -160,7 +172,7 @@ enum class BlinkType {
 
 enum class GazeTriggerMode(val label: String) {
     ALL_ACTIVE("Brow Raise + Blink + Dwell"),
-    BROW_RAISE("Brow Raise (380ms Hold) + Dwell"),
+    BROW_RAISE("Brow Raise (400ms Hold) + Dwell"),
     COMMAND_BLINK("Command Blink (350-800ms) + Dwell"),
     DWELL_ONLY("Dwell Only (No Gesture)")
 }

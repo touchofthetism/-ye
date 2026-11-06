@@ -10,7 +10,6 @@ import com.example.data.model.ValidationMetricsResult
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.hypot
-import kotlin.math.max
 import kotlin.math.min
 
 /**
@@ -22,13 +21,31 @@ import kotlin.math.min
  *    Worst-Quadrant Error (maxErrorPct), and Approximate Physical Error (~mm, calibrated for
  *    Google Pixel 10 Pro XL 6.8" LTPO OLED 71.3mm x 158.4mm active area or DisplayMetrics fallback).
  * 3. Frame-Interval-Adaptive Exponential Smoothing for 10-15 FPS camera pipelines.
- * 4. Canonical Schmitt-Trigger Hysteresis Blink State Machine (80-349ms Natural, 350-900ms Command).
+ * 4. Canonical Schmitt-Trigger Hysteresis Blink State Machine (80-349ms Natural, 350-800ms Command,
+ *    >800ms Extended Rest).
  */
 object GazeCalibrationMath {
 
     // Google Pixel 10 Pro XL physical active display dimensions (6.8" 20:9 LTPO OLED)
     const val PIXEL_10_PRO_XL_WIDTH_MM = 71.3
     const val PIXEL_10_PRO_XL_HEIGHT_MM = 158.4
+
+    // Single source of truth for the Control Deck layout decision (validated metrics only).
+    const val GRID_3X3_MAX_MEAN_ERROR_PCT = 12.0
+    const val GRID_3X3_MAX_WORST_QUADRANT_PCT = 16.5
+    const val RECALIBRATION_RECOMMENDED_WORST_QUADRANT_PCT = 24.0
+
+    /**
+     * True only when both held-out metrics are finite (i.e. actually measured) and within the
+     * 3x3 thresholds. Non-finite input (not validated) always yields the protective 2x2 deck.
+     */
+    fun qualifiesFor3x3Grid(meanErrorPct: Double, maxErrorPct: Double): Boolean =
+        meanErrorPct.isFinite() && maxErrorPct.isFinite() &&
+            meanErrorPct <= GRID_3X3_MAX_MEAN_ERROR_PCT &&
+            maxErrorPct <= GRID_3X3_MAX_WORST_QUADRANT_PCT
+
+    fun gridLayoutLabel(use3x3: Boolean): String =
+        if (use3x3) "3×3 Validated Deck (9 tiles)" else "2×2 Protective Region Deck (4 tiles)"
 
     val FIVE_POINT_CALIBRATION_TARGETS: List<CalibrationTargetPoint> = listOf(
         CalibrationTargetPoint(
@@ -141,8 +158,10 @@ object GazeCalibrationMath {
 
     /**
      * Frame-rate-independent 1€ (EuroFilter)-inspired adaptive exponential smoothing:
-     * - Fixation / small motion (delta < 0.02): tau = 135 ms (heavy jitter suppression, buttery steady hold)
-     * - Fast saccadic sweep (delta >= 0.08): tau = 42 ms (instant response, zero perceived lag)
+     * - At rest (delta = 0): tau = baseTauMs (95 ms default)
+     * - tau falls linearly with displacement to 0.42 * baseTauMs (~40 ms) for delta >= 0.12,
+     *   never below 35 ms
+     * - Returned alpha = 1 - exp(-dt / tau), with dt clamped to 16..250 ms and alpha clamped to [0.20, 0.92]
      */
     fun computeAdaptiveSmoothingAlpha(
         dtMs: Long,
@@ -151,7 +170,7 @@ object GazeCalibrationMath {
     ): Float {
         val clampedDt = dtMs.coerceIn(16L, 250L).toDouble()
         val saccadeBoost = (deltaDisplacement / 0.12f).coerceIn(0f, 1f)
-        val dynamicTau = baseTauMs * (1.0 - 0.58 * saccadeBoost).coerceAtLeast(35.0)
+        val dynamicTau = (baseTauMs * (1.0 - 0.58 * saccadeBoost)).coerceAtLeast(35.0)
         return (1.0 - exp(-clampedDt / dynamicTau)).toFloat().coerceIn(0.20f, 0.92f)
     }
 
@@ -286,7 +305,16 @@ object GazeCalibrationMath {
      * Evaluates held-out validation samples grouped by quadrant target:
      * - meanErrorPct: Primary trustworthy normalized screen error (%)
      * - maxErrorPct: Worst-quadrant error (%) so a single dead corner is never masked by the mean
-     * - approxMeanErrorMm: Approximate physical error (~mm) using Pixel 10 Pro XL geometry or nominal DPI
+     * - approxMeanErrorMm: Approximate physical error (~mm) using the supplied screen width/height in mm
+     *   (Pixel 10 Pro XL geometry when the supplied values are not finite and positive)
+     *
+     * meanErrorPct and maxErrorPct are Euclidean errors in normalized screen space (x as a fraction of
+     * width, y as a fraction of height) times 100. They are NOT % of width or % of the diagonal, so on a
+     * non-square screen 1% of y is a different physical distance than 1% of x; consumers that convert
+     * them to pixels must scale x by width and y by height (an ellipse, not a circle).
+     *
+     * With no samples nothing was measured: all metrics are NaN and the description says
+     * "Not validated (no samples)".
      */
     fun evaluateHeldOutValidation(
         matrixCoeffs: List<Double>,
@@ -297,15 +325,15 @@ object GazeCalibrationMath {
     ): ValidationMetricsResult {
         if (validationSamples.isEmpty()) {
             return ValidationMetricsResult(
-                meanErrorPct = 10.9,
-                maxErrorPct = 14.2,
-                approxMeanErrorMm = 13.4,
-                recommendedGridDesc = "3×2 Region Deck (Worst Quadrant <= 16%)"
+                meanErrorPct = Double.NaN,
+                maxErrorPct = Double.NaN,
+                approxMeanErrorMm = Double.NaN,
+                recommendedGridDesc = "Not validated (no samples)"
             )
         }
 
-        val safeWidthMm = max(55.0, screenWidthMm)
-        val safeHeightMm = max(110.0, screenHeightMm)
+        val safeWidthMm = if (screenWidthMm.isFinite() && screenWidthMm > 0.0) screenWidthMm else PIXEL_10_PRO_XL_WIDTH_MM
+        val safeHeightMm = if (screenHeightMm.isFinite() && screenHeightMm > 0.0) screenHeightMm else PIXEL_10_PRO_XL_HEIGHT_MM
         var totalMmError = 0.0
         var totalNormError = 0.0
 
@@ -335,12 +363,9 @@ object GazeCalibrationMath {
             ?.coerceIn(meanPct, 95.0)
             ?: (meanPct * 1.25).coerceAtMost(95.0)
 
-        // Base grid recommendation on worst-quadrant error (maxErrorPct), not just the mean
-        val recommendation = when {
-            maxQuadrantPct <= 15.5 -> "3×2 Standard Deck (All Quadrants Verified)"
-            maxQuadrantPct <= 24.0 -> "2×2 High-Margin Deck (Protective Quadrant Sizing)"
-            else -> "2×1 Large Split Deck (Recalibration Recommended)"
-        }
+        // Recommend exactly the layout the Control Deck renders for these metrics (same thresholds)
+        val recommendation = gridLayoutLabel(qualifiesFor3x3Grid(meanPct, maxQuadrantPct)) +
+            (if (maxQuadrantPct > RECALIBRATION_RECOMMENDED_WORST_QUADRANT_PCT) " — Recalibration Recommended" else "")
 
         return ValidationMetricsResult(
             meanErrorPct = meanPct,
@@ -350,10 +375,19 @@ object GazeCalibrationMath {
         )
     }
 
+    /**
+     * Dispersion-based fixation clustering over (normX, normY, timestampMs) samples.
+     * A cluster ends when a sample lies farther than [dispersionThreshold] from the running centroid,
+     * or when more than [maxGapMs] passed since the previous sample (face loss / dropped frames), so
+     * time without valid gaze is never counted as fixation dwell. Dwell is lastTs - startTs of the
+     * cluster's own samples. Returns at most the [maxClusters] most recent clusters.
+     */
     fun clusterFixations(
         rawTimedSamples: List<Triple<Float, Float, Long>>,
         dispersionThreshold: Float = 0.12f,
-        minDwellMs: Long = 180L
+        minDwellMs: Long = 180L,
+        maxGapMs: Long = 300L,
+        maxClusters: Int = 40
     ): List<FixationClusterPoint> {
         if (rawTimedSamples.size < 2) return emptyList()
         val clusters = mutableListOf<FixationClusterPoint>()
@@ -369,14 +403,15 @@ object GazeCalibrationMath {
             val centroidX = sumX / count
             val centroidY = sumY / count
             val dist = hypot(x - centroidX, y - centroidY)
+            val gapBreak = ts - lastTs > maxGapMs
 
-            if (dist <= dispersionThreshold) {
+            if (!gapBreak && dist <= dispersionThreshold) {
                 sumX += x
                 sumY += y
                 count++
                 lastTs = ts
             } else {
-                val dwell = (lastTs - startTs).coerceAtLeast(60L)
+                val dwell = lastTs - startTs
                 if (dwell >= minDwellMs) {
                     clusters.add(
                         FixationClusterPoint(
@@ -394,7 +429,7 @@ object GazeCalibrationMath {
             }
         }
 
-        val finalDwell = (lastTs - startTs).coerceAtLeast(60L)
+        val finalDwell = lastTs - startTs
         if (finalDwell >= minDwellMs) {
             clusters.add(
                 FixationClusterPoint(
@@ -405,7 +440,8 @@ object GazeCalibrationMath {
             )
         }
 
-        return clusters.takeLast(40)
+        val cap = maxClusters.coerceAtLeast(0)
+        return if (clusters.size > cap) clusters.takeLast(cap) else clusters
     }
 }
 
@@ -413,9 +449,12 @@ object GazeCalibrationMath {
  * Canonical Schmitt-trigger hysteresis blink detector (§2.6 unified windows):
  * - Close threshold: fused eye-open probability < 0.45
  * - Reopen threshold: fused eye-open probability > 0.65
- * - Natural involuntary blink: 80 ms .. (intentionalMinMs - 1) ms [default 80-349 ms]
- * - Intentional command blink: intentionalMinMs .. 800 ms [default 350-800 ms]
- * - Extended closure / rest: > 800 ms (or > 900 ms cancel)
+ * - Natural involuntary blink: observed closure < intentionalMinMs and estimated closure >= [naturalMinMs]
+ *   [default 80-349 ms]. The observed closure (first closed frame to first reopened frame) is a whole
+ *   number of frame intervals, so the estimate adds half the running mean frame interval to it: a blink
+ *   caught in a single frame still counts at 10-15 FPS, while a single-frame dip at 30 FPS is rejected.
+ * - Intentional command blink: intentionalMinMs .. maxCommandMs observed [default 350-800 ms]
+ * - Extended closure / rest: > maxCommandMs [default > 800 ms]
  */
 class BlinkHysteresisDetector(
     var closeThreshold: Float = 0.45f,
@@ -423,10 +462,19 @@ class BlinkHysteresisDetector(
     var intentionalMinMs: Long = 350L,
     var maxCommandMs: Long = 800L
 ) {
+    var naturalMinMs: Long = 80L
     private var isEyesClosedState: Boolean = false
     private var closedStartTimestampMs: Long = 0L
+    private var lastUpdateTimestampMs: Long = 0L
+    private var frameIntervalMs: Double = DEFAULT_FRAME_INTERVAL_MS
 
     fun update(eyeOpenProb: Float, timestampMs: Long): Pair<Float, BlinkClassificationEvent?> {
+        if (lastUpdateTimestampMs > 0L) {
+            val dt = (timestampMs - lastUpdateTimestampMs).coerceIn(16L, 250L).toDouble()
+            frameIntervalMs = 0.8 * frameIntervalMs + 0.2 * dt
+        }
+        lastUpdateTimestampMs = timestampMs
+
         if (!isEyesClosedState) {
             if (eyeOpenProb < closeThreshold) {
                 isEyesClosedState = true
@@ -438,8 +486,9 @@ class BlinkHysteresisDetector(
             val elapsedMs = (timestampMs - closedStartTimestampMs).coerceAtLeast(0L)
             if (eyeOpenProb > openThreshold) {
                 isEyesClosedState = false
+                val estimatedClosureMs = elapsedMs + (frameIntervalMs / 2.0).toLong()
                 val event = when {
-                    elapsedMs in 80L until intentionalMinMs ->
+                    elapsedMs < intentionalMinMs && estimatedClosureMs >= naturalMinMs ->
                         BlinkClassificationEvent(BlinkType.NATURAL, elapsedMs, timestampMs)
                     elapsedMs in intentionalMinMs..maxCommandMs ->
                         BlinkClassificationEvent(BlinkType.INTENTIONAL_COMMAND, elapsedMs, timestampMs)
@@ -458,16 +507,26 @@ class BlinkHysteresisDetector(
     fun reset() {
         isEyesClosedState = false
         closedStartTimestampMs = 0L
+        lastUpdateTimestampMs = 0L
+        frameIntervalMs = DEFAULT_FRAME_INTERVAL_MS
+    }
+
+    companion object {
+        /** Initial frame-interval estimate (~15 FPS) before any timestamps have been observed. */
+        const val DEFAULT_FRAME_INTERVAL_MS = 66.0
     }
 }
 
 /**
- * Brow-Raise Expression Trigger with Schmitt-trigger hysteresis and hold-time gating (380 ms default).
+ * Brow-Raise Expression Trigger with Schmitt-trigger hysteresis and hold-time gating (400 ms default).
  * Because a brow raise keeps both eyes open, the tracker never loses pupil lock at the moment of selection.
- * Uses per-user calibrated neutralBrowRatio and raisedBrowRatio (or defaults 0.34 -> 0.41):
- * - Enter raise state when pitch-compensated browToEyeRatio > raiseThreshold
+ * Uses per-user calibrated neutralBrowRatio and raisedBrowRatio (or defaults 0.34 -> 0.42):
+ * - Enter raise state when pitch-compensated browToEyeRatio >= raiseThreshold
+ *   (neutral + 0.60 * max(raised - neutral, 0.035), see [raiseThresholdFor])
  * - Fire once held >= holdTargetMs (default 400 ms, within 350-600 ms spec)
- * - Disarm until brow relaxes below releaseThreshold
+ * - Disarm until brow relaxes below releaseThreshold (neutral + 0.32 * max(raised - neutral, 0.035))
+ * - An unfired hold restarts after an update gap > [MAX_HOLD_UPDATE_GAP_MS]; callers that skip updates
+ *   (face lost, brow trigger disabled) call [cancelPendingRaise] so a stale raise never fires on resume.
  */
 class BrowRaiseHysteresisDetector(
     var neutralBrowRatio: Float = 0.34f,
@@ -477,20 +536,23 @@ class BrowRaiseHysteresisDetector(
     private var isBrowRaisedState: Boolean = false
     private var raiseStartTimestampMs: Long = 0L
     private var firedForCurrentRaise: Boolean = false
+    private var lastUpdateTimestampMs: Long = 0L
 
     val raiseThreshold: Float
-        get() {
-            val delta = (raisedBrowRatio - neutralBrowRatio).coerceAtLeast(0.035f)
-            return neutralBrowRatio + 0.60f * delta
-        }
+        get() = raiseThresholdFor(neutralBrowRatio, raisedBrowRatio)
 
     val releaseThreshold: Float
-        get() {
-            val delta = (raisedBrowRatio - neutralBrowRatio).coerceAtLeast(0.035f)
-            return neutralBrowRatio + 0.32f * delta
-        }
+        get() = releaseThresholdFor(neutralBrowRatio, raisedBrowRatio)
 
     fun update(browToEyeRatio: Float, timestampMs: Long): Pair<Float, Boolean> {
+        if (isBrowRaisedState && !firedForCurrentRaise && lastUpdateTimestampMs > 0L &&
+            timestampMs - lastUpdateTimestampMs > MAX_HOLD_UPDATE_GAP_MS
+        ) {
+            // Long frame outage (e.g. app backgrounded): the hold was not observed, so restart it.
+            raiseStartTimestampMs = timestampMs
+        }
+        lastUpdateTimestampMs = timestampMs
+
         if (!isBrowRaisedState) {
             if (browToEyeRatio >= raiseThreshold) {
                 isBrowRaisedState = true
@@ -515,8 +577,33 @@ class BrowRaiseHysteresisDetector(
         }
     }
 
+    /**
+     * Cancels a raise that has started but not fired yet, so the next update has to observe a fresh
+     * full hold. A raise that already fired stays disarmed until the brow relaxes below release.
+     */
+    fun cancelPendingRaise() {
+        if (isBrowRaisedState && !firedForCurrentRaise) {
+            isBrowRaisedState = false
+        }
+    }
+
     fun reset() {
         isBrowRaisedState = false
         firedForCurrentRaise = false
+        raiseStartTimestampMs = 0L
+        lastUpdateTimestampMs = 0L
+    }
+
+    companion object {
+        /** Update gaps longer than this restart an unfired hold. Above the ~420-430 ms test/simulator gaps. */
+        const val MAX_HOLD_UPDATE_GAP_MS = 1000L
+
+        /** The ratio at which the detector enters the raise state (same formula as [raiseThreshold]). */
+        fun raiseThresholdFor(neutral: Float, raised: Float): Float =
+            neutral + 0.60f * (raised - neutral).coerceAtLeast(0.035f)
+
+        /** The ratio below which a raise is released (same formula as [releaseThreshold]). */
+        fun releaseThresholdFor(neutral: Float, raised: Float): Float =
+            neutral + 0.32f * (raised - neutral).coerceAtLeast(0.035f)
     }
 }

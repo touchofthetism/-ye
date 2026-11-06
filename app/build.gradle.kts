@@ -1,5 +1,6 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
 import java.time.Duration
+import org.gradle.api.tasks.PathSensitivity
 
 plugins {
   alias(libs.plugins.android.application)
@@ -75,6 +76,8 @@ secrets {
   propertiesFileName = ".env"
   defaultPropertiesFileName = ".env.example"
   ignoreList.add("FIREBASE_APPCHECK_DEBUG_TOKEN")
+  // No code reads a Gemini key; keep it out of BuildConfig so a key set in .env never ships in the APK.
+  ignoreList.add("GEMINI_API_KEY")
 }
 
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
@@ -137,11 +140,23 @@ dependencies {
   // "ksp"(libs.moshi.kotlin.codegen)
 }
 
+// Opt-in performance benchmarks: ./gradlew :app:testDebugUnitTest -Pbenchmark --tests '*PipelineBenchmarkTest*'
+// "-Pbenchmark" (empty) or "-Pbenchmark=true" enables them; "-Pbenchmark=false" or no property keeps them off.
+val benchmarkEnabled: Boolean =
+  providers.gradleProperty("benchmark").map { it.isEmpty() || it.equals("true", ignoreCase = true) }.getOrElse(false)
+
 tasks.withType<Test> {
-  // Opt-in performance benchmarks: ./gradlew :app:testDebugUnitTest -Pbenchmark --tests '*PipelineBenchmarkTest*'
-  systemProperty("oculagaze.benchmark", providers.gradleProperty("benchmark").isPresent.toString())
+  systemProperty("oculagaze.benchmark", benchmarkEnabled.toString())
   failFast = true
-  timeout.set(Duration.ofMinutes(if (providers.gradleProperty("benchmark").isPresent) 15 else 2))
+  // Task-wide limit (not per test): a cold run downloads the Robolectric SDK 36 jar and makes emulator round trips.
+  timeout.set(Duration.ofMinutes(if (benchmarkEnabled) 30 else 20))
+  // EyeTrackingRepositoryRuleTest / RoundTripTest exercise firestore.rules through the Firebase emulator, so the
+  // rules and emulator config are test inputs, and a cached or up-to-date result must never stand in for a run.
+  inputs.files(rootProject.file("firestore.rules"), rootProject.file("firebase.json"))
+    .withPathSensitivity(PathSensitivity.RELATIVE)
+    .withPropertyName("firebaseEmulatorConfig")
+  outputs.cacheIf("emulator-backed tests depend on external emulator state") { false }
+  outputs.upToDateWhen { false }
   testLogging {
     events("passed", "failed", "skipped")
   }

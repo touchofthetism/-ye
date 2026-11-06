@@ -30,19 +30,27 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
@@ -50,33 +58,129 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.unit.toSize
 import com.example.data.model.SectionDwellSummary
 import com.example.data.model.SectionPassageItem
 import com.example.ui.viewmodel.AttentionSessionLiveState
+import kotlinx.coroutines.flow.distinctUntilChanged
 import java.util.Locale
 
+/**
+ * Reported through `onUpdateLayoutHitSection` when the section bounds are attached but the reticle is over none of
+ * them (header card, gaps and padding around the sections, HUD above the scroll viewport), and when this screen
+ * leaves composition while a recording may keep running. `null` keeps its meaning of "section bounds not attached
+ * yet", which is the only case where the ViewModel may fall back to fixed vertical bands.
+ */
+const val ATTENTION_OFF_PASSAGE_SECTION_ID = "__off_passage__"
+
+/** Passage Box geometry in root coordinates: unclipped origin and size (scroll included) plus the visible, clipped bounds. */
+internal data class PassageLayoutSnapshot(
+    val originInRoot: Offset,
+    val size: Size,
+    val visibleBoundsInRoot: Rect
+)
+
+/** Section id under the reticle, [ATTENTION_OFF_PASSAGE_SECTION_ID] when bounds are known but none is hit, null when no bounds are attached. */
+internal fun resolveLayoutHitReport(reticleRootPosition: Offset, sectionBounds: Map<String, Rect>): String? {
+    if (sectionBounds.isEmpty()) return null
+    return sectionBounds.entries.firstOrNull { (_, rect) -> rect.contains(reticleRootPosition) }?.key
+        ?: ATTENTION_OFF_PASSAGE_SECTION_ID
+}
+
+/**
+ * Reticle position normalized to the passage Box (the frame the fixation heatmap Canvas draws in), or null when the
+ * reticle is not over the visible part of the passage.
+ */
+internal fun passageLocalGazePoint(reticleRootPosition: Offset, passage: PassageLayoutSnapshot): Offset? {
+    if (passage.size.width <= 0f || passage.size.height <= 0f) return null
+    if (!passage.visibleBoundsInRoot.contains(reticleRootPosition)) return null
+    val x = (reticleRootPosition.x - passage.originInRoot.x) / passage.size.width
+    val y = (reticleRootPosition.y - passage.originInRoot.y) / passage.size.height
+    return if (x in 0f..1f && y in 0f..1f) Offset(x, y) else null
+}
+
+/** The thermal flag is latched per recording; it only describes the live session. */
+internal fun shouldShowThermalGuard(state: AttentionSessionLiveState): Boolean =
+    state.isRecording && state.thermalThrottleDetected
+
+/** Words of the sections the gaze dwelled on per minute of on-passage time; 0 means not enough on-passage gaze. */
+internal fun formatEstimatedWpm(wordsPerMinute: Int): String =
+    if (wordsPerMinute > 0) "$wordsPerMinute est. WPM (dwelled sections)" else "est. WPM —"
+
+/** Compatibility overload for callers that read the reticle state in their own scope. */
 @Composable
 fun AttentionAnalyticsScreen(
     attentionState: AttentionSessionLiveState,
-    reticleRootPosition: Offset = Offset.Zero,
+    reticleRootPosition: Offset,
     passageSections: List<SectionPassageItem>,
     sectionSummaries: List<SectionDwellSummary>,
     onUpdateLayoutHitSection: (String?) -> Unit = {},
+    onUpdatePassageGazePoint: (Offset?) -> Unit = {},
+    onClearReplay: () -> Unit = {},
+    onStartRecording: () -> Unit,
+    onStopAndSaveRecording: () -> Unit
+) {
+    val latestReticle = rememberUpdatedState(reticleRootPosition)
+    AttentionAnalyticsScreen(
+        attentionState = attentionState,
+        reticleRootPosition = { latestReticle.value },
+        passageSections = passageSections,
+        sectionSummaries = sectionSummaries,
+        onUpdateLayoutHitSection = onUpdateLayoutHitSection,
+        onUpdatePassageGazePoint = onUpdatePassageGazePoint,
+        onClearReplay = onClearReplay,
+        onStartRecording = onStartRecording,
+        onStopAndSaveRecording = onStopAndSaveRecording
+    )
+}
+
+/**
+ * @param reticleRootPosition Provider of the reticle's root-window position. It is read only inside the hit-test
+ *   coroutine, so reticle motion and scrolling do not recompose this screen.
+ * @param onUpdateLayoutHitSection See [ATTENTION_OFF_PASSAGE_SECTION_ID] for the meaning of null vs. the sentinel.
+ * @param onUpdatePassageGazePoint Reticle position normalized to the passage Box (the heatmap Canvas frame), or null
+ *   when the reticle is off the visible passage or the screen has left composition.
+ */
+@Composable
+fun AttentionAnalyticsScreen(
+    attentionState: AttentionSessionLiveState,
+    reticleRootPosition: () -> Offset = { Offset.Zero },
+    passageSections: List<SectionPassageItem>,
+    sectionSummaries: List<SectionDwellSummary>,
+    onUpdateLayoutHitSection: (String?) -> Unit = {},
+    onUpdatePassageGazePoint: (Offset?) -> Unit = {},
     onClearReplay: () -> Unit = {},
     onStartRecording: () -> Unit,
     onStopAndSaveRecording: () -> Unit
 ) {
     val sectionBoundsMap = remember { mutableStateMapOf<String, Rect>() }
+    var passageLayout by remember { mutableStateOf<PassageLayoutSnapshot?>(null) }
     val textMeasurer = rememberTextMeasurer()
     val scrollState = rememberScrollState()
+    val latestReticle by rememberUpdatedState(reticleRootPosition)
+    val latestOnHit by rememberUpdatedState(onUpdateLayoutHitSection)
+    val latestOnPassagePoint by rememberUpdatedState(onUpdatePassageGazePoint)
 
-    // Hit-test the rendered reticle's root-window coordinate against the live scrolled section bounding boxes
-    LaunchedEffect(reticleRootPosition, scrollState.value, sectionBoundsMap.size) {
-        if (reticleRootPosition != Offset.Zero) {
-            val hit = sectionBoundsMap.entries.firstOrNull { (_, rect) ->
-                rect.contains(reticleRootPosition)
+    // Hit-test the rendered reticle's root-window coordinate against the live scrolled section bounding boxes.
+    // Reticle, section bounds and passage geometry are read only here, so reticle motion, scrolling and layout
+    // shifts (e.g. a banner pushing the passage down) re-run the hit-test without recomposing the screen.
+    LaunchedEffect(Unit) {
+        snapshotFlow { Triple(latestReticle(), sectionBoundsMap.toMap(), passageLayout) }
+            .distinctUntilChanged()
+            .collect { (pos, bounds, passage) ->
+                if (pos != Offset.Zero) {
+                    latestOnHit(resolveLayoutHitReport(pos, bounds))
+                    latestOnPassagePoint(passage?.let { passageLocalGazePoint(pos, it) })
+                }
             }
-            onUpdateLayoutHitSection(hit?.key)
+    }
+
+    // A recording keeps running after the user leaves this tab; stop crediting the last hit section and
+    // stop recording passage-frame fixation samples while the passage is not on screen.
+    DisposableEffect(Unit) {
+        onDispose {
+            latestOnHit(ATTENTION_OFF_PASSAGE_SECTION_ID)
+            latestOnPassagePoint(null)
         }
     }
 
@@ -114,7 +218,7 @@ fun AttentionAnalyticsScreen(
                                 attentionState.isRecording ->
                                     "Recording (${attentionState.elapsedSeconds}s) • Nat Blinks: ${attentionState.sessionNaturalBlinks} • Cmd Blinks: ${attentionState.sessionIntentionalBlinks}"
                                 replay != null ->
-                                    "${replay.durationSeconds}s • ${replay.effectiveWordsPerMinute} eff. WPM • ${String.format(Locale.US, "%.1f", replay.blinksPerMinute)} blinks/min • ${replay.fixationClusterCount} clusters"
+                                    "${replay.durationSeconds}s • ${formatEstimatedWpm(replay.effectiveWordsPerMinute)} • ${String.format(Locale.US, "%.1f", replay.blinksPerMinute)} blinks/min • ${replay.fixationClusterCount} clusters"
                                 else ->
                                     "Measures layout section dwell (%) & dispersion fixation clusters at camera FPS."
                             },
@@ -166,7 +270,7 @@ fun AttentionAnalyticsScreen(
                     }
                 }
 
-                if (attentionState.thermalThrottleDetected) {
+                if (shouldShowThermalGuard(attentionState)) {
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
                         text = "Thermal Guard: Device warming up (>40% FPS drop from baseline) — Performance Mode engaged automatically.",
@@ -180,6 +284,15 @@ fun AttentionAnalyticsScreen(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
+                .onGloballyPositioned { coords ->
+                    // positionInRoot/size are unclipped and include the scroll offset (the heatmap Canvas frame);
+                    // boundsInRoot is clipped to the scroll viewport (what is actually visible).
+                    passageLayout = PassageLayoutSnapshot(
+                        originInRoot = coords.positionInRoot(),
+                        size = coords.size.toSize(),
+                        visibleBoundsInRoot = coords.boundsInRoot()
+                    )
+                }
                 .clip(RoundedCornerShape(16.dp))
                 .background(MaterialTheme.colorScheme.surface)
                 .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(16.dp))

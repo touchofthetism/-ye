@@ -46,7 +46,9 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -63,6 +65,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.example.R
+import com.example.data.model.CalibrationTargetPoint
 import com.example.domain.GazeCalibrationMath
 import com.example.ui.viewmodel.CalibrationFlowStep
 import com.example.ui.viewmodel.CalibrationWizardState
@@ -82,6 +85,20 @@ fun CalibrationStudioScreen(
     onToggleIncludeValidation: (Boolean) -> Unit = {},
     onCaptureManualSamples: () -> Unit = {}
 ) {
+    // Leaving composition mid-wizard (tab switch, activity teardown) must end the run. Otherwise every
+    // later camera frame is still recorded under a target that is no longer on screen, and the fit that
+    // completes in the background becomes the live mapping. The step is read at dispose time, so a
+    // normal FIT -> COMPLETED_SUMMARY transition (which keeps this screen composed) never cancels.
+    val latestStep by rememberUpdatedState(calibrationState.step)
+    val latestOnCancelWizard by rememberUpdatedState(onCancelWizard)
+    DisposableEffect(Unit) {
+        onDispose {
+            if (isCalibrationCollectingStep(latestStep)) {
+                latestOnCancelWizard()
+            }
+        }
+    }
+
     when (calibrationState.step) {
         CalibrationFlowStep.IDLE -> {
             CalibrationIdleOverview(
@@ -239,35 +256,45 @@ private fun CalibrationIdleOverview(
                             )
                         }
                     }
-                    Text(
-                        text = "Sequence: P1(0.50,0.50) → P2(0.14,0.16) → P3(0.86,0.16) → P4(0.14,0.84) → P5(0.86,0.84)",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .background(
-                                MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
-                                RoundedCornerShape(6.dp)
-                            )
-                            .padding(horizontal = 8.dp, vertical = 2.dp)
-                    )
                 }
+                // Below the map, not over it: overlaid at BottomCenter it wrapped onto the P4/P5 markers.
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "Sequence: P1(0.50,0.50) → P2(0.14,0.16) → P3(0.86,0.16) → P4(0.14,0.84) → P5(0.86,0.84)",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.fillMaxWidth()
+                )
 
                 Spacer(modifier = Modifier.height(14.dp))
+                // Null means "not validated" (no calibration applied yet): never show a number nobody measured.
+                val meanErrPct: Float? = hudState.activeErrorRadiusPct
+                val worstErrPct: Float? = hudState.activeMaxQuadrantErrorPct
+                val meanErrMm: Double? = hudState.activeErrorMm
+                val meanErrText = formatErrorPctOrNull(meanErrPct?.toDouble())
+                val worstErrText = formatErrorPctOrNull(worstErrPct?.toDouble())
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     MetricBadgeCard(
                         label = "MEAN SCREEN ERR",
-                        value = String.format(Locale.US, "±%.1f%%", hudState.activeErrorRadiusPct),
-                        sub = String.format(Locale.US, "~%.1f mm (approximate)", hudState.activeErrorMm),
+                        value = meanErrText ?: NOT_CALIBRATED_TEXT,
+                        sub = if (meanErrText != null) {
+                            formatApproxMmOrNull(meanErrMm) ?: "mm not measured"
+                        } else {
+                            "Run calibration to measure"
+                        },
                         modifier = Modifier.weight(1f)
                     )
                     MetricBadgeCard(
                         label = "WORST QUADRANT",
-                        value = String.format(Locale.US, "±%.1f%%", hudState.activeMaxQuadrantErrorPct),
-                        sub = "Profile: ${hudState.activeProfileName.take(16)}",
+                        value = worstErrText ?: NOT_CALIBRATED_TEXT,
+                        sub = if (worstErrText != null) {
+                            "Profile: ${hudState.activeProfileName.take(16)}"
+                        } else {
+                            "Default matrix, not validated"
+                        },
                         modifier = Modifier.weight(1f)
                     )
                 }
@@ -350,6 +377,10 @@ private fun CalibrationIdleOverview(
  * - P4 Bottom-Left (0.14, 0.84)
  * - P5 Bottom-Right (0.86, 0.84)
  * (Plus optional 4 held-out validation quadrant coordinates when enabled.)
+ *
+ * The fixation target itself is drawn full-frame by [CalibrationTargetFullscreenOverlay] (placed by
+ * MainActivity in the same root Box the gaze output is normalized to). This screen only shows the
+ * guidance, the controls and a small progress map.
  */
 @Composable
 fun FivePointCalibrationScreen(
@@ -359,28 +390,38 @@ fun FivePointCalibrationScreen(
     onSnapSimulatorToCurrentTarget: (Float, Float) -> Unit,
     onCaptureManualSamples: () -> Unit = {}
 ) {
-    val allTargets = GazeCalibrationMath.CALIBRATION_AND_VALIDATION_TARGETS
+    // Only these two HUD fields matter here. Passing them as plain values lets the wizard body skip
+    // recomposition on camera frames that change nothing it shows (the HUD state changes every frame).
+    FivePointCalibrationContent(
+        calibrationState = calibrationState,
+        faceDetected = hudState.rawFeature.faceDetected,
+        isSimulatorProxyEnabled = hudState.isSimulatorProxyEnabled,
+        onCancelWizard = onCancelWizard,
+        onSnapSimulatorToCurrentTarget = onSnapSimulatorToCurrentTarget,
+        onCaptureManualSamples = onCaptureManualSamples
+    )
+}
+
+@Composable
+private fun FivePointCalibrationContent(
+    calibrationState: CalibrationWizardState,
+    faceDetected: Boolean,
+    isSimulatorProxyEnabled: Boolean,
+    onCancelWizard: () -> Unit,
+    onSnapSimulatorToCurrentTarget: (Float, Float) -> Unit,
+    onCaptureManualSamples: () -> Unit
+) {
     val fiveFitTargets = GazeCalibrationMath.FIVE_POINT_CALIBRATION_TARGETS
-    val target = allTargets.getOrNull(calibrationState.currentTargetIndex) ?: allTargets.first()
+    val target = calibrationTargetForIndex(calibrationState.currentTargetIndex)
     val isValidation = target.isValidationPoint
     val targetColor = if (isValidation) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.primary
     val completedColor = MaterialTheme.colorScheme.secondary
     val pendingColor = MaterialTheme.colorScheme.outline
 
-    val infiniteTransition = rememberInfiniteTransition(label = "calibration_pulse")
-    val pulseScale by infiniteTransition.animateFloat(
-        initialValue = 0.86f,
-        targetValue = 1.24f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 750, easing = FastOutSlowInEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "pulse_ring_scale"
-    )
-
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(12.dp)
             .testTag("five_point_calibration_screen")
     ) {
@@ -423,10 +464,14 @@ fun FivePointCalibrationScreen(
                             color = MaterialTheme.colorScheme.onSurface
                         )
                         Text(
-                            text = if (calibrationState.isSettlingDelay) {
-                                "Settling saccade (400 ms) — keep eyes fixated on pulsing center dot..."
-                            } else {
-                                String.format(
+                            text = when {
+                                // Samples are only taken on face-detected frames, so without a face the
+                                // settling phase never ends: say so instead of "settling" forever.
+                                !faceDetected ->
+                                    "No face detected — face the front camera. Sampling is paused until your face is found."
+                                calibrationState.isSettlingDelay ->
+                                    "Settling saccade (400 ms) — keep your eyes on the pulsing on-screen target..."
+                                else -> String.format(
                                     Locale.US,
                                     "Collecting gaze samples: %d/%d at point (%d%%) • Total collected: %d pts",
                                     calibrationState.samplesCollectedForCurrentTarget,
@@ -436,7 +481,11 @@ fun FivePointCalibrationScreen(
                                 )
                             },
                             style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = if (faceDetected) {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            } else {
+                                MaterialTheme.colorScheme.error
+                            },
                             modifier = Modifier.testTag("calibration_sample_counter_text")
                         )
                     }
@@ -493,7 +542,9 @@ fun FivePointCalibrationScreen(
                     }
                 }
 
-                // Action controls for Simulator Lock, Manual Capture, and Cancel
+                // Action controls for Simulator Lock, Manual Capture, and Cancel.
+                // The simulator is only ever moved when it is already on: on real hardware a capture must
+                // record the user's own camera frames, never a synthetic vector placed on the target.
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -501,7 +552,9 @@ fun FivePointCalibrationScreen(
                 ) {
                     Button(
                         onClick = {
-                            onSnapSimulatorToCurrentTarget(target.normX, target.normY)
+                            if (isSimulatorProxyEnabled) {
+                                onSnapSimulatorToCurrentTarget(target.normX, target.normY)
+                            }
                             onCaptureManualSamples()
                         },
                         modifier = Modifier
@@ -521,7 +574,12 @@ fun FivePointCalibrationScreen(
                         )
                     }
                     OutlinedButton(
-                        onClick = { onSnapSimulatorToCurrentTarget(target.normX, target.normY) },
+                        onClick = {
+                            if (isSimulatorProxyEnabled) {
+                                onSnapSimulatorToCurrentTarget(target.normX, target.normY)
+                            }
+                        },
+                        enabled = isSimulatorProxyEnabled,
                         modifier = Modifier
                             .heightIn(min = 48.dp)
                             .testTag("snap_sim_to_target_button")
@@ -542,14 +600,24 @@ fun FivePointCalibrationScreen(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Interactive 5-Point Coordinate Canvas
+        // Small progress map: a miniature of the screen, deliberately without a pulsing bullseye. The
+        // target the user fixates is the full-frame one, drawn in the frame the gaze output uses.
+        Text(
+            text = "Progress map (miniature of the screen, not a target). Look at the pulsing target drawn on the screen itself.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("calibration_progress_map_label")
+        )
+        Spacer(modifier = Modifier.height(6.dp))
         BoxWithConstraints(
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(1f)
-                .clip(RoundedCornerShape(18.dp))
-                .background(MaterialTheme.colorScheme.background)
-                .border(1.5.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(18.dp))
+                .height(140.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
+                .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(14.dp))
                 .testTag("five_point_calibration_canvas")
         ) {
             val density = LocalDensity.current
@@ -557,7 +625,7 @@ fun FivePointCalibrationScreen(
             val heightPx = with(density) { maxHeight.toPx() }
 
             Canvas(modifier = Modifier.fillMaxSize()) {
-                val dashEffect = PathEffect.dashPathEffect(floatArrayOf(12f, 10f), 0f)
+                val dashEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f), 0f)
 
                 // Subtle reference crosshair lines at screen midpoint (0.50, 0.50)
                 drawLine(
@@ -573,7 +641,7 @@ fun FivePointCalibrationScreen(
                     strokeWidth = 1.dp.toPx()
                 )
 
-                // Draw sequential guide path across the 5 calibration targets
+                // Sequential guide path across the 5 calibration targets
                 for (i in 0 until fiveFitTargets.size - 1) {
                     val fromPt = fiveFitTargets[i]
                     val toPt = fiveFitTargets[i + 1]
@@ -586,96 +654,48 @@ fun FivePointCalibrationScreen(
                         },
                         start = Offset(fromPt.normX * size.width, fromPt.normY * size.height),
                         end = Offset(toPt.normX * size.width, toPt.normY * size.height),
-                        strokeWidth = if (isActiveTransition) 2.5.dp.toPx() else 1.5.dp.toPx(),
+                        strokeWidth = if (isActiveTransition) 2.dp.toPx() else 1.dp.toPx(),
                         pathEffect = dashEffect
                     )
                 }
 
-                // Draw all 5 calibration screen coordinates (completed, pending, and active)
+                // Completed and pending fit points
                 fiveFitTargets.forEach { pt ->
-                    val cx = pt.normX * size.width
-                    val cy = pt.normY * size.height
+                    val center = Offset(pt.normX * size.width, pt.normY * size.height)
                     val isDone = calibrationState.currentTargetIndex > pt.index
                     val isCurrent = calibrationState.currentTargetIndex == pt.index
-
                     if (isDone) {
                         drawCircle(
-                            color = completedColor.copy(alpha = 0.20f),
-                            radius = 18.dp.toPx(),
-                            center = Offset(cx, cy)
-                        )
-                        drawCircle(
                             color = completedColor,
-                            radius = 12.dp.toPx(),
-                            center = Offset(cx, cy),
-                            style = Stroke(width = 2.5.dp.toPx())
-                        )
-                        drawCircle(
-                            color = completedColor,
-                            radius = 4.5.dp.toPx(),
-                            center = Offset(cx, cy)
-                        )
-                    } else if (!isCurrent) {
-                        drawCircle(
-                            color = pendingColor.copy(alpha = 0.38f),
-                            radius = 13.dp.toPx(),
-                            center = Offset(cx, cy),
+                            radius = 7.dp.toPx(),
+                            center = center,
                             style = Stroke(width = 1.5.dp.toPx())
                         )
                         drawCircle(
-                            color = pendingColor.copy(alpha = 0.45f),
+                            color = completedColor,
                             radius = 3.dp.toPx(),
-                            center = Offset(cx, cy)
+                            center = center
+                        )
+                    } else if (!isCurrent) {
+                        drawCircle(
+                            color = pendingColor.copy(alpha = 0.45f),
+                            radius = 7.dp.toPx(),
+                            center = center,
+                            style = Stroke(width = 1.dp.toPx())
                         )
                     }
                 }
 
-                // Draw active target (either one of the 5 fitting points or 4 validation points)
-                val tx = target.normX * size.width
-                val ty = target.normY * size.height
-
-                // Live gaze line from current estimated screen gaze to active target coordinate
-                val gx = hudState.normX * size.width
-                val gy = hudState.normY * size.height
-                drawLine(
-                    color = targetColor.copy(alpha = 0.30f),
-                    start = Offset(gx, gy),
-                    end = Offset(tx, ty),
-                    strokeWidth = 1.5.dp.toPx(),
-                    pathEffect = dashEffect
-                )
-
-                // Animated pulsing outer halo guiding fixation to (tx, ty)
-                drawCircle(
-                    color = targetColor.copy(alpha = 0.22f),
-                    radius = (38.dp.toPx() * pulseScale),
-                    center = Offset(tx, ty)
-                )
+                // Current point (fit or held-out) as a plain position marker, not a fixation bullseye
                 drawCircle(
                     color = targetColor,
-                    radius = 26.dp.toPx(),
-                    center = Offset(tx, ty),
-                    style = Stroke(width = 3.dp.toPx())
-                )
-                // Sample collection 360° progress arc
-                drawArc(
-                    color = targetColor,
-                    startAngle = -90f,
-                    sweepAngle = calibrationState.currentTargetProgress * 360f,
-                    useCenter = false,
-                    topLeft = Offset(tx - 32.dp.toPx(), ty - 32.dp.toPx()),
-                    size = Size(64.dp.toPx(), 64.dp.toPx()),
-                    style = Stroke(width = 5.dp.toPx())
-                )
-                // High-contrast bullseye center dot
-                drawCircle(
-                    color = targetColor,
-                    radius = 6.5.dp.toPx(),
-                    center = Offset(tx, ty)
+                    radius = 5.dp.toPx(),
+                    center = Offset(target.normX * size.width, target.normY * size.height)
                 )
             }
 
-            // Accessible interactive target nodes at each of the 5 screen coordinates
+            // Accessible nodes at each of the 5 fit coordinates. Only the current one captures: tapping
+            // another point must never record anything under the current target's label.
             val targetHitSize = 48.dp
             val halfHitPx = with(density) { (targetHitSize / 2).toPx() }
             fiveFitTargets.forEach { pt ->
@@ -687,12 +707,18 @@ fun FivePointCalibrationScreen(
                         .offset { IntOffset(xOffsetPx, yOffsetPx) }
                         .size(targetHitSize)
                         .clip(CircleShape)
-                        .clickable {
-                            onSnapSimulatorToCurrentTarget(pt.normX, pt.normY)
+                        .then(
                             if (isCurrent) {
-                                onCaptureManualSamples()
+                                Modifier.clickable {
+                                    if (isSimulatorProxyEnabled) {
+                                        onSnapSimulatorToCurrentTarget(pt.normX, pt.normY)
+                                    }
+                                    onCaptureManualSamples()
+                                }
+                            } else {
+                                Modifier
                             }
-                        }
+                        )
                         .semantics {
                             contentDescription = "${pt.shortName} coordinate (${pt.normX}, ${pt.normY})"
                         }
@@ -703,6 +729,97 @@ fun FivePointCalibrationScreen(
         }
     }
 }
+
+/**
+ * Full-frame fixation target for the calibration wizard.
+ *
+ * Gaze normX/normY is normalized to the root content Box that also hosts RegionConfidenceReticleOverlay,
+ * and the fit labels each sample with the current target's (normX, normY). The target must therefore be
+ * drawn in that same frame: MainActivity places this overlay in the root Box with Modifier.fillMaxSize(),
+ * and it draws only the current target at (normX * width, normY * height) of its own bounds, with the
+ * sample-progress ring. It has no pointer input, so every touch reaches the controls underneath.
+ */
+@Composable
+fun CalibrationTargetFullscreenOverlay(
+    calibrationState: CalibrationWizardState,
+    modifier: Modifier = Modifier
+) {
+    val target = currentCalibrationFixationTarget(calibrationState) ?: return
+    val targetColor = if (target.isValidationPoint) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.primary
+    val progress = calibrationState.currentTargetProgress.coerceIn(0f, 1f)
+
+    val pulseTransition = rememberInfiniteTransition(label = "calibration_target_pulse")
+    val pulseScale = pulseTransition.animateFloat(
+        initialValue = 0.86f,
+        targetValue = 1.24f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 750, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "calibration_target_pulse_scale"
+    )
+
+    Canvas(modifier = modifier.testTag("calibration_fullscreen_target_overlay")) {
+        val center = calibrationTargetCenterPx(target, size.width, size.height)
+        // The pulse is read in the draw phase, so the animation redraws without recomposing.
+        drawCircle(
+            color = targetColor.copy(alpha = 0.22f),
+            radius = 38.dp.toPx() * pulseScale.value,
+            center = center
+        )
+        drawCircle(
+            color = targetColor,
+            radius = 26.dp.toPx(),
+            center = center,
+            style = Stroke(width = 3.dp.toPx())
+        )
+        // Sample collection 360° progress arc
+        drawArc(
+            color = targetColor,
+            startAngle = -90f,
+            sweepAngle = progress * 360f,
+            useCenter = false,
+            topLeft = Offset(center.x - 32.dp.toPx(), center.y - 32.dp.toPx()),
+            size = Size(64.dp.toPx(), 64.dp.toPx()),
+            style = Stroke(width = 5.dp.toPx())
+        )
+        // High-contrast bullseye center dot
+        drawCircle(
+            color = targetColor,
+            radius = 6.5.dp.toPx(),
+            center = center
+        )
+    }
+}
+
+private const val NOT_CALIBRATED_TEXT = "Not calibrated"
+private const val NOT_MEASURED_TEXT = "Not measured"
+
+/** True while the wizard records camera frames under an on-screen target. */
+internal fun isCalibrationCollectingStep(step: CalibrationFlowStep): Boolean =
+    step == CalibrationFlowStep.FIT_5_POINTS || step == CalibrationFlowStep.VALIDATE_4_POINTS
+
+/** Wizard target for [index]: fit points 0-4, then held-out points 5-8 (first point if out of range). */
+private fun calibrationTargetForIndex(index: Int): CalibrationTargetPoint {
+    val allTargets = GazeCalibrationMath.CALIBRATION_AND_VALIDATION_TARGETS
+    return allTargets.getOrNull(index) ?: allTargets.first()
+}
+
+/** The point the user must fixate now, or null when the wizard is not collecting samples. */
+internal fun currentCalibrationFixationTarget(state: CalibrationWizardState): CalibrationTargetPoint? =
+    if (isCalibrationCollectingStep(state.step)) calibrationTargetForIndex(state.currentTargetIndex) else null
+
+/** Pixel center of [target] in a [widthPx] x [heightPx] frame (the frame gaze normX/normY is normalized to). */
+internal fun calibrationTargetCenterPx(target: CalibrationTargetPoint, widthPx: Float, heightPx: Float): Offset =
+    Offset(target.normX * widthPx, target.normY * heightPx)
+
+/** "±x.x%" for a measured error; null when nothing was measured (null, NaN or infinite). */
+internal fun formatErrorPctOrNull(value: Double?): String? =
+    value?.takeIf { it.isFinite() }?.let { String.format(Locale.US, "±%.1f%%", it) }
+
+/** "~x.x mm (approximate)" for a measured error; null when nothing was measured. */
+internal fun formatApproxMmOrNull(value: Double?): String? =
+    value?.takeIf { it.isFinite() }?.let { String.format(Locale.US, "~%.1f mm (approximate)", it) }
 
 @Composable
 private fun CalibrationValidationSummaryCard(
@@ -748,21 +865,48 @@ private fun CalibrationValidationSummaryCard(
 
                 Spacer(modifier = Modifier.height(14.dp))
 
+                // Quick-fit mode scores the fit on the very samples it was trained on: that is a fit
+                // residual, not a screen error, and no quadrant point was measured. Only the held-out
+                // run earns the validated labels. Non-finite metrics were not measured at all.
+                val metricsAreHeldOut = calibrationState.includeHeldOutValidation
+                val meanErrText = formatErrorPctOrNull(calibrationState.validationMeanErrorPct)
+                val worstErrText = formatErrorPctOrNull(calibrationState.validationMaxErrorPct)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     MetricBadgeCard(
-                        label = "MEAN SCREEN ERROR",
-                        value = String.format(Locale.US, "±%.1f%%", calibrationState.validationMeanErrorPct),
-                        sub = String.format(Locale.US, "~%.1f mm (approximate)", calibrationState.validationMeanErrorMm),
+                        label = if (metricsAreHeldOut) "MEAN SCREEN ERROR" else "FIT RESIDUAL (IN-SAMPLE)",
+                        value = meanErrText ?: NOT_MEASURED_TEXT,
+                        sub = if (metricsAreHeldOut) {
+                            formatApproxMmOrNull(calibrationState.validationMeanErrorMm) ?: "mm not measured"
+                        } else {
+                            "not validated"
+                        },
                         modifier = Modifier.weight(1f)
                     )
                     MetricBadgeCard(
-                        label = "WORST QUADRANT",
-                        value = String.format(Locale.US, "±%.1f%%", calibrationState.validationMaxErrorPct),
-                        sub = "Total Samples: ${calibrationState.totalCollectedSamples}",
+                        label = if (metricsAreHeldOut) "WORST QUADRANT" else "WORST FIT POINT",
+                        value = worstErrText ?: NOT_MEASURED_TEXT,
+                        sub = if (metricsAreHeldOut) {
+                            "Total Samples: ${calibrationState.totalCollectedSamples}"
+                        } else {
+                            "not validated • ${calibrationState.totalCollectedSamples} samples"
+                        },
                         modifier = Modifier.weight(1f)
+                    )
+                }
+
+                if (!metricsAreHeldOut) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Quick fit: these are residuals on the same ${calibrationState.totalCollectedSamples} " +
+                            "samples the fit was trained on. No held-out point was measured, so the real screen " +
+                            "error is unknown and usually larger. Run " +
+                            "'${stringResource(R.string.calibration_mode_5_plus_4)}' to measure it.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.tertiary,
+                        modifier = Modifier.testTag("calibration_in_sample_caveat")
                     )
                 }
 
@@ -777,7 +921,8 @@ private fun CalibrationValidationSummaryCard(
                 )
                 Spacer(modifier = Modifier.height(6.dp))
                 fiveFitTargets.forEach { pt ->
-                    val count = calibrationState.pointSampleCounts[pt.index] ?: calibrationState.requiredSamplesPerTarget
+                    // A point with no entry collected nothing: never show the required count as collected.
+                    val count = calibrationState.pointSampleCounts[pt.index] ?: 0
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -799,11 +944,13 @@ private fun CalibrationValidationSummaryCard(
 
                 Spacer(modifier = Modifier.height(10.dp))
 
-                Text(
-                    text = "Recommended Layout: ${calibrationState.recommendedGridLabel}",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.secondary
-                )
+                if (calibrationState.recommendedGridLabel.isNotBlank()) {
+                    Text(
+                        text = "Recommended Layout: ${calibrationState.recommendedGridLabel}",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.secondary
+                    )
+                }
 
                 Spacer(modifier = Modifier.height(8.dp))
 
