@@ -201,7 +201,7 @@ class PipelineBenchmarkTest {
         val unsafeCls = Class.forName("sun.misc.Unsafe")
         val field = unsafeCls.getDeclaredField("theUnsafe").apply { isAccessible = true }
         val unsafe = field.get(null)
-        return unsafeCls.getMethod("allocateInstance", Class::class.java).invoke(unsafe, cls)
+        return checkNotNull(unsafeCls.getMethod("allocateInstance", Class::class.java).invoke(unsafe, cls))
     }
 
     /** Resolves the engine's ROI analysis entry point (signature-tolerant across refactors). */
