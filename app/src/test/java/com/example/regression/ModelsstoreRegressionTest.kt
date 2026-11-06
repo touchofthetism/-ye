@@ -7,9 +7,14 @@ import com.example.R
 import com.example.data.model.AacActionTile
 import com.example.data.model.AnalysisResolutionTier
 import com.example.data.model.CalibrationProfile
+import com.example.data.model.DwellSpeedPreset
 import com.example.data.model.GazeFeatureVector
+import com.example.data.model.GazeFilterMode
+import com.example.data.model.GazePostureProfile
 import com.example.data.model.GazeTriggerMode
+import com.example.data.model.InteractionSettings
 import com.example.data.model.TrackingSession
+import com.example.data.model.calibrationPostureProfile
 import com.example.data.repository.LocalTelemetryStore
 import com.example.domain.BrowRaiseHysteresisDetector
 import com.google.firebase.FirebaseApp
@@ -35,7 +40,9 @@ import org.xmlpull.v1.XmlPullParser
  * - the standardized feature mapping no longer changes gain with the low-light flag,
  * - labels match the real detector timing and analysis resolution,
  * - cloud-sync consent is per account, the local vault returns persisted ids, wipes AAC phrases,
- *   names its caps, records the chosen active profile, and is excluded from backup.
+ *   names its caps, records the chosen active profile, and is excluded from backup,
+ * - the held-out validation flag and calibration posture persist with each profile (cloud mapper and vault),
+ * - interaction settings persist per account and are wiped with the vault.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
@@ -264,6 +271,120 @@ class ModelsstoreRegressionTest {
         assertEquals("cal_b", store.getActiveProfileId(uid))
         store.clearAllLocalData(uid)
         assertNull(store.getActiveProfileId(uid))
+    }
+
+    // ---- A1 / A178 / B50 / A222: held-out flag and fit posture persist with the profile ----------------
+
+    @Test
+    fun calibrationProfile_heldOutFlagAndPosture_mapThroughFirestoreUnderTheirOwnKeys() {
+        val docRef = DocumentReference.forPath(
+            ResourcePath.fromString("users/u_meta/calibrations/cal_meta_1"),
+            firestore()
+        )
+        val validated = CustomClassMapper.convertToCustomClass(
+            mapOf<String, Any>("userId" to "u_meta", "heldOutValidated" to true, "calibrationPosture" to "RECLINING"),
+            CalibrationProfile::class.java,
+            docRef
+        )
+        assertTrue(validated.heldOutValidated)
+        assertEquals(GazePostureProfile.RECLINING, validated.calibrationPostureProfile())
+
+        val legacy = CustomClassMapper.convertToCustomClass(
+            mapOf<String, Any>("userId" to "u_meta", "name" to "Saved before the flag existed"),
+            CalibrationProfile::class.java,
+            docRef
+        )
+        assertFalse("A record with no flag must not read back as validated", legacy.heldOutValidated)
+        assertEquals(GazePostureProfile.UPRIGHT, legacy.calibrationPostureProfile())
+
+        @Suppress("UNCHECKED_CAST")
+        val plain = CustomClassMapper.convertToPlainJavaTypes(
+            CalibrationProfile(heldOutValidated = true, calibrationPosture = GazePostureProfile.LYING_DOWN.name)
+        ) as Map<String, Any?>
+        assertEquals(true, plain["heldOutValidated"])
+        assertEquals("LYING_DOWN", plain["calibrationPosture"])
+        assertFalse(plain.keys.toString(), plain.containsKey("calibrationPostureProfile"))
+    }
+
+    @Test
+    fun calibrationPostureProfile_mapsBlankOrUnknownNamesToUpright() {
+        assertEquals(GazePostureProfile.UPRIGHT, CalibrationProfile().calibrationPostureProfile())
+        assertEquals(GazePostureProfile.UPRIGHT, CalibrationProfile(calibrationPosture = "").calibrationPostureProfile())
+        assertEquals(GazePostureProfile.UPRIGHT, CalibrationProfile(calibrationPosture = "SIDEWAYS").calibrationPostureProfile())
+        assertEquals(
+            GazePostureProfile.LYING_DOWN,
+            CalibrationProfile(calibrationPosture = "LYING_DOWN").calibrationPostureProfile()
+        )
+    }
+
+    @Test
+    fun localVault_roundTripsHeldOutFlagAndPosture_andReadsLegacyEntriesAsUnvalidated() {
+        val store = LocalTelemetryStore(context)
+        val uid = "meta_uid"
+        store.saveLocalProfile(
+            uid,
+            CalibrationProfile(id = "cal_validated", heldOutValidated = true, calibrationPosture = "RECLINING")
+        )
+        store.saveLocalProfile(uid, CalibrationProfile(id = "cal_fit_only", heldOutValidated = false))
+        val byId = LocalTelemetryStore(context).loadLocalProfiles(uid).associateBy { it.id }
+        assertTrue(byId.getValue("cal_validated").heldOutValidated)
+        assertEquals("RECLINING", byId.getValue("cal_validated").calibrationPosture)
+        assertFalse(byId.getValue("cal_fit_only").heldOutValidated)
+        assertEquals("UPRIGHT", byId.getValue("cal_fit_only").calibrationPosture)
+
+        // Entries written by older versions have neither key; an unknown posture name is not kept.
+        vaultPrefs().edit().putString(
+            "local_profiles_legacy_uid",
+            """[{"id":"cal_old","name":"Old"},{"id":"cal_odd","name":"Odd","calibrationPosture":"SIDEWAYS"}]"""
+        ).commit()
+        val legacy = store.loadLocalProfiles("legacy_uid").associateBy { it.id }
+        assertFalse(legacy.getValue("cal_old").heldOutValidated)
+        assertEquals("UPRIGHT", legacy.getValue("cal_old").calibrationPosture)
+        assertEquals("UPRIGHT", legacy.getValue("cal_odd").calibrationPosture)
+    }
+
+    // ---- A101 / A185 / A225: interaction settings persist per account --------------------------------
+
+    @Test
+    fun interactionSettings_roundTripPerAccount_andAreWipedWithTheVault() {
+        val store = LocalTelemetryStore(context)
+        val uid = "settings_uid"
+        assertNull(store.loadInteractionSettings(uid))
+
+        val custom = InteractionSettings(
+            dwellTriggerMs = 1400L,
+            dwellSensitivityRadiusMultiplier = 1.25f,
+            activeDwellPreset = DwellSpeedPreset.RELAXED,
+            triggerMode = GazeTriggerMode.DWELL_ONLY,
+            filterMode = GazeFilterMode.KALMAN,
+            activePosture = GazePostureProfile.LYING_DOWN,
+            neutralBrowRatio = 0.31f,
+            raisedBrowRatio = 0.4f
+        )
+        store.saveInteractionSettings(uid, custom)
+        assertEquals(custom, LocalTelemetryStore(context).loadInteractionSettings(uid))
+        assertNull("Another account must not inherit these settings", store.loadInteractionSettings("other_uid"))
+
+        store.clearAllLocalData(uid)
+        assertNull(store.loadInteractionSettings(uid))
+    }
+
+    @Test
+    fun interactionSettings_missingUnknownOrNonFiniteFieldsReadBackAsDefaults() {
+        val store = LocalTelemetryStore(context)
+        val defaults = InteractionSettings()
+
+        store.saveInteractionSettings("nan_uid", InteractionSettings(dwellSensitivityRadiusMultiplier = Float.NaN))
+        assertEquals(defaults, store.loadInteractionSettings("nan_uid"))
+
+        vaultPrefs().edit().putString(
+            "local_interaction_settings_partial_uid",
+            """{"dwellTriggerMs":650,"triggerMode":"REMOVED_MODE","neutralBrowRatio":"abc"}"""
+        ).commit()
+        assertEquals(defaults.copy(dwellTriggerMs = 650L), store.loadInteractionSettings("partial_uid"))
+
+        vaultPrefs().edit().putString("local_interaction_settings_corrupt_uid", "not json").commit()
+        assertNull(store.loadInteractionSettings("corrupt_uid"))
     }
 
     // ---- A54: the biometric vault never leaves the device through backup or transfer ------------------
