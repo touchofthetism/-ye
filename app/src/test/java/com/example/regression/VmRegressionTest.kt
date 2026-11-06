@@ -629,4 +629,129 @@ class VmRegressionTest {
         assertFalse(banner, banner.contains("100% PASS"))
         assertTrue(banner, banner.contains("gated scenarios passed"))
     }
+
+    // --- Round 2: A1 / A155 / B27: quick-fit profiles stay unvalidated after a restart ---------------------
+
+    @Test
+    fun `a restored quick-fit profile is not validated but a restored held-out profile is`() {
+        val store = LocalTelemetryStore(context)
+        val quickUser = freshUser()
+        val quickVm = newVm(quickUser, store)
+        quickVm.startCalibrationAndValidationWizard(includeValidation = false)
+        driveWizard(quickVm, System.currentTimeMillis() + 500L) { !isCollecting(it) }
+        quickVm.saveCompletedCalibrationProfile()
+        val restoredQuick = newVm(quickUser, store).liveHudState.value
+        assertTrue(restoredQuick.hasActiveCalibration)
+        assertNull("in-sample residual must not come back as validated accuracy", restoredQuick.activeErrorRadiusPct)
+        assertNull(restoredQuick.activeMaxQuadrantErrorPct)
+
+        val heldOutUser = freshUser()
+        val heldOutVm = newVm(heldOutUser, store)
+        heldOutVm.startCalibrationAndValidationWizard(includeValidation = true)
+        driveWizard(heldOutVm, System.currentTimeMillis() + 500L) { !isCollecting(it) }
+        heldOutVm.saveCompletedCalibrationProfile()
+        assertNotNull(newVm(heldOutUser, store).liveHudState.value.activeErrorRadiusPct)
+    }
+
+    // --- Round 2: A175 / B34: the HUD carries the applied profile id ------------------------------------------
+
+    @Test
+    fun `hud reports the applied profile id and clears it when that profile is deleted`() {
+        val store = LocalTelemetryStore(context)
+        val user = freshUser()
+        store.saveLocalProfile(user, CalibrationProfile(id = "local_cal_a", userId = user, name = "Desk A"))
+        val vm = newVm(user, store)
+        assertEquals("local_cal_a", vm.liveHudState.value.activeProfileId)
+        vm.deleteCalibrationProfile("local_cal_a")
+        assertNull(vm.liveHudState.value.activeProfileId)
+    }
+
+    // --- Round 2: A77: inconsistent stored blink settings are not applied ------------------------------------
+
+    @Test
+    fun `a stored command-blink minimum above the command maximum is not applied`() {
+        val store = LocalTelemetryStore(context)
+        val user = freshUser()
+        store.saveLocalProfile(
+            user,
+            CalibrationProfile(id = "local_cal_b", userId = user, name = "Old client", intentionalBlinkMinMs = 900L)
+        )
+        val vm = newVm(user, store)
+        var t = 1_000_000L
+        repeat(4) { vm.processIncomingFeatureFrame(face(t)); t += 33L }
+        val closeStart = t
+        while (t < closeStart + 450L) { vm.processIncomingFeatureFrame(face(t, open = 0.10f)); t += 33L }
+        repeat(2) { vm.processIncomingFeatureFrame(face(t)); t += 33L }
+        assertEquals("a 450 ms closure must still be a command blink", 1, vm.liveHudState.value.intentionalBlinkCount)
+    }
+
+    // --- Round 2: calib-screen hardening: a late cancel keeps the unsaved summary ------------------------------
+
+    @Test
+    fun `cancel outside a running collection keeps the completed summary`() {
+        val vm = newVm(store = null)
+        vm.startCalibrationAndValidationWizard(includeValidation = false)
+        driveWizard(vm, System.currentTimeMillis() + 500L) { !isCollecting(it) }
+        assertEquals(CalibrationFlowStep.COMPLETED_SUMMARY, vm.calibrationState.value.step)
+        vm.cancelCalibrationWizard()
+        assertEquals(CalibrationFlowStep.COMPLETED_SUMMARY, vm.calibrationState.value.step)
+    }
+
+    // --- Round 2: A168 / B21: fixation samples are recorded in the passage frame and tagged -------------------
+
+    @Test
+    fun `fixations are recorded only from the passage point and saved tagged as passage frame`() {
+        val vm = newVm(store = null)
+        vm.startAttentionRecording()
+        vm.updateActiveReadingSectionFromLayout("sec_1")
+        var t = 1_000_000L
+        repeat(20) { vm.processIncomingFeatureFrame(face(t)); t += 66L }
+        vm.stopAndSaveAttentionSession()
+        assertEquals(
+            "no passage point means no fixation samples",
+            0,
+            requireNotNull(vm.attentionState.value.selectedReplaySession).fixationClusterCount
+        )
+
+        vm.startAttentionRecording()
+        vm.updateActiveReadingSectionFromLayout("sec_1")
+        vm.updatePassageGazePoint(androidx.compose.ui.geometry.Offset(0.30f, 0.40f))
+        repeat(20) { vm.processIncomingFeatureFrame(face(t)); t += 66L }
+        vm.stopAndSaveAttentionSession()
+        val saved = requireNotNull(vm.attentionState.value.selectedReplaySession)
+        assertTrue(saved.fixationClusterCount >= 1)
+        assertTrue(saved.clusterPoints.isNotEmpty())
+        assertTrue(saved.clusterPoints.toString(), saved.clusterPoints.all { it.endsWith(",p") })
+        val cluster = vm.attentionState.value.computedClusters.first()
+        assertEquals(0.30f, cluster.normX, 0.01f)
+        assertEquals(0.40f, cluster.normY, 0.01f)
+    }
+
+    @Test
+    fun `legacy overlay-frame cluster points are not replayed on the passage`() {
+        val vm = newVm(store = null)
+        vm.selectSessionForReplay(TrackingSession(id = "local_sess_legacy", clusterPoints = listOf("0.45,0.25,1100")))
+        assertTrue(vm.attentionState.value.computedClusters.isEmpty())
+        assertTrue(vm.statusBannerMessage.value.orEmpty().contains("before passage-aligned"))
+
+        vm.selectSessionForReplay(TrackingSession(id = "local_sess_new", clusterPoints = listOf("0.450,0.250,1100,p")))
+        assertEquals(1, vm.attentionState.value.computedClusters.size)
+    }
+
+    // --- Round 2: A251: a save that evicts the oldest local session says so ------------------------------------
+
+    @Test
+    fun `a session save that evicts the oldest local session says so`() {
+        val store = LocalTelemetryStore(context)
+        val user = freshUser()
+        repeat(LocalTelemetryStore.MAX_LOCAL_SESSIONS) { i ->
+            store.saveLocalSession(user, TrackingSession(id = "local_sess_old_$i", title = "Old $i"))
+        }
+        val vm = newVm(user, store)
+        vm.startAttentionRecording()
+        vm.stopAndSaveAttentionSession()
+        val banner = vm.statusBannerMessage.value.orEmpty()
+        assertTrue(banner, banner.contains("${LocalTelemetryStore.MAX_LOCAL_SESSIONS} most recent sessions"))
+        assertEquals(LocalTelemetryStore.MAX_LOCAL_SESSIONS, store.loadLocalSessions(user).size)
+    }
 }

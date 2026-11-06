@@ -192,7 +192,8 @@ class EyeTrackingViewModel(
     private var latestMergedProfiles: List<CalibrationProfile> = emptyList()
     private val deletedProfileIds = mutableSetOf<String>()
 
-    // Facts about profiles saved in this session that CalibrationProfile does not persist yet.
+    // Facts about profiles saved in this session. CalibrationProfile persists them too, but a cloud copy
+    // (which wins the merge) may not carry them, so the in-session record takes precedence.
     private data class SessionProfileMeta(
         val heldOutValidated: Boolean,
         val calibrationPosture: GazePostureProfile
@@ -2037,8 +2038,9 @@ class EyeTrackingViewModel(
             "${sec.sectionId}:${sec.heading.take(40)}:$pct"
         }
 
+        // Tagged as passage-frame points; untagged legacy entries were recorded in the overlay frame
         val clusterPointsEncoded = clusters.map { c ->
-            String.format(java.util.Locale.US, "%.3f,%.3f,%d", c.normX, c.normY, c.dwellMs)
+            String.format(Locale.US, "%.3f,%.3f,%d,%s", c.normX, c.normY, c.dwellMs, PASSAGE_FRAME_CLUSTER_TAG)
         }
 
         val simulated = sessionUsedSimulatedFrames
@@ -2077,24 +2079,38 @@ class EyeTrackingViewModel(
             )
         }
 
-        localStore?.saveLocalSession(currentUserId, sessionModel)
+        val localSessions = _localSessionsFlow.value
+        val evictionNote = if (
+            localStore != null &&
+            localSessions.size >= LocalTelemetryStore.MAX_LOCAL_SESSIONS &&
+            localSessions.none { it.id == sessionId }
+        ) {
+            " The on-device vault keeps the ${LocalTelemetryStore.MAX_LOCAL_SESSIONS} most recent sessions, " +
+                "so the oldest on-device session was removed."
+        } else {
+            ""
+        }
+        // The cloud upload uses the entry exactly as persisted (same id), so the merged list de-duplicates them
+        val persisted = localStore?.saveLocalSession(currentUserId, sessionModel) ?: sessionModel
         _localSessionsFlow.value = localStore?.loadLocalSessions(currentUserId).orEmpty()
 
         if (simulated) {
-            _statusBannerMessage.value = "Simulated session saved on this device only (not synced, labelled SIMULATED)."
+            _statusBannerMessage.value =
+                "Simulated session saved on this device only (not synced, labelled SIMULATED).$evictionNote"
             return
         }
         if (!_liveHudState.value.cloudSyncEnabled) {
-            _statusBannerMessage.value = "Session saved to on-device storage (Cloud Sync is paused)."
+            _statusBannerMessage.value = "Session saved to on-device storage (Cloud Sync is paused).$evictionNote"
             return
         }
 
         viewModelScope.launch {
-            val res = repository.createTrackingSession(sessionModel)
+            val res = repository.createTrackingSession(persisted)
             if (res.isSuccess) {
-                _statusBannerMessage.value = "Attention session synced to Cloud Firestore & local vault."
+                _statusBannerMessage.value = "Attention session synced to Cloud Firestore & local vault.$evictionNote"
             } else {
-                _statusBannerMessage.value = "Saved locally; Cloud sync error: ${res.exceptionOrNull()?.localizedMessage}"
+                _statusBannerMessage.value =
+                    "Saved locally; Cloud sync error: ${res.exceptionOrNull()?.localizedMessage}$evictionNote"
             }
         }
     }
@@ -2113,14 +2129,28 @@ class EyeTrackingViewModel(
             return
         }
         sessionTimerJob?.cancel()
+        // Only passage-frame points can be drawn on the passage heatmap. Legacy (untagged, 3-field) points
+        // were recorded in the root overlay frame and would be drawn misaligned, so they are not replayed.
+        var legacyPointCount = 0
         val parsedClusters = session.clusterPoints.mapNotNull { encoded ->
             val parts = encoded.split(",")
-            if (parts.size == 3) {
-                val x = parts[0].toFloatOrNull()
-                val y = parts[1].toFloatOrNull()
-                val ms = parts[2].toLongOrNull()
-                if (x != null && y != null && ms != null) FixationClusterPoint(x, y, ms) else null
-            } else null
+            when {
+                parts.size == 4 && parts[3] == PASSAGE_FRAME_CLUSTER_TAG -> {
+                    val x = parts[0].toFloatOrNull()
+                    val y = parts[1].toFloatOrNull()
+                    val ms = parts[2].toLongOrNull()
+                    if (x != null && y != null && ms != null) FixationClusterPoint(x, y, ms) else null
+                }
+                parts.size == 3 -> {
+                    legacyPointCount++
+                    null
+                }
+                else -> null
+            }
+        }
+        if (legacyPointCount > 0 && parsedClusters.isEmpty()) {
+            _statusBannerMessage.value =
+                "This session was recorded before passage-aligned fixations; its fixation heatmap is not shown."
         }
         _attentionState.update {
             it.copy(
@@ -2185,6 +2215,7 @@ class EyeTrackingViewModel(
         viewModelScope.launch {
             val res = repository.eraseAllUserCloudTelemetry()
             if (res.isSuccess) {
+                dropErasedCloudOnlyRecords()
                 val count = res.getOrDefault(0)
                 val summary = "Deleted $count Firestore cloud document(s) under /users/$currentUserId (on-device vault preserved)."
                 _liveHudState.update {
@@ -2206,6 +2237,28 @@ class EyeTrackingViewModel(
                 }
                 _statusBannerMessage.value = summary
             }
+        }
+    }
+
+    /**
+     * After a confirmed cloud-only erase: records that existed only in the cloud are gone, so a cloud-only
+     * active profile stops driving tracking (and is never re-applied from a stale listing), and a cloud-only
+     * replay is closed. Records with an on-device copy (local or shared id) are kept.
+     */
+    private fun dropErasedCloudOnlyRecords() {
+        val localProfileIds = _localProfilesFlow.value.map { it.id }.toSet()
+        val cloudOnlyProfileIds = latestCloudProfiles.map { it.id }
+            .filter { it.isNotBlank() && it !in localProfileIds }
+        deletedProfileIds.addAll(cloudOnlyProfileIds)
+        val activeId = activeProfileId
+        if (activeId != null && activeId in cloudOnlyProfileIds) {
+            resetEngineToUncalibratedDefaults()
+            reconcileActiveProfile(latestMergedProfiles)
+        }
+        val attention = _attentionState.value
+        val replayId = attention.selectedReplaySession?.id
+        if (!attention.isRecording && replayId != null && _localSessionsFlow.value.none { it.id == replayId }) {
+            clearSessionReplay()
         }
     }
 
@@ -2265,7 +2318,26 @@ class EyeTrackingViewModel(
 
     companion object {
         /** Section id the Attention screen reports while its layout is attached but no section is hit. */
-        const val OFF_PASSAGE_SECTION_ID = "__off_passage__"
+        const val OFF_PASSAGE_SECTION_ID = com.example.ui.screens.ATTENTION_OFF_PASSAGE_SECTION_ID
+
+        /** Fourth field of a saved cluster point recorded in the passage frame (legacy points have 3 fields). */
+        private const val PASSAGE_FRAME_CLUSTER_TAG = "p"
+
+        // Bounds for the reported gaze-frame size, by short and long side so landscape frames keep their height
+        private const val MIN_FRAME_SIDE_MM = 20.0
+        private const val MAX_FRAME_SHORT_SIDE_MM = 400.0
+        private const val MAX_FRAME_LONG_SIDE_MM = 600.0
+
+        // Blink detector defaults and the ranges a stored profile's blink settings must fall in to be applied
+        private const val DEFAULT_CLOSE_BLINK_THRESHOLD = 0.45f
+        private const val DEFAULT_OPEN_BLINK_THRESHOLD = 0.65f
+        private const val DEFAULT_INTENTIONAL_BLINK_MIN_MS = 350L
+        private const val MIN_CLOSE_BLINK_THRESHOLD = 0.05
+        private const val MAX_CLOSE_BLINK_THRESHOLD = 0.80
+        private const val MAX_OPEN_BLINK_THRESHOLD = 0.98
+        private const val MIN_BLINK_HYSTERESIS_GAP = 0.05
+        private const val MIN_INTENTIONAL_BLINK_MS = 150L
+        private const val MAX_INTENTIONAL_BLINK_MIN_MS = 700L
 
         private const val TAG = "EyeTrackingVM"
         private const val STOP_TIMEOUT_MILLIS = 5000L
@@ -2274,8 +2346,9 @@ class EyeTrackingViewModel(
         private const val MAX_SESSION_GAZE_SAMPLES = 3600
         private const val MAX_SAVED_CLUSTERS = 40
         private const val SIMULATED_PREFIX = "[SIMULATED] "
-        private const val QUICK_FIT_GRID_LABEL =
-            "2×2 Protective Deck (5-point fit residual only — not validated; run 5-Point Fit + 4-Point Validation to unlock 3×3)"
+        // Same layout name the Control Deck uses for unvalidated metrics (GazeCalibrationMath.gridLayoutLabel)
+        private val QUICK_FIT_GRID_LABEL = GazeCalibrationMath.gridLayoutLabel(use3x3 = false) +
+            " — 5-point fit residual only, not validated; run 5-Point Fit + 4-Point Validation to unlock 3×3"
         private const val MIN_BROW_RAISE_SEPARATION = 0.035f
         // Dwell: frame gaps longer than this (background, camera rebind) reset a pending dwell;
         // invalid gaze longer than an extended closure resets it, shorter invalid runs only pause it.
