@@ -8,6 +8,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performSemanticsAction
 import com.example.InlineCloudPrivacyBar
+import com.example.data.repository.LocalTelemetryStore
 import com.example.shouldClearUserScopedViewModels
 import com.example.tileTriggerHapticFeedbackConstant
 import org.junit.Assert.assertEquals
@@ -109,8 +110,8 @@ class ActivityRegressionTest {
         /** TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE */
         const val TTS_SERVICE_ACTION = "android.intent.action.TTS_SERVICE"
 
-        /** SharedPreferences file written by LocalTelemetryStore ("oculagaze_local_vault"). */
-        const val VAULT_PREFS_FILE = "oculagaze_local_vault.xml"
+        /** SharedPreferences file the on-device vault lives in (shared_prefs/oculagaze_local_vault.xml). */
+        const val VAULT_PREFS_FILE = "${LocalTelemetryStore.VAULT_PREFS_NAME}.xml"
 
         /** Gradle runs unit tests from the module directory; also accept the repository root. */
         fun sourceFile(modulePath: String): File {

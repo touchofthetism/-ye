@@ -60,7 +60,8 @@ import java.io.PrintStream
 @Config(sdk = [36])
 class AuthRegressionTest {
 
-    private val context: Context = ApplicationProvider.getApplicationContext()
+    private val context: Context
+        get() = ApplicationProvider.getApplicationContext()
     private val dispatcher = StandardTestDispatcher()
     private val scheduler get() = dispatcher.scheduler
     private lateinit var scope: CoroutineScope
