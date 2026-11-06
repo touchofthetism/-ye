@@ -19,7 +19,7 @@ class EyeTrackingRepositoryRuleTest : FirestoreEmulatorTestBase() {
     @Test
     fun createAndObserveCalibrationProfile_authenticatedOwner_succeeds() = runBlocking {
         val aliceUid = signInTestUser(ALICE_EMAIL)
-        val repository = EyeTrackingRepository(firestore)
+        val repository = EyeTrackingRepository(firestore, auth)
         val profileId = "cal_${UUID.randomUUID().toString().replace("-", "").take(12)}"
 
         val createResult = withTimeout(DEFAULT_TIMEOUT_MS) {
@@ -54,7 +54,7 @@ class EyeTrackingRepositoryRuleTest : FirestoreEmulatorTestBase() {
     @Test
     fun createAndObserveTrackingSession_authenticatedOwner_succeeds() = runBlocking {
         val aliceUid = signInTestUser(ALICE_EMAIL)
-        val repository = EyeTrackingRepository(firestore)
+        val repository = EyeTrackingRepository(firestore, auth)
         val sessionId = "sess_${UUID.randomUUID().toString().replace("-", "").take(12)}"
 
         val createResult = withTimeout(DEFAULT_TIMEOUT_MS) {
@@ -92,7 +92,7 @@ class EyeTrackingRepositoryRuleTest : FirestoreEmulatorTestBase() {
     @Test
     fun getCalibrationProfileById_crossUserAccess_failsWithPermissionDenied() = runBlocking {
         val aliceUid = signInTestUser(ALICE_EMAIL)
-        val aliceRepo = EyeTrackingRepository(firestore)
+        val aliceRepo = EyeTrackingRepository(firestore, auth)
         val profileId = "cal_${UUID.randomUUID().toString().replace("-", "").take(12)}"
 
         val createdId = withTimeout(DEFAULT_TIMEOUT_MS) {
@@ -106,7 +106,7 @@ class EyeTrackingRepositoryRuleTest : FirestoreEmulatorTestBase() {
         }
 
         signInTestUser(BOB_EMAIL)
-        val bobRepo = EyeTrackingRepository(firestore)
+        val bobRepo = EyeTrackingRepository(firestore, auth)
         val bobAttempt = withTimeout(DEFAULT_TIMEOUT_MS) {
             bobRepo.getCalibrationProfileById(aliceUid, createdId)
         }
@@ -119,7 +119,7 @@ class EyeTrackingRepositoryRuleTest : FirestoreEmulatorTestBase() {
     @Test
     fun observeCalibrationProfiles_unauthenticatedUser_failsWithPermissionDenied() = runBlocking {
         auth.signOut()
-        val repository = EyeTrackingRepository(firestore)
+        val repository = EyeTrackingRepository(firestore, auth)
 
         var caughtException: Throwable? = null
         try {
@@ -133,6 +133,43 @@ class EyeTrackingRepositoryRuleTest : FirestoreEmulatorTestBase() {
         val firestoreException = caughtException?.unwrapFirestoreException()
         assertNotNull("Expected nested FirebaseFirestoreException, got $caughtException", firestoreException)
         assertEquals(FirebaseFirestoreException.Code.PERMISSION_DENIED, firestoreException?.code)
+    }
+
+    @Test
+    fun eraseAllUserCloudTelemetry_authenticatedOwner_deletesAllCalibrationsAndSessions() = runBlocking {
+        val aliceUid = signInTestUser(ALICE_EMAIL)
+        val repository = EyeTrackingRepository(firestore, auth)
+        val profileId = "cal_${UUID.randomUUID().toString().replace("-", "").take(12)}"
+        val sessionId = "sess_${UUID.randomUUID().toString().replace("-", "").take(12)}"
+
+        withTimeout(DEFAULT_TIMEOUT_MS) {
+            repository.createCalibrationProfile(
+                CalibrationProfile(
+                    id = profileId,
+                    userId = aliceUid,
+                    name = "Profile To Delete"
+                )
+            ).getOrThrow()
+            repository.createTrackingSession(
+                TrackingSession(
+                    id = sessionId,
+                    userId = aliceUid,
+                    title = "Session To Delete",
+                    durationSeconds = 20
+                )
+            ).getOrThrow()
+        }
+
+        val eraseResult = withTimeout(DEFAULT_TIMEOUT_MS) {
+            repository.eraseAllUserCloudTelemetry()
+        }
+        assertTrue("Expected eraseAllUserCloudTelemetry to succeed", eraseResult.isSuccess)
+        assertEquals(2, eraseResult.getOrNull())
+
+        val remainingProfiles = withTimeout(DEFAULT_TIMEOUT_MS) {
+            repository.getCalibrationProfiles(aliceUid).getOrThrow()
+        }
+        assertTrue("Expected all Firestore calibration profiles to be deleted", remainingProfiles.isEmpty())
     }
 
     private companion object {

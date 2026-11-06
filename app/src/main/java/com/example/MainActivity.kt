@@ -86,6 +86,16 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import java.util.Locale
 
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.size
+import androidx.compose.material.icons.filled.CloudDone
+import androidx.compose.material.icons.filled.CloudOff
+import androidx.compose.material.icons.filled.DeleteForever
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Switch
+import androidx.compose.ui.text.font.FontWeight
+
 internal fun FirebaseAuth.authStateFlow(): Flow<FirebaseUser?> = callbackFlow {
     val listener = FirebaseAuth.AuthStateListener { auth ->
         trySend(auth.currentUser)
@@ -326,6 +336,91 @@ fun AuthenticatedMainWorkbench(
                     }
                 )
 
+                // Always-visible Privacy Settings Toggle (Cloud Telemetry Opt-In/Out) & Firestore Data Deletion Bar
+                // when on Calibrate, Control Deck, or Attention Lab tabs (Tab 3 renders the expanded CloudPrivacyScreen card)
+                if (selectedTab != 3) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 2.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(MaterialTheme.colorScheme.surface)
+                            .padding(horizontal = 12.dp, vertical = 6.dp)
+                            .testTag("inline_privacy_telemetry_bar"),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                imageVector = if (hudState.cloudSyncEnabled) Icons.Filled.CloudDone else Icons.Filled.CloudOff,
+                                contentDescription = stringResource(R.string.cloud_telemetry_opt_in_title),
+                                tint = if (hudState.cloudSyncEnabled) {
+                                    MaterialTheme.colorScheme.secondary
+                                } else {
+                                    MaterialTheme.colorScheme.tertiary
+                                },
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column {
+                                Text(
+                                    text = if (hudState.cloudSyncEnabled) {
+                                        "Cloud Telemetry: OPTED IN"
+                                    } else {
+                                        "Cloud Telemetry: OPTED OUT (Local)"
+                                    },
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Text(
+                                    text = if (hudState.cloudSyncEnabled) {
+                                        "Syncing to Firestore (/users/${currentUserId.take(6)}…)"
+                                    } else {
+                                        "Zero cloud writes • On-device only"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Switch(
+                                checked = hudState.cloudSyncEnabled,
+                                onCheckedChange = { viewModel.toggleCloudSync(it) },
+                                modifier = Modifier.testTag("cloud_sync_toggle")
+                            )
+                            OutlinedButton(
+                                onClick = { viewModel.deleteFirestoreCloudTelemetry() },
+                                enabled = !hudState.isDeletingCloudData,
+                                modifier = Modifier
+                                    .heightIn(min = 48.dp)
+                                    .testTag("delete_firestore_data_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.DeleteForever,
+                                    contentDescription = stringResource(R.string.delete_firestore_telemetry_button),
+                                    tint = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = if (hudState.isDeletingCloudData) "Deleting…" else "Delete Cloud",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.error
+                                )
+                            }
+                        }
+                    }
+                }
+
                 if (statusBanner != null) {
                     Row(
                         modifier = Modifier
@@ -334,7 +429,8 @@ fun AuthenticatedMainWorkbench(
                             .clip(RoundedCornerShape(8.dp))
                             .background(MaterialTheme.colorScheme.secondary.copy(alpha = 0.18f))
                             .clickable { viewModel.dismissStatusBanner() }
-                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                            .padding(horizontal = 12.dp, vertical = 6.dp)
+                            .testTag("status_banner_row"),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
@@ -363,6 +459,12 @@ fun AuthenticatedMainWorkbench(
                             onSaveProfile = { viewModel.saveCompletedCalibrationProfile() },
                             onSnapSimulatorToCurrentTarget = { tx, ty ->
                                 viewModel.updateSimulatorGazeTarget(tx, ty)
+                            },
+                            onToggleIncludeValidation = { includeVal ->
+                                viewModel.setIncludeHeldOutValidation(includeVal)
+                            },
+                            onCaptureManualSamples = {
+                                viewModel.captureManualSamplesForCurrentTarget()
                             }
                         )
                         1 -> GazeControlDeckScreen(
@@ -405,6 +507,7 @@ fun AuthenticatedMainWorkbench(
                                 selectedTab = 2
                             },
                             onDeleteSession = { viewModel.deleteTrackingSession(it) },
+                            onDeleteFirestoreOnly = { viewModel.deleteFirestoreCloudTelemetry() },
                             onEraseAllTelemetry = { viewModel.eraseAllCloudTelemetry() },
                             onSignOut = {
                                 signOutUser(

@@ -47,6 +47,11 @@ import com.example.ui.viewmodel.LiveGazeHudState
 import com.example.ui.viewmodel.UiDataState
 import java.util.Locale
 
+import androidx.compose.material.icons.filled.CloudQueue
+import androidx.compose.material.icons.filled.Security
+import androidx.compose.ui.res.stringResource
+import com.example.R
+
 @Composable
 fun CloudPrivacyScreen(
     hudState: LiveGazeHudState,
@@ -61,6 +66,7 @@ fun CloudPrivacyScreen(
     onDeleteProfile: (String) -> Unit,
     onSelectSessionReplay: (TrackingSession) -> Unit,
     onDeleteSession: (String) -> Unit,
+    onDeleteFirestoreOnly: () -> Unit = {},
     onEraseAllTelemetry: () -> Unit,
     onSignOut: () -> Unit
 ) {
@@ -71,9 +77,11 @@ fun CloudPrivacyScreen(
             .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // Biometric Privacy, Authenticated Google Session & Cloud Sync Control Card
+        // Biometric Privacy, Explicit Cloud Telemetry Opt-In/Out Toggle & Firestore Data Deletion Card
         Card(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("privacy_settings_card"),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
             shape = RoundedCornerShape(16.dp)
         ) {
@@ -89,25 +97,29 @@ fun CloudPrivacyScreen(
                     ) {
                         Icon(
                             imageVector = if (hudState.cloudSyncEnabled) Icons.Default.CloudDone else Icons.Default.CloudOff,
-                            contentDescription = "Cloud Sync Status",
+                            contentDescription = "Cloud Telemetry Sync Status",
                             tint = if (hudState.cloudSyncEnabled) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.tertiary,
                             modifier = Modifier.size(24.dp)
                         )
                         Spacer(modifier = Modifier.width(10.dp))
                         Column {
                             Text(
-                                text = "Google Sign-In Session + Cloud Firestore",
+                                text = stringResource(R.string.cloud_telemetry_opt_in_title),
                                 style = MaterialTheme.typography.titleMedium,
                                 color = MaterialTheme.colorScheme.onSurface
                             )
                             Text(
                                 text = if (hudState.cloudSyncEnabled) {
-                                    "Active: User-scoped profiles & sessions sync to Firestore AND local vault."
+                                    stringResource(R.string.cloud_telemetry_status_opted_in)
                                 } else {
-                                    "Paused: Profiles & sessions persist privately on-device across restarts."
+                                    stringResource(R.string.cloud_telemetry_status_opted_out)
                                 },
                                 style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                color = if (hudState.cloudSyncEnabled) {
+                                    MaterialTheme.colorScheme.secondary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
                             )
                         }
                     }
@@ -150,38 +162,85 @@ fun CloudPrivacyScreen(
                     )
                     if (firestoreDatabaseId.isNotBlank()) {
                         Text(
-                            text = "Firestore DB: $firestoreDatabaseId",
+                            text = "Firestore DB: $firestoreDatabaseId • Privacy Mode: ${if (hudState.cloudSyncEnabled) "OPTED-IN (Cloud + Local)" else "OPTED-OUT (Local Only)"}",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    if (!hudState.lastCloudDeletionSummary.isNullOrBlank()) {
+                        Text(
+                            text = hudState.lastCloudDeletionSummary,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.testTag("cloud_deletion_status_text")
                         )
                     }
                 }
 
                 Spacer(modifier = Modifier.height(12.dp))
 
+                // Primary Firestore Cloud Data Deletion Button (deletes Firestore documents, preserves local calibration)
+                Button(
+                    onClick = onDeleteFirestoreOnly,
+                    enabled = !hudState.isDeletingCloudData,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = Color.White
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("delete_firestore_data_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.DeleteForever,
+                        contentDescription = stringResource(R.string.delete_firestore_telemetry_button)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = if (hudState.isDeletingCloudData) {
+                            stringResource(R.string.deleting_firestore_telemetry_label)
+                        } else {
+                            stringResource(R.string.delete_firestore_telemetry_button)
+                        },
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Button(
+                    OutlinedButton(
                         onClick = onEraseAllTelemetry,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.error,
-                            contentColor = Color.White
-                        ),
+                        enabled = !hudState.isDeletingCloudData,
                         modifier = Modifier
                             .weight(1.4f)
+                            .height(48.dp)
                             .testTag("erase_all_cloud_button")
                     ) {
-                        Icon(imageVector = Icons.Default.DeleteForever, contentDescription = "Erase All")
+                        Icon(
+                            imageVector = Icons.Default.Delete,
+                            contentDescription = "Wipe Cloud and Local Vault",
+                            tint = MaterialTheme.colorScheme.error
+                        )
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Wipe Cloud & Local Vault", style = MaterialTheme.typography.labelMedium)
+                        Text(
+                            text = "Wipe Cloud & Local Vault",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.error
+                        )
                     }
 
                     OutlinedButton(
                         onClick = onSignOut,
                         modifier = Modifier
                             .weight(1f)
+                            .height(48.dp)
                             .testTag("sign_out_button")
                     ) {
                         Icon(imageVector = Icons.AutoMirrored.Filled.Logout, contentDescription = "Sign Out")

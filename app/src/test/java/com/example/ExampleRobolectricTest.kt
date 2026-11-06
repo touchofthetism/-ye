@@ -167,5 +167,141 @@ class ExampleRobolectricTest {
         assertEquals(brightVec[3], dimVec[3], 1e-6)
         assertEquals(brightVec[4], dimVec[4], 1e-6)
     }
+
+    @Test
+    fun `privacy settings toggle persists explicit opt-in and opt-out and clearAllLocalData wipes user vault`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val localStore = LocalTelemetryStore(context)
+
+        // Default is opted-out (false)
+        localStore.setCloudSyncEnabled(false)
+        assertFalse(localStore.isCloudSyncEnabled())
+
+        // Explicit opt-in persists true
+        localStore.setCloudSyncEnabled(true)
+        assertTrue(localStore.isCloudSyncEnabled())
+
+        // Explicit opt-out persists false
+        localStore.setCloudSyncEnabled(false)
+        assertFalse(localStore.isCloudSyncEnabled())
+
+        // Verify local vault deletion
+        localStore.saveLocalProfile(
+            userId = "privacy_test_uid",
+            profile = CalibrationProfile(id = "local_p1", name = "Test Profile")
+        )
+        assertEquals(1, localStore.loadLocalProfiles("privacy_test_uid").size)
+        localStore.clearAllLocalData("privacy_test_uid")
+        assertTrue(localStore.loadLocalProfiles("privacy_test_uid").isEmpty())
+    }
+
+    @Test
+    fun `fivePointCalibrationTargets define 5 screen coordinates with guidance prompts and converge ridge fit`() {
+        val fivePoints = GazeCalibrationMath.FIVE_POINT_CALIBRATION_TARGETS
+        assertEquals(5, fivePoints.size)
+
+        // Verify Center, Top-Left, Top-Right, Bottom-Left, Bottom-Right coordinates
+        assertEquals(0.50f, fivePoints[0].normX, 1e-4f)
+        assertEquals(0.50f, fivePoints[0].normY, 1e-4f)
+        assertEquals(0.14f, fivePoints[1].normX, 1e-4f)
+        assertEquals(0.16f, fivePoints[1].normY, 1e-4f)
+        assertEquals(0.86f, fivePoints[2].normX, 1e-4f)
+        assertEquals(0.16f, fivePoints[2].normY, 1e-4f)
+        assertEquals(0.14f, fivePoints[3].normX, 1e-4f)
+        assertEquals(0.84f, fivePoints[3].normY, 1e-4f)
+        assertEquals(0.86f, fivePoints[4].normX, 1e-4f)
+        assertEquals(0.84f, fivePoints[4].normY, 1e-4f)
+
+        fivePoints.forEach { target ->
+            assertFalse(target.isValidationPoint)
+            assertTrue(target.shortName.isNotBlank())
+            assertTrue(target.guidancePrompt.isNotBlank())
+        }
+
+        // Collect 18 synthetic gaze samples at each of the 5 coordinates (90 total samples)
+        val collectedSamples = fivePoints.flatMap { target ->
+            val vec = GazeFeatureVector(
+                gx = ((target.normX - 0.5f) * 0.42f).toDouble(),
+                gy = ((target.normY - 0.5f) * 0.36f).toDouble(),
+                yaw = ((target.normX - 0.5f) * 14f).toDouble(),
+                pitch = ((target.normY - 0.5f) * 12f).toDouble(),
+                faceDetected = true
+            )
+            List(18) { Pair(vec, Pair(target.normX, target.normY)) }
+        }
+        assertEquals(90, collectedSamples.size)
+
+        val fittedMatrix = GazeCalibrationMath.fitRidgeAffineMatrix2x6(
+            samples = collectedSamples,
+            baselineEyeDistPx = 148.0
+        )
+        assertEquals(12, fittedMatrix.size)
+
+        val metrics = GazeCalibrationMath.evaluateHeldOutValidation(
+            matrixCoeffs = fittedMatrix,
+            validationSamples = collectedSamples,
+            baselineEyeDistPx = 148.0
+        )
+        assertTrue(metrics.meanErrorPct < 10.0)
+    }
+
+    @Test
+    fun `benchmarkPixel10ProXlPipeline throughput and latency limits`() {
+        val baseVec = GazeFeatureVector(
+            gx = 0.18,
+            gy = -0.12,
+            yaw = 8.5,
+            pitch = -4.2,
+            roll = 1.1,
+            eyeDistancePx = 146.0,
+            leftEyeOpenProb = 0.94f,
+            rightEyeOpenProb = 0.94f,
+            leftEyeConfidence = 0.92f,
+            rightEyeConfidence = 0.92f,
+            browToEyeRatio = 0.35f,
+            faceDetected = true
+        )
+
+        // 1. Benchmark 1,000 feature vector standardization cycles (simulating sustained inference on Tensor G5)
+        val startStd = System.nanoTime()
+        var checkSum = 0.0
+        for (i in 0 until 1000) {
+            val arr = baseVec.toStandardizedFeatureArray(148.0)
+            checkSum += arr[1]
+        }
+        val elapsedStdUs = (System.nanoTime() - startStd) / 1000L
+        val perOpStdUs = elapsedStdUs / 1000.0
+        // Assert each standardization takes < 25 microseconds (well within 66ms / 15 FPS frame budget)
+        assertTrue("Standardization took $perOpStdUs µs per op, expected < 25 µs", perOpStdUs < 25.0)
+
+        // 2. Benchmark 5-point ridge regression solver on 90 samples
+        val fivePoints = GazeCalibrationMath.FIVE_POINT_CALIBRATION_TARGETS
+        val samples = fivePoints.flatMap { target ->
+            val v = baseVec.copy(
+                gx = ((target.normX - 0.5f) * 0.42).toDouble(),
+                gy = ((target.normY - 0.5f) * 0.36).toDouble()
+            )
+            List(18) { Pair(v, Pair(target.normX, target.normY)) }
+        }
+        val startFit = System.nanoTime()
+        val solved = GazeCalibrationMath.fitRidgeAffineMatrix2x6(samples, 148.0)
+        val elapsedFitMs = (System.nanoTime() - startFit) / 1_000_000L
+        assertEquals(12, solved.size)
+        // Ridge fit over 90 samples must complete under 15 ms so calibration handoff feels instantaneous on 120Hz display
+        assertTrue("Ridge fit took $elapsedFitMs ms, expected < 15 ms", elapsedFitMs < 15L)
+
+        // 3. Benchmark Schmitt-trigger hysteresis state transitions over 500 frames
+        val detector = BlinkHysteresisDetector()
+        val startBlink = System.nanoTime()
+        for (f in 0 until 500) {
+            val prob = if (f in 100..120) 0.20f else 0.85f
+            detector.update(prob, 1000L + f * 16L)
+        }
+        val elapsedBlinkUs = (System.nanoTime() - startBlink) / 1000L
+        val perFrameBlinkUs = elapsedBlinkUs / 500.0
+        assertTrue("Blink detector took $perFrameBlinkUs µs per frame, expected < 10 µs", perFrameBlinkUs < 10.0)
+    }
 }
+
+
 

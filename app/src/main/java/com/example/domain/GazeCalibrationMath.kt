@@ -30,19 +30,95 @@ object GazeCalibrationMath {
     const val PIXEL_10_PRO_XL_WIDTH_MM = 71.3
     const val PIXEL_10_PRO_XL_HEIGHT_MM = 158.4
 
-    val CALIBRATION_AND_VALIDATION_TARGETS: List<CalibrationTargetPoint> = listOf(
-        // Phase A: 5 Fitting Points
-        CalibrationTargetPoint(0, "Fit 1/5 • Center", 0.50f, 0.50f, isValidationPoint = false),
-        CalibrationTargetPoint(1, "Fit 2/5 • Top-Left", 0.14f, 0.16f, isValidationPoint = false),
-        CalibrationTargetPoint(2, "Fit 3/5 • Top-Right", 0.86f, 0.16f, isValidationPoint = false),
-        CalibrationTargetPoint(3, "Fit 4/5 • Bottom-Left", 0.14f, 0.84f, isValidationPoint = false),
-        CalibrationTargetPoint(4, "Fit 5/5 • Bottom-Right", 0.86f, 0.84f, isValidationPoint = false),
-        // Phase B: 4 Held-Out Validation Points (Inner Quadrant Centroids)
-        CalibrationTargetPoint(5, "Validate 1/4 • Upper-Left Quadrant", 0.30f, 0.32f, isValidationPoint = true),
-        CalibrationTargetPoint(6, "Validate 2/4 • Upper-Right Quadrant", 0.70f, 0.32f, isValidationPoint = true),
-        CalibrationTargetPoint(7, "Validate 3/4 • Lower-Left Quadrant", 0.30f, 0.68f, isValidationPoint = true),
-        CalibrationTargetPoint(8, "Validate 4/4 • Lower-Right Quadrant", 0.70f, 0.68f, isValidationPoint = true)
+    val FIVE_POINT_CALIBRATION_TARGETS: List<CalibrationTargetPoint> = listOf(
+        CalibrationTargetPoint(
+            index = 0,
+            label = "Fit 1/5 • Center",
+            normX = 0.50f,
+            normY = 0.50f,
+            isValidationPoint = false,
+            shortName = "P1 Center",
+            guidancePrompt = "Look directly at the Center screen coordinate (50%, 50%) at comfortable reading distance."
+        ),
+        CalibrationTargetPoint(
+            index = 1,
+            label = "Fit 2/5 • Top-Left",
+            normX = 0.14f,
+            normY = 0.16f,
+            isValidationPoint = false,
+            shortName = "P2 Top-Left",
+            guidancePrompt = "Shift your gaze to the Top-Left corner (14%, 16%) while keeping your chin natural."
+        ),
+        CalibrationTargetPoint(
+            index = 2,
+            label = "Fit 3/5 • Top-Right",
+            normX = 0.86f,
+            normY = 0.16f,
+            isValidationPoint = false,
+            shortName = "P3 Top-Right",
+            guidancePrompt = "Sweep across to the Top-Right coordinate (86%, 16%) and hold steady on the bullseye."
+        ),
+        CalibrationTargetPoint(
+            index = 3,
+            label = "Fit 4/5 • Bottom-Left",
+            normX = 0.14f,
+            normY = 0.84f,
+            isValidationPoint = false,
+            shortName = "P4 Bottom-Left",
+            guidancePrompt = "Look down to the Bottom-Left coordinate (14%, 84%) with eyes open so iris centroids lock."
+        ),
+        CalibrationTargetPoint(
+            index = 4,
+            label = "Fit 5/5 • Bottom-Right",
+            normX = 0.86f,
+            normY = 0.84f,
+            isValidationPoint = false,
+            shortName = "P5 Bottom-Right",
+            guidancePrompt = "Fixate on the final Bottom-Right coordinate (86%, 84%) to complete the 5-point regression fit."
+        )
     )
+
+    val HELD_OUT_VALIDATION_TARGETS: List<CalibrationTargetPoint> = listOf(
+        CalibrationTargetPoint(
+            index = 5,
+            label = "Validate 1/4 • Upper-Left Quadrant",
+            normX = 0.30f,
+            normY = 0.32f,
+            isValidationPoint = true,
+            shortName = "V1 Upper-Left",
+            guidancePrompt = "Look at the Upper-Left quadrant centroid (30%, 32%) to verify held-out accuracy."
+        ),
+        CalibrationTargetPoint(
+            index = 6,
+            label = "Validate 2/4 • Upper-Right Quadrant",
+            normX = 0.70f,
+            normY = 0.32f,
+            isValidationPoint = true,
+            shortName = "V2 Upper-Right",
+            guidancePrompt = "Look at the Upper-Right quadrant centroid (70%, 32%) to measure quadrant error."
+        ),
+        CalibrationTargetPoint(
+            index = 7,
+            label = "Validate 3/4 • Lower-Left Quadrant",
+            normX = 0.30f,
+            normY = 0.68f,
+            isValidationPoint = true,
+            shortName = "V3 Lower-Left",
+            guidancePrompt = "Look at the Lower-Left quadrant centroid (30%, 68%) to test lower-screen tracking."
+        ),
+        CalibrationTargetPoint(
+            index = 8,
+            label = "Validate 4/4 • Lower-Right Quadrant",
+            normX = 0.70f,
+            normY = 0.68f,
+            isValidationPoint = true,
+            shortName = "V4 Lower-Right",
+            guidancePrompt = "Fixate on the Lower-Right quadrant centroid (70%, 68%) to finalize validation."
+        )
+    )
+
+    val CALIBRATION_AND_VALIDATION_TARGETS: List<CalibrationTargetPoint> =
+        FIVE_POINT_CALIBRATION_TARGETS + HELD_OUT_VALIDATION_TARGETS
 
     fun projectGaze(
         feature: GazeFeatureVector,

@@ -189,7 +189,9 @@ data class CalibrationTargetPoint(
     val label: String,
     val normX: Float,
     val normY: Float,
-    val isValidationPoint: Boolean
+    val isValidationPoint: Boolean,
+    val shortName: String = label,
+    val guidancePrompt: String = "Keep your head still and fixate steadily on the pulsing center dot."
 )
 
 data class ValidationMetricsResult(

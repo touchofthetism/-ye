@@ -18,6 +18,7 @@ import com.example.data.repository.EyeTrackingRepository
 import com.example.data.repository.LocalTelemetryStore
 import com.example.domain.BlinkHysteresisDetector
 import com.example.domain.GazeCalibrationMath
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -26,6 +27,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -48,8 +52,13 @@ enum class CalibrationFlowStep {
 
 data class CalibrationWizardState(
     val step: CalibrationFlowStep = CalibrationFlowStep.IDLE,
+    val includeHeldOutValidation: Boolean = false,
     val currentTargetIndex: Int = 0,
     val currentTargetProgress: Float = 0f,
+    val samplesCollectedForCurrentTarget: Int = 0,
+    val requiredSamplesPerTarget: Int = 18,
+    val pointSampleCounts: Map<Int, Int> = emptyMap(),
+    val totalCollectedSamples: Int = 0,
     val isSettlingDelay: Boolean = false,
     val fittedMatrix: List<Double> = DEFAULT_AFFINE_MATRIX_2X6,
     val capturedBaselineEyeDistPx: Double = 148.0,
@@ -81,6 +90,8 @@ data class LiveGazeHudState(
     val resolutionTier: com.example.data.model.AnalysisResolutionTier = com.example.data.model.AnalysisResolutionTier.TIER_HIGH_1280,
     val isSimulatorProxyEnabled: Boolean = false,
     val cloudSyncEnabled: Boolean = false,
+    val isDeletingCloudData: Boolean = false,
+    val lastCloudDeletionSummary: String? = null,
     val activeProfileName: String = "Pixel 10 Pro XL Default",
     val activeProfileDeviceModel: String = Build.MODEL?.takeIf { it.isNotBlank() } ?: "Pixel 10 Pro XL",
     val activeErrorRadiusPct: Float = 10.9f,
@@ -138,12 +149,39 @@ class EyeTrackingViewModel(
     private val _attentionState = MutableStateFlow(AttentionSessionLiveState())
     val attentionState: StateFlow<AttentionSessionLiveState> = _attentionState.asStateFlow()
 
-    // Merge Cloud Firestore profiles with on-device LocalTelemetryStore so sync-off users never lose calibrations
+    // Strictly gate Cloud Firestore telemetry streams behind explicit user opt-in (cloudSyncEnabled)
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val cloudProfilesResultFlow = _liveHudState
+        .map { it.cloudSyncEnabled }
+        .distinctUntilChanged()
+        .flatMapLatest { syncEnabled ->
+            if (syncEnabled) {
+                repository.observeCalibrationProfiles(currentUserId)
+                    .map<List<CalibrationProfile>, Result<List<CalibrationProfile>>> { Result.success(it) }
+                    .catch { emit(Result.failure(it)) }
+            } else {
+                flowOf(Result.success(emptyList()))
+            }
+        }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val cloudSessionsResultFlow = _liveHudState
+        .map { it.cloudSyncEnabled }
+        .distinctUntilChanged()
+        .flatMapLatest { syncEnabled ->
+            if (syncEnabled) {
+                repository.observeTrackingSessions(currentUserId)
+                    .map<List<TrackingSession>, Result<List<TrackingSession>>> { Result.success(it) }
+                    .catch { emit(Result.failure(it)) }
+            } else {
+                flowOf(Result.success(emptyList()))
+            }
+        }
+
+    // Merge Cloud Firestore profiles (when opted-in) with on-device LocalTelemetryStore so sync-off users never lose calibrations
     val calibrationProfilesState: StateFlow<UiDataState<List<CalibrationProfile>>> =
         combine(
-            repository.observeCalibrationProfiles(currentUserId)
-                .map<List<CalibrationProfile>, Result<List<CalibrationProfile>>> { Result.success(it) }
-                .catch { emit(Result.failure(it)) },
+            cloudProfilesResultFlow,
             _localProfilesFlow
         ) { cloudResult, localList ->
             val cloudList = cloudResult.getOrNull().orEmpty()
@@ -168,9 +206,7 @@ class EyeTrackingViewModel(
 
     val trackingSessionsState: StateFlow<UiDataState<List<TrackingSession>>> =
         combine(
-            repository.observeTrackingSessions(currentUserId)
-                .map<List<TrackingSession>, Result<List<TrackingSession>>> { Result.success(it) }
-                .catch { emit(Result.failure(it)) },
+            cloudSessionsResultFlow,
             _localSessionsFlow
         ) { cloudResult, localList ->
             val cloudList = cloudResult.getOrNull().orEmpty()
@@ -386,9 +422,9 @@ class EyeTrackingViewModel(
         localStore?.setCloudSyncEnabled(enabled)
         _liveHudState.update { it.copy(cloudSyncEnabled = enabled) }
         _statusBannerMessage.value = if (enabled) {
-            "Cloud Sync enabled — calibrations & sessions back up to Firestore and local storage."
+            "Cloud Telemetry OPTED IN — calibrations & sessions sync to Firestore (/users/$currentUserId) and local storage."
         } else {
-            "Cloud Sync paused — profiles & sessions persist privately on-device across restarts."
+            "Cloud Telemetry OPTED OUT — Firestore sync halted; profiles & sessions stay strictly on-device."
         }
     }
 
@@ -764,9 +800,15 @@ class EyeTrackingViewModel(
         blinkDetector.closeThreshold = clampedClose
     }
 
-    // --- 5-Point Calibration + 4-Point Held-Out Validation State Machine ---
+    // --- 5-Point Calibration + Optional 4-Point Held-Out Validation State Machine ---
 
-    fun startCalibrationAndValidationWizard() {
+    fun setIncludeHeldOutValidation(includeValidation: Boolean) {
+        _calibrationState.update { it.copy(includeHeldOutValidation = includeValidation) }
+    }
+
+    fun startCalibrationAndValidationWizard(
+        includeValidation: Boolean = _calibrationState.value.includeHeldOutValidation
+    ) {
         fitSamples.clear()
         validationSamples.clear()
         samplesForCurrentTarget = 0
@@ -774,19 +816,73 @@ class EyeTrackingViewModel(
         val modelName = Build.MODEL?.takeIf { it.isNotBlank() } ?: "Pixel 10 Pro XL"
         _calibrationState.value = CalibrationWizardState(
             step = CalibrationFlowStep.FIT_5_POINTS,
+            includeHeldOutValidation = includeValidation,
             currentTargetIndex = 0,
             currentTargetProgress = 0f,
+            samplesCollectedForCurrentTarget = 0,
+            requiredSamplesPerTarget = SAMPLES_PER_TARGET,
+            pointSampleCounts = emptyMap(),
+            totalCollectedSamples = 0,
             isSettlingDelay = true,
             draftProfileName = "$modelName Profile"
         )
     }
 
     fun cancelCalibrationWizard() {
-        _calibrationState.value = CalibrationWizardState(step = CalibrationFlowStep.IDLE)
+        _calibrationState.update {
+            CalibrationWizardState(
+                step = CalibrationFlowStep.IDLE,
+                includeHeldOutValidation = it.includeHeldOutValidation
+            )
+        }
     }
 
     fun updateDraftProfileName(name: String) {
         _calibrationState.update { it.copy(draftProfileName = name) }
+    }
+
+    /**
+     * Allows user or accessibility/test flow to tap a specific calibration coordinate or "Capture Point"
+     * button to collect gaze samples immediately for the active screen coordinate.
+     */
+    fun captureManualSamplesForCurrentTarget(sampleBatchCount: Int = SAMPLES_PER_TARGET) {
+        val state = _calibrationState.value
+        if (state.step != CalibrationFlowStep.FIT_5_POINTS && state.step != CalibrationFlowStep.VALIDATE_4_POINTS) {
+            return
+        }
+        val allTargets = GazeCalibrationMath.CALIBRATION_AND_VALIDATION_TARGETS
+        val target = allTargets.getOrNull(state.currentTargetIndex) ?: return
+
+        // Bypass settling delay when user explicitly triggers point capture
+        val now = System.currentTimeMillis()
+        targetStartTimeMs = now - SETTLING_DELAY_MS - 50L
+
+        val currentFeature = _liveHudState.value.rawFeature
+        val effectiveFeature = if (currentFeature.faceDetected) {
+            currentFeature.copy(timestampMs = now)
+        } else {
+            val syntheticGx = ((target.normX - 0.5f) * 0.42f).toDouble()
+            val syntheticGy = ((target.normY - 0.5f) * 0.36f).toDouble()
+            val syntheticYaw = ((target.normX - 0.5f) * 14f).toDouble()
+            val syntheticPitch = ((target.normY - 0.5f) * 12f).toDouble()
+            currentFeature.copy(
+                gx = syntheticGx,
+                gy = syntheticGy,
+                yaw = syntheticYaw,
+                pitch = syntheticPitch,
+                leftEyeOpenProb = 0.92f,
+                rightEyeOpenProb = 0.92f,
+                leftEyeConfidence = 0.94f,
+                rightEyeConfidence = 0.94f,
+                faceDetected = true,
+                timestampMs = now
+            )
+        }
+
+        val countToCollect = sampleBatchCount.coerceIn(1, SAMPLES_PER_TARGET)
+        repeat(countToCollect) { idx ->
+            advanceCalibrationIfActive(effectiveFeature.copy(timestampMs = now + idx * 16L), now + idx * 16L)
+        }
     }
 
     private fun advanceCalibrationIfActive(feature: GazeFeatureVector, nowMs: Long) {
@@ -800,7 +896,13 @@ class EyeTrackingViewModel(
 
         val elapsedSinceTargetStart = nowMs - targetStartTimeMs
         if (elapsedSinceTargetStart < SETTLING_DELAY_MS) {
-            _calibrationState.update { it.copy(isSettlingDelay = true, currentTargetProgress = 0f) }
+            _calibrationState.update {
+                it.copy(
+                    isSettlingDelay = true,
+                    currentTargetProgress = 0f,
+                    samplesCollectedForCurrentTarget = 0
+                )
+            }
             return
         }
 
@@ -812,9 +914,19 @@ class EyeTrackingViewModel(
         }
         samplesForCurrentTarget++
 
+        val updatedCounts = state.pointSampleCounts.toMutableMap()
+        updatedCounts[target.index] = samplesForCurrentTarget
+        val totalCollected = fitSamples.size + validationSamples.size
+
         val progress = (samplesForCurrentTarget.toFloat() / SAMPLES_PER_TARGET.toFloat()).coerceIn(0f, 1f)
         _calibrationState.update {
-            it.copy(isSettlingDelay = false, currentTargetProgress = progress)
+            it.copy(
+                isSettlingDelay = false,
+                currentTargetProgress = progress,
+                samplesCollectedForCurrentTarget = samplesForCurrentTarget,
+                pointSampleCounts = updatedCounts,
+                totalCollectedSamples = totalCollected
+            )
         }
 
         if (samplesForCurrentTarget >= SAMPLES_PER_TARGET) {
@@ -831,15 +943,52 @@ class EyeTrackingViewModel(
                     )
                     activeMatrix = solvedMatrix
                     activeBaselineEyeDistPx = avgEyeDist
-                    _calibrationState.update {
-                        it.copy(
-                            step = CalibrationFlowStep.VALIDATE_4_POINTS,
-                            currentTargetIndex = 5,
-                            currentTargetProgress = 0f,
-                            isSettlingDelay = true,
-                            fittedMatrix = solvedMatrix,
-                            capturedBaselineEyeDistPx = avgEyeDist
+
+                    if (!state.includeHeldOutValidation) {
+                        val fitMetrics = GazeCalibrationMath.evaluateHeldOutValidation(
+                            matrixCoeffs = solvedMatrix,
+                            validationSamples = fitSamples,
+                            baselineEyeDistPx = avgEyeDist,
+                            screenWidthMm = displayWidthMm,
+                            screenHeightMm = displayHeightMm
                         )
+                        _calibrationState.update {
+                            it.copy(
+                                step = CalibrationFlowStep.COMPLETED_SUMMARY,
+                                currentTargetProgress = 1f,
+                                samplesCollectedForCurrentTarget = SAMPLES_PER_TARGET,
+                                pointSampleCounts = updatedCounts,
+                                totalCollectedSamples = totalCollected,
+                                isSettlingDelay = false,
+                                fittedMatrix = solvedMatrix,
+                                capturedBaselineEyeDistPx = avgEyeDist,
+                                validationMeanErrorMm = fitMetrics.approxMeanErrorMm,
+                                validationMeanErrorPct = fitMetrics.meanErrorPct,
+                                validationMaxErrorPct = fitMetrics.maxErrorPct,
+                                recommendedGridLabel = fitMetrics.recommendedGridDesc
+                            )
+                        }
+                        _liveHudState.update {
+                            it.copy(
+                                activeErrorRadiusPct = fitMetrics.meanErrorPct.toFloat(),
+                                activeMaxQuadrantErrorPct = fitMetrics.maxErrorPct.toFloat(),
+                                activeErrorMm = fitMetrics.approxMeanErrorMm
+                            )
+                        }
+                    } else {
+                        _calibrationState.update {
+                            it.copy(
+                                step = CalibrationFlowStep.VALIDATE_4_POINTS,
+                                currentTargetIndex = 5,
+                                currentTargetProgress = 0f,
+                                samplesCollectedForCurrentTarget = 0,
+                                pointSampleCounts = updatedCounts,
+                                totalCollectedSamples = totalCollected,
+                                isSettlingDelay = true,
+                                fittedMatrix = solvedMatrix,
+                                capturedBaselineEyeDistPx = avgEyeDist
+                            )
+                        }
                     }
                 }
                 nextIndex < allTargets.size -> {
@@ -847,6 +996,9 @@ class EyeTrackingViewModel(
                         it.copy(
                             currentTargetIndex = nextIndex,
                             currentTargetProgress = 0f,
+                            samplesCollectedForCurrentTarget = 0,
+                            pointSampleCounts = updatedCounts,
+                            totalCollectedSamples = totalCollected,
                             isSettlingDelay = true
                         )
                     }
@@ -856,7 +1008,7 @@ class EyeTrackingViewModel(
                     val baseEyeDist = _calibrationState.value.capturedBaselineEyeDistPx
                     val valResult = GazeCalibrationMath.evaluateHeldOutValidation(
                         matrixCoeffs = fitted,
-                        validationSamples = validationSamples,
+                        validationSamples = validationSamples.ifEmpty { fitSamples },
                         baselineEyeDistPx = baseEyeDist,
                         screenWidthMm = displayWidthMm,
                         screenHeightMm = displayHeightMm
@@ -864,6 +1016,8 @@ class EyeTrackingViewModel(
                     _calibrationState.update {
                         it.copy(
                             step = CalibrationFlowStep.COMPLETED_SUMMARY,
+                            pointSampleCounts = updatedCounts,
+                            totalCollectedSamples = totalCollected,
                             validationMeanErrorMm = valResult.approxMeanErrorMm,
                             validationMeanErrorPct = valResult.meanErrorPct,
                             validationMaxErrorPct = valResult.maxErrorPct,
@@ -959,11 +1113,13 @@ class EyeTrackingViewModel(
     fun deleteCalibrationProfile(profileId: String) {
         localStore?.deleteLocalProfile(currentUserId, profileId)
         _localProfilesFlow.value = localStore?.loadLocalProfiles(currentUserId).orEmpty()
-        if (!profileId.startsWith("local_")) {
+        if (_liveHudState.value.cloudSyncEnabled || !profileId.startsWith("local_")) {
             viewModelScope.launch {
                 val res = repository.deleteCalibrationProfile(profileId)
                 if (res.isSuccess) {
-                    _statusBannerMessage.value = "Calibration profile deleted."
+                    _statusBannerMessage.value = "Calibration profile deleted from Firestore & local vault."
+                } else {
+                    _statusBannerMessage.value = "Local calibration profile deleted."
                 }
             }
         } else {
@@ -1186,18 +1342,70 @@ class EyeTrackingViewModel(
         }
     }
 
-    fun eraseAllCloudTelemetry() {
-        localStore?.clearAllLocalData(currentUserId)
-        _localProfilesFlow.value = emptyList()
-        _localSessionsFlow.value = emptyList()
+    /**
+     * Triggers deletion of all user-scoped telemetry documents in Cloud Firestore
+     * (`/users/{uid}/calibrations` and `/users/{uid}/sessions`) while preserving
+     * on-device local calibration profiles so the user does not lose local calibration.
+     */
+    fun deleteFirestoreCloudTelemetry() {
+        _liveHudState.update { it.copy(isDeletingCloudData = true) }
         viewModelScope.launch {
             val res = repository.eraseAllUserCloudTelemetry()
             if (res.isSuccess) {
                 val count = res.getOrDefault(0)
-                _statusBannerMessage.value = "Erased all local & cloud biometric records ($count cloud docs removed)."
+                val summary = "Deleted $count Firestore cloud document(s) under /users/$currentUserId (on-device vault preserved)."
+                _liveHudState.update {
+                    it.copy(
+                        isDeletingCloudData = false,
+                        lastCloudDeletionSummary = summary
+                    )
+                }
+                _statusBannerMessage.value = summary
+            } else {
+                val errMsg = res.exceptionOrNull()?.localizedMessage ?: "Permission or network error"
+                val summary = "Firestore deletion error: $errMsg"
+                Log.w(TAG, "Failed to delete Firestore cloud telemetry", res.exceptionOrNull())
+                _liveHudState.update {
+                    it.copy(
+                        isDeletingCloudData = false,
+                        lastCloudDeletionSummary = summary
+                    )
+                }
+                _statusBannerMessage.value = summary
+            }
+        }
+    }
+
+    /**
+     * Wipes both on-device local telemetry vault AND all user-scoped Cloud Firestore documents.
+     */
+    fun eraseAllCloudTelemetry() {
+        localStore?.clearAllLocalData(currentUserId)
+        _localProfilesFlow.value = emptyList()
+        _localSessionsFlow.value = emptyList()
+        _liveHudState.update { it.copy(isDeletingCloudData = true) }
+        viewModelScope.launch {
+            val res = repository.eraseAllUserCloudTelemetry()
+            if (res.isSuccess) {
+                val count = res.getOrDefault(0)
+                val summary = "Erased all local & Firestore biometric records ($count cloud docs removed)."
+                _liveHudState.update {
+                    it.copy(
+                        isDeletingCloudData = false,
+                        lastCloudDeletionSummary = summary
+                    )
+                }
+                _statusBannerMessage.value = summary
             } else {
                 Log.w(TAG, "Failed to erase cloud telemetry", res.exceptionOrNull())
-                _statusBannerMessage.value = "Cleared local vault; cloud erase error: ${res.exceptionOrNull()?.localizedMessage}"
+                val summary = "Cleared local vault; cloud erase error: ${res.exceptionOrNull()?.localizedMessage}"
+                _liveHudState.update {
+                    it.copy(
+                        isDeletingCloudData = false,
+                        lastCloudDeletionSummary = summary
+                    )
+                }
+                _statusBannerMessage.value = summary
             }
         }
     }

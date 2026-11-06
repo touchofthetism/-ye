@@ -13,4 +13,20 @@
     <string name="grant_camera_permission">Grant Camera Access</string>
     <string name="simulator_mode_label">Simulator Proxy</string>
     <string name="erase_all_cloud_data">Erase All Cloud Telemetry</string>
+    <string name="privacy_telemetry_card_title">Privacy &amp; Cloud Telemetry Controls</string>
+    <string name="cloud_telemetry_opt_in_title">Cloud Telemetry Opt-In (Firestore Sync)</string>
+    <string name="cloud_telemetry_status_opted_in">OPTED IN: Calibrations &amp; session summaries sync to your private Firestore vault.</string>
+    <string name="cloud_telemetry_status_opted_out">OPTED OUT (Default): Zero cloud telemetry — all data stays strictly on-device.</string>
+    <string name="delete_firestore_telemetry_button">Delete Cloud Data (Firestore)</string>
+    <string name="deleting_firestore_telemetry_label">Deleting Firestore Data…</string>
+    <string name="confirm_delete_cloud_dialog_title">Delete Cloud Telemetry from Firestore?</string>
+    <string name="confirm_delete_cloud_dialog_body">This permanently deletes all calibration profiles and attention session telemetry stored under /users/%1$s in Cloud Firestore. Your on-device local calibration profile will remain intact.</string>
+    <string name="confirm_delete_cloud_action">Delete from Firestore</string>
+    <string name="cancel_action">Cancel</string>
+    <string name="calibration_5_point_title">5-Point Guided Screen Calibration</string>
+    <string name="calibration_5_point_subtitle">Fixate on each of the 5 screen coordinates (Center, Top-Left, Top-Right, Bottom-Left, Bottom-Right) as the target ring pulses to collect binocular iris &amp; 3D head-pose gaze data points.</string>
+    <string name="calibration_mode_5_point_only">5-Point Quick Fit</string>
+    <string name="calibration_mode_5_plus_4">5-Point Fit + 4-Point Validation</string>
+    <string name="start_5_point_calibration">Start 5-Point Calibration</string>
+    <string name="capture_gaze_sample_action">Capture Point</string>
 </resources>
