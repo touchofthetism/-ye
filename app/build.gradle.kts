@@ -138,8 +138,10 @@ dependencies {
 }
 
 tasks.withType<Test> {
+  // Opt-in performance benchmarks: ./gradlew :app:testDebugUnitTest -Pbenchmark --tests '*PipelineBenchmarkTest*'
+  systemProperty("oculagaze.benchmark", providers.gradleProperty("benchmark").isPresent.toString())
   failFast = true
-  timeout.set(Duration.ofMinutes(2))
+  timeout.set(Duration.ofMinutes(if (providers.gradleProperty("benchmark").isPresent) 15 else 2))
   testLogging {
     events("passed", "failed", "skipped")
   }
