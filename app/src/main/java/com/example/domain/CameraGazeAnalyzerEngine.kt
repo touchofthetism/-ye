@@ -47,6 +47,12 @@ class CameraGazeAnalyzerEngine(
     // Reusable Y-plane buffer to eliminate per-frame heap allocations on Tensor G5
     private var reusableYBuffer: ByteArray = ByteArray(0)
 
+    // Speed-adaptive One Euro Filters (Casiez et al. 2012) for pupil coordinate stream
+    // and visual eye diagnostics, heavily damping high-frequency jitter during fixations
+    private val pupilOneEuroFilter = OneEuroFilter2D(minCutoff = 0.85, beta = 0.035, dCutoff = 1.0)
+    private val leftPupilVisualFilter = OneEuroFilter2D(minCutoff = 0.90, beta = 0.040, dCutoff = 1.0)
+    private val rightPupilVisualFilter = OneEuroFilter2D(minCutoff = 0.90, beta = 0.040, dCutoff = 1.0)
+
     private val detector: FaceDetector = FaceDetection.getClient(
         FaceDetectorOptions.Builder()
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
@@ -286,9 +292,23 @@ class CameraGazeAnalyzerEngine(
             (rightEyeNY - 0.06f).coerceAtLeast(0.04f)
         }
 
+        val nowMs = System.currentTimeMillis()
+        val isEyesClosing = leftOpen < 0.40f && rightOpen < 0.40f
+
+        // Apply One Euro Filter to the fused pupil coordinate stream:
+        // Freezes during eye closure so the eyelid sweep never injects false pupil motion
+        val (cleanGx, cleanGy) = if (!isEyesClosing) {
+            pupilOneEuroFilter.filter(fusedEyeGx, fusedEyeGy, nowMs)
+        } else {
+            pupilOneEuroFilter.lastPosition ?: Pair(fusedEyeGx, fusedEyeGy)
+        }
+
+        val (cleanLeftPupilX, cleanLeftPupilY) = leftPupilVisualFilter.filter(leftPupilNX.toDouble(), leftPupilNY.toDouble(), nowMs)
+        val (cleanRightPupilX, cleanRightPupilY) = rightPupilVisualFilter.filter(rightPupilNX.toDouble(), rightPupilNY.toDouble(), nowMs)
+
         return GazeFeatureVector(
-            gx = fusedEyeGx.coerceIn(-0.5, 0.5),
-            gy = fusedEyeGy.coerceIn(-0.5, 0.5),
+            gx = cleanGx.coerceIn(-0.5, 0.5),
+            gy = cleanGy.coerceIn(-0.5, 0.5),
             yaw = yaw,
             pitch = pitch,
             roll = roll,
@@ -310,10 +330,10 @@ class CameraGazeAnalyzerEngine(
             leftEyeNormY = leftEyeNY,
             rightEyeNormX = rightEyeNX,
             rightEyeNormY = rightEyeNY,
-            leftPupilNormX = leftPupilNX,
-            leftPupilNormY = leftPupilNY,
-            rightPupilNormX = rightPupilNX,
-            rightPupilNormY = rightPupilNY,
+            leftPupilNormX = cleanLeftPupilX.toFloat().coerceIn(0.05f, 0.95f),
+            leftPupilNormY = cleanLeftPupilY.toFloat().coerceIn(0.05f, 0.95f),
+            rightPupilNormX = cleanRightPupilX.toFloat().coerceIn(0.05f, 0.95f),
+            rightPupilNormY = cleanRightPupilY.toFloat().coerceIn(0.05f, 0.95f),
             leftBrowNormY = leftBrowNY,
             rightBrowNormY = rightBrowNY,
             frameWidthPx = uprightW,
@@ -321,7 +341,7 @@ class CameraGazeAnalyzerEngine(
             sensorRotationDeg = rotationDegrees,
             ambientLuma = meanAmbientLuma,
             isLowLightDegraded = isLowLight,
-            timestampMs = System.currentTimeMillis()
+            timestampMs = nowMs
         )
     }
 
@@ -481,13 +501,15 @@ class CameraGazeAnalyzerEngine(
 
         val meanLuma = (lumaSum / totalPixels).coerceIn(0, 255)
         val rawDynamicRange = (localMaxLuma - localMinLuma).coerceAtLeast(1)
-        val dynamicRange = rawDynamicRange.coerceAtLeast(12)
-        val contrastScore = (rawDynamicRange.toFloat() / 65f).coerceIn(0.18f, 1.0f)
+        val dynamicRange = rawDynamicRange.coerceAtLeast(10)
+        val contrastScore = (rawDynamicRange.toFloat() / 55f).coerceIn(0.25f, 1.0f)
         val glareRatio = brightGlarePixels.toFloat() / totalPixels.toFloat()
         val hasGlare = glareRatio > 0.14f
-        val glarePenalty = (glareRatio * 3.8f).coerceIn(0f, 0.90f)
+        val glarePenalty = (glareRatio * 3.8f).coerceIn(0f, 0.85f)
 
-        // Pass 2: Compute contrast-normalized dark-iris centroid in upright coordinates
+        // Pass 2: Adaptive dark-pupil thresholding with quadratic weighting
+        // Focuses heavily on the darkest 35% of the dynamic range to isolate the iris/pupil from sclera
+        val darkThreshold = localMinLuma + (rawDynamicRange * 0.40).toInt().coerceAtLeast(6)
         var darkWeightSum = 0.0
         var weightedUx = 0.0
         var weightedUy = 0.0
@@ -495,29 +517,31 @@ class CameraGazeAnalyzerEngine(
         for (uy in uy0..uy1 step step) {
             for (ux in ux0..ux1 step step) {
                 val luma = sampleUprightLuma(yBytes, ux, uy, rawWidth, rawHeight, rotationDegrees, rowStride, pixelStride)
-                if (luma in 0..240) {
-                    val normDarkness = ((localMaxLuma - luma).coerceAtLeast(0).toDouble()) / dynamicRange.toDouble()
-                    if (normDarkness > 0.35) {
-                        val w = normDarkness * normDarkness * normDarkness
-                        darkWeightSum += w
-                        weightedUx += ux * w
-                        weightedUy += uy * w
-                    }
+                if (luma in 0..darkThreshold) {
+                    val darkness = (darkThreshold - luma + 1).toDouble()
+                    val w = darkness * darkness
+                    darkWeightSum += w
+                    weightedUx += ux * w
+                    weightedUy += uy * w
                 }
             }
         }
 
         if (darkWeightSum <= 1e-4) {
-            return EyeRoiResult(0.0, 0.0, 0.15f, hasGlare, geomCenter, null, meanLuma, rawDynamicRange)
+            // Fallback to geometric center if contrast is too flat
+            val relX = -((geomCenter.x - canthusMidX) / boxW).coerceIn(-0.5, 0.5)
+            val relY = ((geomCenter.y - canthusMidY) / boxH).coerceIn(-0.5, 0.5)
+            return EyeRoiResult(relX, relY, 0.20f, hasGlare, geomCenter, null, meanLuma, rawDynamicRange)
         }
 
         val pupilUx = weightedUx / darkWeightSum
         val pupilUy = weightedUy / darkWeightSum
 
-        // Mirror horizontal axis for front camera so looking right -> positive normGx
+        // Normalized relative pupil displacement (-0.5 to +0.5).
+        // Front-camera horizontal axis is mirrored so looking user-right yields +normGx.
         val normGx = -((pupilUx - canthusMidX) / boxW).coerceIn(-0.5, 0.5)
         val normGy = ((pupilUy - canthusMidY) / boxH).coerceIn(-0.5, 0.5)
-        val confidence = (eyeOpenProb.coerceIn(0.1f, 1f) * (1f - glarePenalty) * contrastScore).coerceIn(0.05f, 1.0f)
+        val confidence = (eyeOpenProb.coerceIn(0.2f, 1f) * (1f - glarePenalty) * contrastScore).coerceIn(0.10f, 1.0f)
 
         return EyeRoiResult(
             normGx = normGx,
@@ -582,6 +606,9 @@ class CameraGazeAnalyzerEngine(
 
     fun close() {
         isClosed = true
+        pupilOneEuroFilter.reset()
+        leftPupilVisualFilter.reset()
+        rightPupilVisualFilter.reset()
         try {
             detector.close()
         } catch (_: Exception) {

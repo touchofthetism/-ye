@@ -27,6 +27,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -68,7 +69,10 @@ fun CloudPrivacyScreen(
     onDeleteSession: (String) -> Unit,
     onDeleteFirestoreOnly: () -> Unit = {},
     onEraseAllTelemetry: () -> Unit,
-    onSignOut: () -> Unit
+    onSignOut: () -> Unit,
+    onChangeDwellDurationMs: (Long) -> Unit = {},
+    onChangeDwellSensitivityMultiplier: (Float) -> Unit = {},
+    onSelectDwellPreset: (com.example.data.model.DwellSpeedPreset) -> Unit = {}
 ) {
     Column(
         modifier = Modifier
@@ -77,6 +81,134 @@ fun CloudPrivacyScreen(
             .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
+        // Dwell Trigger & Eye-Tracking Speed Settings Menu Card
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("dwell_settings_card"),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.PhoneAndroid,
+                            contentDescription = "Dwell Trigger Settings",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(22.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Dwell Sensitivity & Speed Settings",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                    Text(
+                        text = "${hudState.dwellTriggerMs} ms",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+
+                Text(
+                    text = "Configure fixation duration and boundary sensitivity tolerance to match personal eye movement speed.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                // Eye-Tracking Speed Presets
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    com.example.data.model.DwellSpeedPreset.entries.forEach { preset ->
+                        val isSelected = hudState.activeDwellPreset == preset && hudState.dwellTriggerMs == preset.durationMs
+                        FilterChip(
+                            selected = isSelected,
+                            onClick = { onSelectDwellPreset(preset) },
+                            label = {
+                                Text(
+                                    text = preset.title.take(12),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                                )
+                            },
+                            modifier = Modifier.testTag("speed_preset_chip_${preset.name.lowercase()}")
+                        )
+                    }
+                }
+
+                // Slider 1: Dwell Duration Threshold
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "Duration Threshold (Hold Time):",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = "${hudState.dwellTriggerMs} ms",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    androidx.compose.material3.Slider(
+                        value = hudState.dwellTriggerMs.toFloat(),
+                        onValueChange = { onChangeDwellDurationMs(it.toLong()) },
+                        valueRange = 400f..2200f,
+                        steps = 17,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("privacy_dwell_duration_slider")
+                    )
+                }
+
+                // Slider 2: Sensitivity Radius Multiplier (Boundary Margin)
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "Lock Sensitivity (Boundary Margin):",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = String.format(Locale.US, "%.2f× (%d dp)", hudState.dwellSensitivityRadiusMultiplier, (14f * hudState.dwellSensitivityRadiusMultiplier).toInt()),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.secondary,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    androidx.compose.material3.Slider(
+                        value = hudState.dwellSensitivityRadiusMultiplier,
+                        onValueChange = { onChangeDwellSensitivityMultiplier(it) },
+                        valueRange = 0.6f..2.0f,
+                        steps = 13,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("privacy_dwell_sensitivity_slider")
+                    )
+                }
+            }
+        }
+
         // Biometric Privacy, Explicit Cloud Telemetry Opt-In/Out Toggle & Firestore Data Deletion Card
         Card(
             modifier = Modifier

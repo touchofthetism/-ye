@@ -13,8 +13,8 @@ import com.google.firebase.firestore.ServerTimestamp
  * +gx / +yaw = looking right (+x_screen); +gy / +pitch = looking down (+y_screen).
  */
 val DEFAULT_AFFINE_MATRIX_2X6: List<Double> = listOf(
-    0.50, 0.30, 0.00, 0.24, 0.00, 0.02,
-    0.50, 0.00, 0.32, 0.00, 0.26, -0.02
+    0.50, 0.42, 0.00, 0.32, 0.00, 0.01,
+    0.50, 0.00, 0.44, 0.00, 0.36, -0.01
 )
 
 @IgnoreExtraProperties
@@ -165,6 +165,18 @@ enum class GazeTriggerMode(val label: String) {
     DWELL_ONLY("Dwell Only (No Gesture)")
 }
 
+enum class DwellSpeedPreset(
+    val title: String,
+    val subtitle: String,
+    val durationMs: Long,
+    val radiusToleranceMultiplier: Float
+) {
+    FAST_READER("Fast Reader", "Rapid scanning • 650 ms", 650L, 0.85f),
+    BALANCED("Balanced", "Default tracking • 1,000 ms", 1000L, 1.0f),
+    RELAXED("Relaxed / Steady", "Stable & deliberate • 1,400 ms", 1400L, 1.25f),
+    MOTOR_ASSIST("High Precision Assist", "Forgiving dwell • 1,900 ms", 1900L, 1.55f)
+}
+
 enum class GazeOverlayVisualMode(val shortLabel: String) {
     RETICLE_AND_HEATMAP("Cursor + Heatmap"),
     RETICLE_ONLY("Cursor Only"),
@@ -228,3 +240,21 @@ data class AacActionTile(
     val speechPhrase: String,
     val category: String
 )
+
+enum class GazePostureProfile(
+    val label: String,
+    val shortName: String,
+    val xBias: Float,
+    val yBias: Float
+) {
+    UPRIGHT("Sitting Upright (Desk / Mount)", "Upright", 0.0f, 0.0f),
+    RECLINING("Reclining (45° Tilt)", "Reclining", 0.0f, -0.035f),
+    LYING_DOWN("Lying Down Flat (15° Tilt)", "Lying Down", 0.0f, -0.070f)
+}
+
+enum class GazeFilterMode(val label: String, val shortName: String) {
+    ONE_EURO("1€ Speed-Adaptive Filter (Recommended)", "1€ Filter"),
+    KALMAN("Closed-Form 2D Kalman Filter", "Kalman"),
+    RAW("Raw Unfiltered Stream", "Raw")
+}
+

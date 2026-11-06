@@ -1005,12 +1005,17 @@ fun RegionConfidenceReticleOverlay(
         var lastReportedRootY = -1f
         while (true) {
             withFrameNanos { nowNanos ->
-                val dtSec = if (lastNanos == 0L) 0.008f else ((nowNanos - lastNanos) / 1_000_000_000f).coerceIn(0.004f, 0.05f)
+                val dtSec = if (lastNanos == 0L) 0.0083f else ((nowNanos - lastNanos) / 1_000_000_000f).coerceIn(0.002f, 0.04f)
                 lastNanos = nowNanos
                 val dx = targetNormX - displayNormX
                 val dy = targetNormY - displayNormY
-                if (kotlin.math.abs(dx) > 0.0003f || kotlin.math.abs(dy) > 0.0003f) {
-                    val lerpFactor = (dtSec * 16f).coerceIn(0.08f, 0.45f)
+                val dist = kotlin.math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
+
+                // Adaptive speed: faster catchup during saccades (> 0.06 dist), silk-smooth damping during micro-dwell (< 0.015 dist)
+                val speed = if (dist > 0.06f) 24f else if (dist > 0.02f) 18f else 13f
+                val lerpFactor = (dtSec * speed).coerceIn(0.12f, 0.65f)
+
+                if (dist > 0.00015f) {
                     displayNormX += dx * lerpFactor
                     displayNormY += dy * lerpFactor
                 } else {
@@ -1021,7 +1026,7 @@ fun RegionConfidenceReticleOverlay(
                 if (overlayRootBounds.width > 0f && overlayRootBounds.height > 0f) {
                     val rootX = overlayRootBounds.left + displayNormX * overlayRootBounds.width
                     val rootY = overlayRootBounds.top + displayNormY * overlayRootBounds.height
-                    if (kotlin.math.abs(rootX - lastReportedRootX) > 0.5f || kotlin.math.abs(rootY - lastReportedRootY) > 0.5f) {
+                    if (kotlin.math.abs(rootX - lastReportedRootX) > 0.35f || kotlin.math.abs(rootY - lastReportedRootY) > 0.35f) {
                         lastReportedRootX = rootX
                         lastReportedRootY = rootY
                         latestOnReticleRootPositionChanged(Offset(rootX, rootY))
