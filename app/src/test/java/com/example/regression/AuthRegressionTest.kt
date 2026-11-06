@@ -10,6 +10,7 @@ import androidx.credentials.GetCredentialRequest
 import androidx.credentials.GetCredentialResponse
 import androidx.credentials.exceptions.GetCredentialException
 import androidx.credentials.exceptions.GetCredentialProviderConfigurationException
+import androidx.credentials.exceptions.GetCredentialUnknownException
 import androidx.credentials.exceptions.NoCredentialException
 import androidx.test.core.app.ApplicationProvider
 import com.example.domain.BlinkHysteresisDetector
@@ -186,6 +187,39 @@ class AuthRegressionTest {
         scheduler.runCurrent()
         assertEquals("no credential request after an explicit sign-out", 1, credentialManager.getCredentialCalls)
         assertEquals("the screen is released (loading cleared) instead", 2, unauthenticated)
+    }
+
+    @Test
+    fun autoSignIn_failures_areLoggedWithTheProviderMessage() {
+        val auth = authRegressionFirebaseAuth()
+        // An unregistered signing SHA-1 surfaces as DEVELOPER_ERROR (code 10) in the provider message.
+        val developerError = "10: [28433] Developer console is not set up correctly."
+        val failures = listOf<GetCredentialException>(
+            NoCredentialException(developerError),
+            GetCredentialUnknownException(developerError)
+        )
+        for (failure in failures) {
+            var unauthenticated = 0
+            val previousStream = ShadowLog.stream
+            val logBuffer = ByteArrayOutputStream()
+            ShadowLog.stream = PrintStream(logBuffer, true)
+            try {
+                attemptAutoSignIn(
+                    context, fakeCredentialManager(onGet = { throw failure }),
+                    onAuthSuccess = { fail("must not succeed") },
+                    onUnauthenticated = { unauthenticated++ },
+                    scope = scope, auth = auth
+                )
+                scheduler.runCurrent()
+            } finally {
+                ShadowLog.stream = previousStream
+            }
+
+            val logs = logBuffer.toString()
+            assertEquals("the screen is released after ${failure::class.simpleName}", 1, unauthenticated)
+            assertTrue("auto sign-in failure must be logged at warning level: $logs", logs.contains("W/Auth: Auto sign-in"))
+            assertTrue("the provider message must reach the log: $logs", logs.contains(developerError))
+        }
     }
 
     @Test

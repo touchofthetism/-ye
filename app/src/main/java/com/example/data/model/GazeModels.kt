@@ -18,6 +18,18 @@ val DEFAULT_AFFINE_MATRIX_2X6: List<Double> = listOf(
     0.50, 0.00, 0.44, 0.00, 0.36, -0.01
 )
 
+/**
+ * A saved 2x6 calibration.
+ * - baselineEyeDistancePx: inter-ocular distance at calibration, in the same reference pixels as
+ *   [GazeFeatureVector.eyeDistancePx].
+ * - meanErrorMm / meanErrorPct / maxErrorPct: held-out validation error when [heldOutValidated] is true;
+ *   otherwise the in-sample residual on the 5 fit targets, which is not a validated accuracy.
+ * - heldOutValidated: true only when the error metrics come from the 4 held-out validation targets
+ *   (CalibrationWizardState.metricsAreHeldOut at save time). Records saved before this field existed read
+ *   back false, because nothing shows they were validated.
+ * - calibrationPosture: [GazePostureProfile] name the fit was recorded in; read it with
+ *   [calibrationPostureProfile], which maps unknown or blank values to UPRIGHT.
+ */
 @IgnoreExtraProperties
 data class CalibrationProfile(
     @DocumentId val id: String = "",
@@ -36,9 +48,19 @@ data class CalibrationProfile(
     // "active", so the stored "isActive" key never deserialized and every cloud profile read back
     // active. Naming the getter's property explicitly binds the stored key (and the backing field).
     @get:PropertyName("isActive") val isActive: Boolean = true,
+    // No "is" prefix, so Firestore's mapper and the local vault both use the key "heldOutValidated".
+    val heldOutValidated: Boolean = false,
+    val calibrationPosture: String = GazePostureProfile.UPRIGHT.name,
     @ServerTimestamp val createdAt: Timestamp? = null,
     @ServerTimestamp val updatedAt: Timestamp? = null
 )
+
+/**
+ * The posture [CalibrationProfile.calibrationPosture] names, or UPRIGHT for a blank or unknown value.
+ * An extension rather than a member so Firestore's mapper does not serialize it as an extra field.
+ */
+fun CalibrationProfile.calibrationPostureProfile(): GazePostureProfile =
+    GazePostureProfile.entries.firstOrNull { it.name == calibrationPosture } ?: GazePostureProfile.UPRIGHT
 
 @IgnoreExtraProperties
 data class TrackingSession(
@@ -66,8 +88,14 @@ data class TrackingSession(
  * 6D standardized feature vector + per-eye confidence diagnostics + normalized brow-raise signal.
  * - gx, gy: Confidence-weighted fused pupil/iris centroid offset in [-0.5, +0.5].
  * - yaw, pitch, roll: 3D head Euler angles in degrees from ML Kit Face Detection.
- * - leftEyeConfidence, rightEyeConfidence: Per-eye fusion weights in [0.05, 1.0] accounting for
- *   eye-openness, local ROI contrast, and specular eyeglass glare rejection.
+ * - eyeDistancePx: inter-ocular distance in reference pixels of a frame whose long upright side is
+ *   1280 px (AnalysisResolutionTier.TIER_HIGH_1280; equivalently a 960 px short side for 4:3), not raw
+ *   analysis pixels, so a resolution tier change does not look like a distance change.
+ * - leftEyeOpenProb, rightEyeOpenProb: ML Kit eye-open probabilities. No-face frames carry 0 for both,
+ *   so read them (and [combinedEyeOpenProb]) as eyelid closure only when [faceDetected] is true.
+ * - leftEyeConfidence, rightEyeConfidence: Per-eye fusion weights in [0, 1.0] accounting for
+ *   eye-openness, local ROI contrast, and specular eyeglass glare rejection: 0 on no-face frames, at most
+ *   0.05 for an eye whose ROI produced no pupil measurement, and at least 0.10 for a measured pupil.
  * - browToEyeRatio: Vertical distance from eyebrow top contour to eye center normalized by inter-ocular distance,
  *   compensated for upward head pitch and upward gaze so looking at top-row tiles does not false-trigger.
  * - isSimulated: true for frames synthesized by the simulator proxy / emulator ticker rather than measured
@@ -270,3 +298,18 @@ enum class GazeFilterMode(val label: String, val shortName: String) {
     RAW("Raw Unfiltered Stream", "Raw")
 }
 
+/**
+ * A user's interaction preferences and brow-raise calibration, kept per account in the on-device vault
+ * (LocalTelemetryStore.saveInteractionSettings) so they survive restarts. Defaults match LiveGazeHudState's.
+ * The store returns values as saved; callers apply their own setter ranges when restoring them.
+ */
+data class InteractionSettings(
+    val dwellTriggerMs: Long = 1000L,
+    val dwellSensitivityRadiusMultiplier: Float = 1.0f,
+    val activeDwellPreset: DwellSpeedPreset = DwellSpeedPreset.BALANCED,
+    val triggerMode: GazeTriggerMode = GazeTriggerMode.ALL_ACTIVE,
+    val filterMode: GazeFilterMode = GazeFilterMode.ONE_EURO,
+    val activePosture: GazePostureProfile = GazePostureProfile.UPRIGHT,
+    val neutralBrowRatio: Float = 0.34f,
+    val raisedBrowRatio: Float = 0.42f
+)

@@ -112,6 +112,29 @@ class CloudEmulatorRegressionTest : FirestoreEmulatorTestBase() {
     }
 
     @Test
+    fun setActiveCalibrationProfile_isExclusive_andSkipsIdsThatNoLongerExist() = runBlocking {
+        val uid = signInTestUser(freshEmail())
+        val repository = EyeTrackingRepository(firestore, auth)
+        val oldId = freshId("cal_old")
+        val chosenId = freshId("cal_chosen")
+        val goneId = freshId("cal_gone")
+
+        withTimeout(TIMEOUT_MS) {
+            repository.createCalibrationProfile(CalibrationProfile(id = oldId, userId = uid, name = "Old", isActive = true)).getOrThrow()
+            repository.createCalibrationProfile(CalibrationProfile(id = chosenId, userId = uid, name = "Chosen", isActive = false)).getOrThrow()
+        }
+        // goneId stands for a stale id from an old listing; it must not fail the batch or create a document.
+        val result = withTimeout(TIMEOUT_MS) { repository.setActiveCalibrationProfile(chosenId, listOf(oldId, goneId)) }
+        assertTrue("activation with a stale id failed: ${result.exceptionOrNull()}", result.isSuccess)
+        assertEquals(true, withTimeout(TIMEOUT_MS) { rawIsActive(uid, chosenId) })
+        assertEquals(false, withTimeout(TIMEOUT_MS) { rawIsActive(uid, oldId) })
+        val goneExists = withTimeout(TIMEOUT_MS) {
+            firestore.collection("users").document(uid).collection("calibrations").document(goneId).get().await().exists()
+        }
+        assertFalse("a stale id must not be written", goneExists)
+    }
+
+    @Test
     fun deleteAndGet_ofMissingDocument_succeed() = runBlocking {
         val uid = signInTestUser(freshEmail())
         val repository = EyeTrackingRepository(firestore, auth)

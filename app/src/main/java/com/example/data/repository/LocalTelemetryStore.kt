@@ -3,6 +3,11 @@ package com.example.data.repository
 import android.content.Context
 import com.example.data.model.CalibrationProfile
 import com.example.data.model.DEFAULT_AFFINE_MATRIX_2X6
+import com.example.data.model.DwellSpeedPreset
+import com.example.data.model.GazeFilterMode
+import com.example.data.model.GazePostureProfile
+import com.example.data.model.GazeTriggerMode
+import com.example.data.model.InteractionSettings
 import com.example.data.model.TrackingSession
 import com.google.firebase.Timestamp
 import org.json.JSONArray
@@ -105,6 +110,11 @@ class LocalTelemetryStore(context: Context) {
                         openBlinkThreshold = obj.optDouble("openBlinkThreshold", 0.55),
                         intentionalBlinkMinMs = obj.optLong("intentionalBlinkMinMs", 350L),
                         isActive = obj.optBoolean("isActive", i == 0),
+                        // Entries written before these keys existed read back unvalidated and upright.
+                        heldOutValidated = obj.optBoolean("heldOutValidated", false),
+                        calibrationPosture = obj.optString("calibrationPosture", GazePostureProfile.UPRIGHT.name)
+                            .takeIf { raw -> GazePostureProfile.entries.any { it.name == raw } }
+                            ?: GazePostureProfile.UPRIGHT.name,
                         createdAt = ts,
                         updatedAt = ts
                     )
@@ -174,6 +184,8 @@ class LocalTelemetryStore(context: Context) {
                 put("openBlinkThreshold", p.openBlinkThreshold)
                 put("intentionalBlinkMinMs", p.intentionalBlinkMinMs)
                 put("isActive", p.isActive)
+                put("heldOutValidated", p.heldOutValidated)
+                put("calibrationPosture", p.calibrationPosture)
                 put("createdAtMs", p.createdAt?.toDate()?.time ?: System.currentTimeMillis())
             }
             arr.put(obj)
@@ -246,8 +258,9 @@ class LocalTelemetryStore(context: Context) {
     }
 
     /**
-     * Wipes [userId]'s vault: calibration profiles, sessions, the recorded active profile id and the
-     * user-authored AAC phrase tiles (which can hold personal or medical text).
+     * Wipes [userId]'s vault: calibration profiles, sessions, the recorded active profile id, the
+     * user-authored AAC phrase tiles (which can hold personal or medical text) and the interaction settings
+     * (which include brow ratios measured from the user's face).
      */
     fun clearAllLocalData(userId: String) {
         prefs.edit()
@@ -255,8 +268,66 @@ class LocalTelemetryStore(context: Context) {
             .remove("${KEY_SESSIONS_PREFIX}_$userId")
             .remove("${KEY_AAC_TILES_PREFIX}_$userId")
             .remove("${KEY_ACTIVE_PROFILE_ID_PREFIX}_$userId")
+            .remove("${KEY_INTERACTION_SETTINGS_PREFIX}_$userId")
             .apply()
     }
+
+    /**
+     * Stores [userId]'s dwell, trigger, filter, posture and brow-calibration settings as one JSON entry,
+     * replacing any earlier one. Non-finite numbers are left out and read back as defaults.
+     */
+    fun saveInteractionSettings(userId: String, settings: InteractionSettings) {
+        val obj = JSONObject().apply {
+            put("dwellTriggerMs", settings.dwellTriggerMs)
+            putIfFinite("dwellSensitivityRadiusMultiplier", settings.dwellSensitivityRadiusMultiplier)
+            put("activeDwellPreset", settings.activeDwellPreset.name)
+            put("triggerMode", settings.triggerMode.name)
+            put("filterMode", settings.filterMode.name)
+            put("activePosture", settings.activePosture.name)
+            putIfFinite("neutralBrowRatio", settings.neutralBrowRatio)
+            putIfFinite("raisedBrowRatio", settings.raisedBrowRatio)
+        }
+        prefs.edit().putString("${KEY_INTERACTION_SETTINGS_PREFIX}_$userId", obj.toString()).apply()
+    }
+
+    /**
+     * [userId]'s saved interaction settings, or null when none were saved (or the entry is unreadable), so the
+     * caller keeps its own defaults. A missing, non-finite or unknown field reads back as the
+     * [InteractionSettings] default; values are otherwise returned as saved, without range clamping.
+     */
+    fun loadInteractionSettings(userId: String): InteractionSettings? {
+        val raw = prefs.getString("${KEY_INTERACTION_SETTINGS_PREFIX}_$userId", null) ?: return null
+        return try {
+            val obj = JSONObject(raw)
+            val defaults = InteractionSettings()
+            InteractionSettings(
+                dwellTriggerMs = obj.optLong("dwellTriggerMs", defaults.dwellTriggerMs),
+                dwellSensitivityRadiusMultiplier = obj.finiteFloat(
+                    "dwellSensitivityRadiusMultiplier",
+                    defaults.dwellSensitivityRadiusMultiplier
+                ),
+                activeDwellPreset = DwellSpeedPreset.entries
+                    .firstOrNull { it.name == obj.optString("activeDwellPreset") } ?: defaults.activeDwellPreset,
+                triggerMode = GazeTriggerMode.entries
+                    .firstOrNull { it.name == obj.optString("triggerMode") } ?: defaults.triggerMode,
+                filterMode = GazeFilterMode.entries
+                    .firstOrNull { it.name == obj.optString("filterMode") } ?: defaults.filterMode,
+                activePosture = GazePostureProfile.entries
+                    .firstOrNull { it.name == obj.optString("activePosture") } ?: defaults.activePosture,
+                neutralBrowRatio = obj.finiteFloat("neutralBrowRatio", defaults.neutralBrowRatio),
+                raisedBrowRatio = obj.finiteFloat("raisedBrowRatio", defaults.raisedBrowRatio)
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun JSONObject.putIfFinite(key: String, value: Float) {
+        if (value.isFinite()) put(key, value.toDouble())
+    }
+
+    private fun JSONObject.finiteFloat(key: String, fallback: Float): Float =
+        optDouble(key, Double.NaN).takeIf { it.isFinite() }?.toFloat() ?: fallback
 
     private fun writeSessions(userId: String, sessions: List<TrackingSession>) {
         val arr = JSONArray()
@@ -342,5 +413,6 @@ class LocalTelemetryStore(context: Context) {
         private const val KEY_SESSIONS_PREFIX = "local_sessions"
         private const val KEY_AAC_TILES_PREFIX = "local_aac_tiles"
         private const val KEY_ACTIVE_PROFILE_ID_PREFIX = "local_active_profile_id"
+        private const val KEY_INTERACTION_SETTINGS_PREFIX = "local_interaction_settings"
     }
 }

@@ -124,6 +124,7 @@ fun attemptAutoSignIn(
     val clientId = try {
         context.getString(R.string.default_web_client_id)
     } catch (e: Exception) {
+        Log.w("Auth", "Auto sign-in skipped: default_web_client_id is missing", e)
         onUnauthenticated()
         return
     }
@@ -150,7 +151,9 @@ fun attemptAutoSignIn(
                 onUnauthenticated()
             }
         } catch (e: NoCredentialException) {
-            Log.d("Auth", "Auto sign-in: no authorized Google account on this device")
+            // Keep the provider's message: a misconfigured OAuth client (unregistered signing
+            // SHA-1, DEVELOPER_ERROR / code 10) can also arrive here instead of failing loudly.
+            Log.w("Auth", "Auto sign-in: no authorized Google account on this device${e.message?.let { " ($it)" }.orEmpty()}", e)
             onUnauthenticated()
         } catch (e: GetCredentialCancellationException) {
             Log.d("Auth", "Auto sign-in dismissed")

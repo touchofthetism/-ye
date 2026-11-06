@@ -169,11 +169,22 @@ class EyeTrackingRepository(
      * every other active cloud profile, so the user's choice is not overridden by a newer profile
      * that is still marked active.
      */
-    suspend fun updateCalibrationActiveState(profileId: String, isActive: Boolean): Result<Unit> {
+    suspend fun updateCalibrationActiveState(profileId: String, isActive: Boolean): Result<Unit> =
+        commitActiveState(profileId, isActive, alsoDeactivateIds = emptySet())
+
+    /**
+     * Activates [activeId] and deactivates [otherIds] in one atomic batch, together with any other
+     * profile the listing still shows as active. Ids whose documents no longer exist are skipped,
+     * because one update of a missing document would fail the whole batch.
+     */
+    suspend fun setActiveCalibrationProfile(activeId: String, otherIds: Collection<String>): Result<Unit> =
+        commitActiveState(activeId, isActive = true, alsoDeactivateIds = otherIds.toSet())
+
+    private suspend fun commitActiveState(profileId: String, isActive: Boolean, alsoDeactivateIds: Set<String>): Result<Unit> {
         return try {
             val uid = requireUserId()
             val docRef = calibrationsOf(uid).document(profileId)
-            val othersToDeactivate = if (isActive) otherActiveProfileRefs(uid, keepId = profileId) else emptyList()
+            val othersToDeactivate = if (isActive) otherActiveProfileRefs(uid, keepId = profileId, alsoDeactivateIds) else emptyList()
             val batch = db.batch()
             batch.update(docRef, activeStateFields(isActive))
             othersToDeactivate.forEach { batch.update(it, activeStateFields(false)) }
@@ -187,13 +198,18 @@ class EyeTrackingRepository(
         }
     }
 
-    private suspend fun otherActiveProfileRefs(uid: String, keepId: String): List<DocumentReference> =
+    /** Existing documents only: the listing is the source of the refs, so stale ids are dropped. */
+    private suspend fun otherActiveProfileRefs(
+        uid: String,
+        keepId: String,
+        alsoDeactivateIds: Set<String> = emptySet()
+    ): List<DocumentReference> =
         calibrationsOf(uid)
             .whereEqualTo("userId", uid)
             .get()
             .await()
             .documents
-            .filter { it.id != keepId && it.get("isActive") == true }
+            .filter { it.id != keepId && (it.get("isActive") == true || it.id in alsoDeactivateIds) }
             .map { it.reference }
 
     private fun activeStateFields(isActive: Boolean): Map<String, Any> = mapOf(

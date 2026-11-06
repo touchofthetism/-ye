@@ -6,6 +6,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsProperties
@@ -30,6 +31,7 @@ import com.example.domain.GazeCalibrationMath
 import com.example.domain.ReplayScenario
 import com.example.ui.components.DwellTriggerSettingsDialog
 import com.example.ui.screens.GazeControlDeckScreen
+import com.example.ui.screens.tileCentersInGazeFrame
 import com.example.ui.viewmodel.LiveGazeHudState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -49,7 +51,8 @@ import java.util.Locale
  * - focus hysteresis is 14 dp on the device's density,
  * - the 3x3 "Validated" deck needs measured accuracy and uses the shared layout classifier,
  * - dwell sliders represent every preset and round instead of truncating,
- * - the benchmark summary reports the run's own verdict and counts, Locale.US formatted.
+ * - the benchmark summary reports the run's own verdict and counts, Locale.US formatted,
+ * - visible tile centres are reported in the gaze (root overlay) frame for drift correction.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36], qualifiers = "w411dp-h891dp")
@@ -73,6 +76,8 @@ class DeckRegressionTest {
         var hud by mutableStateOf(initialHud)
         var reticle by mutableStateOf(Offset.Zero)
         var show by mutableStateOf(true)
+        var gazeFrame by mutableStateOf(Rect.Zero)
+        val centerCalls = mutableListOf<Map<String, Pair<Float, Float>>>()
         val focusCalls = mutableListOf<String?>()
         val durations = mutableListOf<Long>()
         val edits = mutableListOf<Triple<String, String, String>>()
@@ -91,7 +96,9 @@ class DeckRegressionTest {
                 },
                 onManualTileClick = {},
                 onChangeDwellDurationMs = { h.durations += it },
-                onEditTilePhrase = { id, title, phrase -> h.edits += Triple(id, title, phrase) }
+                onEditTilePhrase = { id, title, phrase -> h.edits += Triple(id, title, phrase) },
+                gazeFrameRootBounds = h.gazeFrame,
+                onUpdateTileCentersNorm = { h.centerCalls += it }
             )
         }
     }
@@ -316,6 +323,7 @@ class DeckRegressionTest {
             allScenariosPassed = false,
             falseActivationsPerMinute = 2.0,
             latencyMedianMs = 0.0042,
+            midasFalseActivationCount = 3,
             scenarioResults = base.scenarioResults.map { r ->
                 if (r.scenario == ReplayScenario.CONTINUOUS_TALKING) r.copy(passed = false, falseActivations = 3)
                 else r.copy(falseActivations = 0)
@@ -339,13 +347,60 @@ class DeckRegressionTest {
             composeRule.onAllNodesWithText("Pixel 10 Pro XL Stress Benchmark", substring = true).assertCountEquals(0)
             composeRule.onAllNodesWithText("thermal endurance", substring = true).assertCountEquals(0)
             composeRule.onNodeWithText("FAILURES DETECTED", substring = true).assertExists()
-            composeRule.onNodeWithText("3 false triggers (2.0/min)", substring = true).assertExists()
+            composeRule.onNodeWithText("3 false triggers (3 in Midas-touch scenarios, 2.0/min)", substring = true)
+                .assertExists()
             composeRule.onNodeWithText("${gated.count { it.passed }}/${gated.size} gated scenarios passed", substring = true)
                 .assertExists()
-            composeRule.onNodeWithText("median 0.004 ms", substring = true).assertExists()
+            composeRule.onNodeWithText("post-feature JVM processing median 0.004 ms", substring = true).assertExists()
+            // The forward-model accuracy fields are a synthetic projection check, not measured accuracy.
+            composeRule.onNodeWithText("synthetic projection check", substring = true).assertExists()
+            composeRule.onNodeWithText("not measured gaze accuracy", substring = true).assertExists()
+            composeRule.onAllNodesWithText("synthetic-trace accuracy", substring = true).assertCountEquals(0)
         } finally {
             Locale.setDefault(previousLocale)
         }
+    }
+
+    // A188 / B56: drift correction needs tile centres in the gaze frame (the root overlay Box), not root px.
+    @Test
+    fun tileCentersInGazeFrame_normalizesToTheOverlayFrame() {
+        val frame = Rect(left = 0f, top = 100f, right = 1000f, bottom = 2100f)
+        val bounds = mapOf(
+            "a" to Rect(100f, 300f, 300f, 500f),
+            "gone" to Rect(500f, 500f, 700f, 700f),
+            "clipped" to Rect(800f, 2100f, 900f, 2100f)
+        )
+        val centers = tileCentersInGazeFrame(bounds, setOf("a", "clipped"), frame)
+        assertEquals(setOf("a"), centers.keys)
+        assertEquals(0.2f, centers.getValue("a").first, 1e-6f)
+        assertEquals(0.15f, centers.getValue("a").second, 1e-6f)
+        assertTrue("no frame yet: nothing to normalize against", tileCentersInGazeFrame(bounds, setOf("a"), Rect.Zero).isEmpty())
+    }
+
+    @Test
+    fun deck_reportsVisibleTileCentresInTheGazeFrame_andClearsThemOnLeave() {
+        val h = DeckHarness()
+        setDeck(h)
+        assertTrue("without a frame no centre may be reported", h.centerCalls.all { it.isEmpty() })
+
+        val frame = Rect(left = 0f, top = 50f, right = 1130f, bottom = 2450f)
+        composeRule.runOnIdle { h.gazeFrame = frame }
+        composeRule.waitForIdle()
+        var latest = h.centerCalls.last()
+        assertEquals(setOf("t1", "t2", "t3", "t4"), latest.keys)
+        val t2 = tileBounds("t2").center
+        assertEquals((t2.x - frame.left) / frame.width, latest.getValue("t2").first, 1e-3f)
+        assertEquals((t2.y - frame.top) / frame.height, latest.getValue("t2").second, 1e-3f)
+
+        // 2x2 -> 3x3: the newly visible tiles are reported too.
+        composeRule.runOnIdle { h.hud = h.hud.copy(activeErrorRadiusPct = 5f, activeMaxQuadrantErrorPct = 8f) }
+        composeRule.waitForIdle()
+        latest = h.centerCalls.last()
+        assertEquals((1..9).map { "t$it" }.toSet(), latest.keys)
+
+        composeRule.runOnIdle { h.show = false }
+        composeRule.waitForIdle()
+        assertTrue("stale centres must be cleared when the deck leaves", h.centerCalls.last().isEmpty())
     }
 
     // A167 / C7: numeric readouts on the deck use Locale.US regardless of the device locale.

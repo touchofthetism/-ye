@@ -61,9 +61,11 @@ private val GATED_BENCHMARK_CATEGORIES = setOf("MIDAS_TOUCH", "COMMAND")
 
 /**
  * One-line summary of the last synthetic replay run, built only from values the run produced:
- * the pass/fail verdict, how many gated scenarios passed, the false-trigger count and the measured
- * post-feature processing latency. It is a JVM replay of synthetic feature traces, not an on-device
- * camera, latency or thermal measurement, and says so.
+ * the pass/fail verdict, how many gated scenarios passed, the false-trigger counts (the per-minute
+ * rate is the report's Midas-touch rate, so it is shown next to the Midas-touch count it belongs to),
+ * the measured post-feature processing latency and the forward-model projection check. It is a JVM
+ * replay of synthetic feature traces, not an on-device camera, latency, accuracy or thermal
+ * measurement, and says so.
  */
 fun formatBenchmarkSummaryLine(report: BenchmarkScorecard): String {
     val gated = report.scenarioResults.filter { it.scenario.category in GATED_BENCHMARK_CATEGORIES }
@@ -73,13 +75,15 @@ fun formatBenchmarkSummaryLine(report: BenchmarkScorecard): String {
     return String.format(
         Locale.US,
         "Latest synthetic replay: %s • %d/%d gated scenarios passed, %d replayed without pass criteria • " +
-            "%d false triggers (%.1f/min) • post-feature processing median %.3f ms (excl. camera + face detection) • " +
-            "synthetic-trace accuracy %.1f px (%.2f°).",
+            "%d false triggers (%d in Midas-touch scenarios, %.1f/min) • " +
+            "post-feature JVM processing median %.3f ms (excl. camera + face detection) • " +
+            "synthetic projection check %.1f px (%.2f°), not measured gaze accuracy.",
         verdict,
         gated.count { it.passed },
         gated.size,
         ungatedCount,
         falseTriggers,
+        report.midasFalseActivationCount,
         report.falseActivationsPerMinute,
         report.latencyMedianMs,
         report.meanAccuracyPx,
