@@ -539,9 +539,7 @@ class VmRegressionTest {
         val vm = newVm()
         vm.startAttentionRecording()
         vm.stopAndSaveAttentionSession()
-        val s = vm.attentionState.value.selectedReplaySession
-        assertNotNull(s)
-        s!!
+        val s = requireNotNull(vm.attentionState.value.selectedReplaySession)
         assertEquals(0, s.topZonePercentage)
         assertEquals(0, s.middleZonePercentage)
         assertEquals(0, s.bottomZonePercentage)

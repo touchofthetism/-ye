@@ -1222,13 +1222,23 @@ class EyeTrackingViewModel(
         // Capture inputs on Main, then run the CPU-bound replay off the UI thread
         val matrix = activeMatrix
         val model = Build.MODEL?.takeIf { it.isNotBlank() } ?: "Google Pixel 10 Pro XL"
+        val widthMm = displayWidthMm
+        val heightMm = displayHeightMm
+        val soc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            Build.SOC_MODEL?.takeIf { it.isNotBlank() && it != Build.UNKNOWN }
+        } else {
+            null
+        }
         _liveHudState.update { it.copy(isBenchmarkRunning = true) }
         viewModelScope.launch {
             try {
                 val scorecard = withContext(Dispatchers.Default) {
                     com.example.domain.BenchmarkRunner.runCompleteBenchmark(
                         matrixCoeffs = matrix,
-                        deviceModel = model
+                        deviceModel = model,
+                        screenWidthMm = widthMm,
+                        screenHeightMm = heightMm,
+                        socLabel = soc
                     )
                 }
                 _liveHudState.update { it.copy(lastBenchmarkReport = scorecard) }
