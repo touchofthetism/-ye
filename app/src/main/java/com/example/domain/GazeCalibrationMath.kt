@@ -36,6 +36,9 @@ object GazeCalibrationMath {
     const val GRID_3X3_MAX_WORST_QUADRANT_PCT = 16.5
     const val RECALIBRATION_RECOMMENDED_WORST_QUADRANT_PCT = 24.0
 
+    /** Upper guard for reported normalized errors; the measured value is otherwise reported unchanged. */
+    const val MAX_REPORTED_ERROR_PCT = 100.0
+
     /**
      * True only when both held-out metrics are finite (i.e. actually measured) and within the
      * 3x3 thresholds. Non-finite input (not validated) always yields the protective 2x2 deck.
@@ -326,6 +329,9 @@ object GazeCalibrationMath {
      * non-square screen 1% of y is a different physical distance than 1% of x; consumers that convert
      * them to pixels must scale x by width and y by height (an ellipse, not a circle).
      *
+     * The values are the measured means, without floors (a 0.2 % fit reports 0.2 %, not a minimum).
+     * Percentages are capped at [MAX_REPORTED_ERROR_PCT]; a non-finite feature makes the metrics NaN.
+     *
      * With no samples nothing was measured: all metrics are NaN and the description says
      * "Not validated (no samples)".
      */
@@ -367,14 +373,19 @@ object GazeCalibrationMath {
             targetErrors.getOrPut(actualTarget) { mutableListOf() }.add(errPct)
         }
 
+        // The measured means are reported as measured: a fit better than 1.5 % or 2 mm is shown as such.
+        // Only guards remain: a non-finite projection (NaN features) leaves the metric NaN, i.e. "not
+        // measured", and percentages are capped at 100 (only a hopeless fit gets there, since projections are
+        // clamped to the screen). For on-screen targets the mm error cannot exceed the screen diagonal anyway.
         val count = validationSamples.size.toDouble()
-        val meanMm = (totalMmError / count).coerceIn(2.0, 120.0)
-        val meanPct = (totalNormError / count).coerceIn(1.5, 85.0)
+        val meanMm = totalMmError / count
+        val meanPct = (totalNormError / count).coerceAtMost(MAX_REPORTED_ERROR_PCT)
+        // The worst per-target mean is never below the overall mean (the lower bound only absorbs rounding).
         val maxQuadrantPct = targetErrors.values
             .mapNotNull { list -> if (list.isEmpty()) null else list.average() }
             .maxOrNull()
-            ?.coerceIn(meanPct, 95.0)
-            ?: (meanPct * 1.25).coerceAtMost(95.0)
+            ?.coerceIn(meanPct, MAX_REPORTED_ERROR_PCT)
+            ?: meanPct
 
         // Recommend exactly the layout the Control Deck renders for these metrics (same thresholds)
         val recommendation = gridLayoutLabel(qualifiesFor3x3Grid(meanPct, maxQuadrantPct)) +

@@ -137,7 +137,10 @@ class PipelineBenchmarkTest {
         val rowStride: Int,
         val leftEye: List<PointF>,
         val rightEye: List<PointF>
-    )
+    ) {
+        /** The engine reads the Y plane as a ByteBuffer (as CameraX delivers it); wrapped once, not per call. */
+        val yBuffer: java.nio.ByteBuffer = java.nio.ByteBuffer.wrap(yBytes)
+    }
 
     /**
      * Paints an upright (portrait) face crop into a raw landscape Y-plane buffer for the given
@@ -205,13 +208,13 @@ class PipelineBenchmarkTest {
     }
 
     /** Resolves the engine's ROI analysis entry point (signature-tolerant across refactors). */
-    private fun roiAnalyzer(): (List<PointF>, Float, SyntheticFrame, Int) -> Any {
+    private fun roiAnalyzer(): (List<PointF>, Float, SyntheticFrame, Int) -> Any? {
         val engineCls = CameraGazeAnalyzerEngine::class.java
         val m: Method = engineCls.declaredMethods.first { it.name == "analyzeEyeContourRoi" && it.parameterCount == 9 }
         m.isAccessible = true
         val engine = allocateWithoutConstructor(engineCls)
         return { pts, open, f, step ->
-            m.invoke(engine, pts, open, f.yBytes, f.rawWidth, f.rawHeight, f.rotation, f.rowStride, 1, step)
+            m.invoke(engine, pts, open, f.yBuffer, f.rawWidth, f.rawHeight, f.rotation, f.rowStride, 1, step)
         }
     }
 
@@ -321,7 +324,8 @@ class PipelineBenchmarkTest {
         val rnd = Random(5)
         val xs = DoubleArray(4096) { 0.5 + rnd.nextDouble(-0.02, 0.02) }
         val ys = DoubleArray(4096) { 0.5 + rnd.nextDouble(-0.02, 0.02) }
-        val oneEuro = OneEuroFilter2D(minCutoff = 0.85, beta = 0.035, dCutoff = 1.0)
+        // The live pupil filter configuration (CameraGazeAnalyzerEngine.PUPIL_FILTER_*)
+        val oneEuro = CameraGazeAnalyzerEngine.newPupilGazeFilter()
         var ts = 0L
         bench("filter.OneEuroFilter2D.filter", opsPerRound = 100_000) {
             var acc = 0.0
@@ -385,14 +389,17 @@ class PipelineBenchmarkTest {
                     trace = trace,
                     blinkDetector = BlinkHysteresisDetector(),
                     browDetector = BrowRaiseHysteresisDetector(),
-                    pupilFilter = OneEuroFilter2D(minCutoff = 0.85, beta = 0.035, dCutoff = 1.0),
-                    screenFilter = OneEuroFilter2D(minCutoff = 0.90, beta = 0.040, dCutoff = 1.0),
+                    // Same filters as the live pipeline and BenchmarkRunner
+                    pupilFilter = CameraGazeAnalyzerEngine.newPupilGazeFilter(),
+                    screenFilter = OneEuroFilter2D(minCutoff = 0.90, beta = 1.2, dCutoff = 1.0),
                     matrixCoeffs = DEFAULT_AFFINE_MATRIX_2X6
                 ).totalFramesEvaluated
             }
             sink += acc.toDouble()
         }
     }
+
+    private fun jsonNumber(value: Double): Any = if (value.isFinite()) value else JSONObject.NULL
 
     private fun benchBenchmarkRunner() {
         bench("BenchmarkRunner.runCompleteBenchmark", opsPerRound = 1, warmupRounds = 3, rounds = 10) {
@@ -404,12 +411,13 @@ class PipelineBenchmarkTest {
             JSONObject()
                 .put("allScenariosPassed", card.allScenariosPassed)
                 .put("failedScenarios", JSONArray(card.scenarioResults.filter { !it.passed }.map { it.scenario.name }))
-                .put("meanAccuracyPx", card.meanAccuracyPx)
-                .put("worstEdgeAccuracyPx", card.worstEdgeAccuracyPx)
-                .put("rmsJitterPx", card.rmsJitterPx)
-                .put("falseActivationsPerMinute", card.falseActivationsPerMinute)
-                .put("latencyMedianMs", card.latencyMedianMs)
-                .put("latencyP95Ms", card.latencyP95Ms)
+                // JSONObject.put rejects NaN (e.g. no scenario qualified for jitter): write null instead
+                .put("meanAccuracyPx", jsonNumber(card.meanAccuracyPx))
+                .put("worstEdgeAccuracyPx", jsonNumber(card.worstEdgeAccuracyPx))
+                .put("rmsJitterPx", jsonNumber(card.rmsJitterPx))
+                .put("falseActivationsPerMinute", jsonNumber(card.falseActivationsPerMinute))
+                .put("latencyMedianMs", jsonNumber(card.latencyMedianMs))
+                .put("latencyP95Ms", jsonNumber(card.latencyP95Ms))
         )
         println(card.toFormattedReport())
     }

@@ -25,6 +25,7 @@ import com.example.ui.screens.AttentionAnalyticsScreen
 import com.example.ui.screens.CloudPrivacyScreen
 import com.example.ui.screens.PassageLayoutSnapshot
 import com.example.ui.screens.formatEstimatedWpm
+import com.example.ui.screens.formatProfileErrorLine
 import com.example.ui.screens.formatSectionDwellLabel
 import com.example.ui.screens.formatSensitivityLabel
 import com.example.ui.screens.formatSessionSummaryLine
@@ -160,7 +161,9 @@ class AnalyticsprivacyRegressionTest {
         assertEquals("1.55× (22 dp)", formatSensitivityLabel(1.55f))
     }
 
-    // A175 / B34: same-named profiles must not all be marked as the loaded calibration.
+    // A175 / B34: same-named profiles must not all be marked as the loaded calibration. Rows are matched by the
+    // applied profile's id: unvalidated profiles (every legacy record) expose no HUD metrics, so the old
+    // name/device/metric heuristic marked the first same-named row instead of the loaded one.
     @Test
     fun `only the loaded profile among same-named profiles is marked current`() {
         val older = CalibrationProfile(id = "a", name = "Pixel Profile", deviceModel = "Pixel", meanErrorPct = 9.0, maxErrorPct = 12.0, meanErrorMm = 11.0)
@@ -168,9 +171,27 @@ class AnalyticsprivacyRegressionTest {
         val other = CalibrationProfile(id = "c", name = "Desk", deviceModel = "Pixel", meanErrorPct = 5.0, maxErrorPct = 6.0, meanErrorMm = 6.1)
         val profiles = listOf(older, loaded, other)
 
-        assertEquals(1, indexOfActiveProfile(profiles, "Pixel Profile", "Pixel", 6.5f, 8.0f, 7.9))
-        assertEquals(2, indexOfActiveProfile(profiles, "Desk", "Pixel", 5.0f, 6.0f, 6.1))
-        assertEquals(-1, indexOfActiveProfile(profiles, "Uncalibrated (default matrix)", "Pixel", null, null, null))
+        assertEquals(1, indexOfActiveProfile(profiles, "b"))
+        assertEquals(0, indexOfActiveProfile(profiles, "a"))
+        assertEquals(2, indexOfActiveProfile(profiles, "c"))
+        // Default matrix (no profile applied) and an id that is no longer listed mark nothing.
+        assertEquals(-1, indexOfActiveProfile(profiles, null))
+        assertEquals(-1, indexOfActiveProfile(profiles, ""))
+        assertEquals(-1, indexOfActiveProfile(profiles, "deleted"))
+    }
+
+    // A178: the saved error is labelled by where it came from instead of hedging "fit, or held-out if validated".
+    @Test
+    fun `profile error line names held-out validation or the unvalidated in-sample fit`() {
+        val base = CalibrationProfile(id = "p", name = "P", deviceModel = "Pixel", meanErrorPct = 6.5, maxErrorPct = 8.25, meanErrorMm = 7.9)
+        assertEquals(
+            "Pixel • Calib. error (held-out validation): mean ±6.5% (approx. ~7.9mm) • worst ±8.3%",
+            formatProfileErrorLine(base.copy(heldOutValidated = true))
+        )
+        assertEquals(
+            "Pixel • Calib. error (in-sample fit (unvalidated)): mean ±6.5% (approx. ~7.9mm) • worst ±8.3%",
+            formatProfileErrorLine(base.copy(heldOutValidated = false))
+        )
     }
 }
 

@@ -61,6 +61,22 @@ class DeckRegressionTest {
     @get:Rule
     val composeRule = createComposeRule()
 
+    /**
+     * Runs [block] with Robolectric reporting new windows as app-visible, so their ViewRootImpl draws.
+     * A Compose text field invalidates its dialog window after the first layout and finishes measuring
+     * in that draw pass; Robolectric's default (windows not visible, so never drawn) leaves the edit
+     * dialog permanently "not idle". Only the icon-free edit dialog runs drawn: the legacy graphics
+     * shadow cannot create the bitmaps that vector icons (e.g. in the settings dialog) draw into.
+     */
+    private fun <T> withWindowsMarkedVisible(block: () -> T): T {
+        val previous = System.setProperty(WINDOWS_MARKED_VISIBLE, "true")
+        try {
+            return block()
+        } finally {
+            if (previous != null) System.setProperty(WINDOWS_MARKED_VISIBLE, previous) else System.clearProperty(WINDOWS_MARKED_VISIBLE)
+        }
+    }
+
     private val tiles = (1..9).map { i ->
         AacActionTile(
             id = "t$i",
@@ -163,7 +179,7 @@ class DeckRegressionTest {
 
     // A154 / B18 (edit dialog) + A165: editing suspends gaze focus, and a blank field cannot be "saved".
     @Test
-    fun editDialog_suspendsGazeFocus_andSaveNeedsLabelAndPhrase() {
+    fun editDialog_suspendsGazeFocus_andSaveNeedsLabelAndPhrase() = withWindowsMarkedVisible {
         val h = DeckHarness()
         setDeck(h)
         moveReticle(h, tileBounds("t1").center)
@@ -414,5 +430,9 @@ class DeckRegressionTest {
         } finally {
             Locale.setDefault(previousLocale)
         }
+    }
+
+    private companion object {
+        const val WINDOWS_MARKED_VISIBLE = "robolectric.areWindowsMarkedVisible"
     }
 }

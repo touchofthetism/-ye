@@ -11,6 +11,7 @@
    - String lists are validated with a join/split round trip on U+001F plus an anchored regex (an unrolled per-index check exceeds the 1,000-expression rules budget). Elements must therefore not contain U+001F; the client never writes it.
 5. **Usable Blink Settings**: `closeBlinkThreshold + 0.05 <= openBlinkThreshold` (non-inverted hysteresis) and `150 <= intentionalBlinkMinMs <= 700`, so the command-blink window `intentionalBlinkMinMs..800 ms` is never empty.
 6. **Strict Key Allowlisting (`hasAll` & `hasOnly`)**: Ghost fields are rejected on both `create` and `update`.
+7. **Write-Once Validation Provenance**: The optional calibration keys `heldOutValidated` (bool) and `calibrationPosture` (`'UPRIGHT'`, `'RECLINING'` or `'LYING_DOWN'`) are allowed on create (in `hasOnly`, not `hasAll`, so older documents stay valid) and are absent from the update `affectedKeys()` allowlist, so a saved profile cannot later be relabelled as validated.
 
 ## 2. The "Dirty Dozen" Adversarial Payloads
 Each item is exercised by `firestore.test.js`.
@@ -27,4 +28,4 @@ Each item is exercised by `firestore.test.js`.
 11. **Value Type Poisoning on Update**: Updating `isActive` to `"yes"` (string instead of bool) -> Reject (`isValidCalibrationProfile(incoming())`).
 12. **Unbounded or Mistyped Lists**: `clusterPoints` with 100 items, `sectionLoads` with 13 items, or a number/map element at any index -> Reject.
 
-Additional cases: blink settings with `intentionalBlinkMinMs: 1000` or inverted thresholds (`close 0.7`, `open 0.5`) -> Reject; the largest valid session (12 section loads, 40 cluster points) and a batched exclusive activation (one profile on, the others off) -> Accept.
+Additional cases: `heldOutValidated: "yes"` or `calibrationPosture: "HANDSTAND"` on create, or flipping `heldOutValidated`/`calibrationPosture` on update -> Reject; blink settings with `intentionalBlinkMinMs: 1000` or inverted thresholds (`close 0.7`, `open 0.5`) -> Reject; the largest valid session (12 section loads, 40 cluster points) and a batched exclusive activation (one profile on, the others off) -> Accept.

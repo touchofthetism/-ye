@@ -76,6 +76,15 @@
           "type": "boolean",
           "description": "Whether this profile is the active one. Activation is exclusive: the client deactivates every other profile in the same batched write."
         },
+        "heldOutValidated": {
+          "type": "boolean",
+          "description": "Optional. True only when the error metrics come from the 4 held-out validation targets; false (or absent, in records saved before the field existed) means they are the in-sample fit residual. Set on create only; the rules reject changing it later."
+        },
+        "calibrationPosture": {
+          "type": "string",
+          "enum": ["UPRIGHT", "RECLINING", "LYING_DOWN"],
+          "description": "Optional. GazePostureProfile the fit was recorded in (absent reads as UPRIGHT). Set on create only; the rules reject changing it later."
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time",

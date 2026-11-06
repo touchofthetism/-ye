@@ -15,11 +15,14 @@ import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.junit.After
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.LooperMode
+import java.net.InetSocketAddress
+import java.net.Socket
 
 @RunWith(RobolectricTestRunner::class)
 @Config(manifest = Config.NONE)
@@ -32,6 +35,16 @@ abstract class FirestoreEmulatorTestBase {
 
     @Before
     open fun setUpFirebase() {
+        // Local runs without `firebase emulators:start` skip these tests instead of failing the whole task
+        // (failFast). CI starts the emulators with `firebase emulators:exec`, so there an unreachable
+        // emulator is a real failure and is not skipped.
+        if (System.getenv("CI") == null) {
+            assumeTrue(
+                "Firebase emulators not reachable on $EMULATOR_HOST:$AUTH_PORT / $FIRESTORE_PORT; " +
+                    "start them with: firebase emulators:start --only firestore,auth --project $PROJECT_ID",
+                isPortOpen(AUTH_PORT) && isPortOpen(FIRESTORE_PORT)
+            )
+        }
         val context = ApplicationProvider.getApplicationContext<Context>()
         val resId = context.resources.getIdentifier("firestore_database_id", "string", context.packageName)
         databaseId = if (resId != 0) context.getString(resId) else "ai-studio-android-d0cf7547-6eb4-4be2-8887-5894b4be11fe"
@@ -64,7 +77,8 @@ abstract class FirestoreEmulatorTestBase {
 
     @After
     open fun tearDownFirebase() {
-        auth.signOut()
+        // Not initialized when setUpFirebase skipped the test (emulators not running).
+        if (::auth.isInitialized) auth.signOut()
     }
 
     protected suspend fun signInTestUser(email: String): String = withContext(Dispatchers.IO) {
@@ -76,6 +90,13 @@ abstract class FirestoreEmulatorTestBase {
             }
             checkNotNull(result.user?.uid) { "User auth failed" }
         }
+    }
+
+    private fun isPortOpen(port: Int): Boolean = try {
+        Socket().use { it.connect(InetSocketAddress(EMULATOR_HOST, port), PROBE_TIMEOUT_MS) }
+        true
+    } catch (unused: java.io.IOException) {
+        false
     }
 
     protected fun Throwable.unwrapFirestoreException(): FirebaseFirestoreException? {
@@ -94,5 +115,6 @@ abstract class FirestoreEmulatorTestBase {
         const val PROJECT_ID = "demo-no-project"
         const val DEFAULT_PASSWORD = "password123"
         const val AUTH_TIMEOUT_MS = 5000L
+        const val PROBE_TIMEOUT_MS = 300
     }
 }

@@ -69,6 +69,10 @@ service cloud.firestore {
              // minimum must stay below 800 ms; 700 ms matches the client's blink-timing setter.
              data.intentionalBlinkMinMs is int && data.intentionalBlinkMinMs >= 150 && data.intentionalBlinkMinMs <= 700 &&
              data.isActive is bool &&
+             // Optional (records saved before these fields existed omit them and read back as
+             // not validated / UPRIGHT). Both are set on create only; the update rule keeps them immutable.
+             (!('heldOutValidated' in data) || data.heldOutValidated is bool) &&
+             (!('calibrationPosture' in data) || data.calibrationPosture in ['UPRIGHT', 'RECLINING', 'LYING_DOWN']) &&
              data.createdAt is timestamp && data.createdAt <= request.time &&
              data.updatedAt is timestamp && data.updatedAt <= request.time;
     }
@@ -110,7 +114,8 @@ service cloud.firestore {
                        incoming().keys().hasOnly([
                          'userId', 'name', 'deviceModel', 'matrixCoeffs', 'baselineEyeDistancePx',
                          'meanErrorMm', 'meanErrorPct', 'maxErrorPct', 'closeBlinkThreshold', 'openBlinkThreshold',
-                         'intentionalBlinkMinMs', 'isActive', 'createdAt', 'updatedAt'
+                         'intentionalBlinkMinMs', 'isActive', 'heldOutValidated', 'calibrationPosture',
+                         'createdAt', 'updatedAt'
                        ]) &&
                        // Server timestamps only (FieldValue.serverTimestamp()); client clocks cannot backdate records.
                        incoming().createdAt == request.time &&

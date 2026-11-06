@@ -2,6 +2,8 @@ package com.example.data.repository
 
 import com.example.base.FirestoreEmulatorTestBase
 import com.example.data.model.CalibrationProfile
+import com.example.data.model.GazePostureProfile
+import com.example.data.model.calibrationPostureProfile
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -58,6 +60,41 @@ class EyeTrackingRepositoryRoundTripTest : FirestoreEmulatorTestBase() {
         }
         val fetched = withTimeout(TIMEOUT_MS) { repository.getCalibrationProfileById(uid, profileId).getOrThrow() }
         assertEquals(false, fetched?.isActive)
+    }
+
+    // A178 / A1: the hand-built create payload dropped both fields, so synced profiles read back as
+    // "not validated" and UPRIGHT (and firestore.rules' hasOnly would have rejected them).
+    @Test
+    fun heldOutValidatedAndCalibrationPosture_survivePersistence() = runBlocking {
+        val uid = signInTestUser(freshEmail())
+        val repository = EyeTrackingRepository(firestore, auth)
+        val validatedId = "cal_${UUID.randomUUID().toString().replace("-", "").take(12)}"
+        val unvalidatedId = "cal_${UUID.randomUUID().toString().replace("-", "").take(12)}"
+
+        withTimeout(TIMEOUT_MS) {
+            repository.createCalibrationProfile(
+                CalibrationProfile(
+                    id = validatedId, userId = uid, name = "Validated Reclining", isActive = false,
+                    heldOutValidated = true, calibrationPosture = GazePostureProfile.RECLINING.name
+                )
+            ).getOrThrow()
+            repository.createCalibrationProfile(
+                CalibrationProfile(
+                    id = unvalidatedId, userId = uid, name = "Quick Fit", isActive = false,
+                    heldOutValidated = false, calibrationPosture = "NOT_A_POSTURE"
+                )
+            ).getOrThrow()
+        }
+
+        val validated = withTimeout(TIMEOUT_MS) { repository.getCalibrationProfileById(uid, validatedId).getOrThrow() }
+        assertNotNull(validated)
+        assertTrue("heldOutValidated=true must survive a Firestore round trip", validated!!.heldOutValidated)
+        assertEquals(GazePostureProfile.RECLINING, validated.calibrationPostureProfile())
+
+        val unvalidated = withTimeout(TIMEOUT_MS) { repository.getCalibrationProfileById(uid, unvalidatedId).getOrThrow() }
+        assertFalse(unvalidated!!.heldOutValidated)
+        // Unknown names are stored as UPRIGHT (the only values the rules accept are the enum names).
+        assertEquals(GazePostureProfile.UPRIGHT.name, unvalidated.calibrationPosture)
     }
 
     private companion object {

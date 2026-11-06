@@ -7,8 +7,10 @@ import com.example.R
 import com.example.data.model.AnalysisResolutionTier
 import com.example.data.model.CalibrationProfile
 import com.example.data.model.DEFAULT_AFFINE_MATRIX_2X6
+import com.example.data.model.InteractionSettings
 import com.example.data.model.GazeFeatureVector
 import com.example.data.model.GazeFilterMode
+import com.example.data.model.GazePostureProfile
 import com.example.data.model.GazeTriggerMode
 import com.example.data.model.TrackingSession
 import com.example.data.repository.EyeTrackingRepository
@@ -753,5 +755,69 @@ class VmRegressionTest {
         val banner = vm.statusBannerMessage.value.orEmpty()
         assertTrue(banner, banner.contains("${LocalTelemetryStore.MAX_LOCAL_SESSIONS} most recent sessions"))
         assertEquals(LocalTelemetryStore.MAX_LOCAL_SESSIONS, store.loadLocalSessions(user).size)
+    }
+
+    // --- Integration: A101 / A185 / A225: interaction settings survive a restart, per account --------------------
+
+    @Test
+    fun `interaction settings are saved per account and restored through the setter ranges`() {
+        val store = LocalTelemetryStore(context)
+        val user = freshUser()
+        val first = newVm(user, store)
+        first.setDwellTriggerDuration(1850L)
+        first.setDwellSensitivityMultiplier(1.6f)
+        first.setTriggerMode(GazeTriggerMode.entries.last())
+        first.setGazeFilterMode(GazeFilterMode.KALMAN)
+        first.setPostureProfile(GazePostureProfile.RECLINING)
+        var t = 2_000_000L
+        first.processIncomingFeatureFrame(face(t, brow = 0.30f)); t += 33L
+        first.calibrateNeutralBrowBaseline()
+        first.processIncomingFeatureFrame(face(t, brow = 0.40f)); t += 33L
+        first.calibrateRaisedBrowPeak()
+        val saved = first.liveHudState.value
+        assertEquals(0.30f, saved.neutralBrowRatio, 1e-4f)
+        assertEquals(0.40f, saved.raisedBrowRatio, 1e-4f)
+
+        // A new ViewModel for the same account (app restart) starts from the saved settings
+        val restored = newVm(user, store).liveHudState.value
+        assertEquals(1850L, restored.dwellTriggerMs)
+        assertEquals(saved.activeDwellPreset, restored.activeDwellPreset)
+        assertEquals(1.6f, restored.dwellSensitivityRadiusMultiplier, 1e-4f)
+        assertEquals(GazeTriggerMode.entries.last(), restored.triggerMode)
+        assertEquals(GazeFilterMode.KALMAN, restored.filterMode)
+        assertEquals(GazePostureProfile.RECLINING, restored.activePosture)
+        assertEquals(0.30f, restored.neutralBrowRatio, 1e-4f)
+        assertEquals(0.40f, restored.raisedBrowRatio, 1e-4f)
+
+        // Another account on the same device keeps the defaults
+        val other = newVm(freshUser(), store).liveHudState.value
+        assertEquals(1000L, other.dwellTriggerMs)
+        assertEquals(GazeFilterMode.ONE_EURO, other.filterMode)
+        assertEquals(GazePostureProfile.UPRIGHT, other.activePosture)
+    }
+
+    @Test
+    fun `restored interaction settings are clamped and impossible brow ratios are ignored`() {
+        val store = LocalTelemetryStore(context)
+        val user = freshUser()
+        store.saveInteractionSettings(
+            user,
+            InteractionSettings(
+                dwellTriggerMs = 50L,
+                dwellSensitivityRadiusMultiplier = 9f,
+                neutralBrowRatio = 0.45f,
+                raisedBrowRatio = 0.46f // less than the minimum raise separation above neutral
+            )
+        )
+        val hud = newVm(user, store).liveHudState.value
+        assertEquals(400L, hud.dwellTriggerMs)
+        assertEquals(2.0f, hud.dwellSensitivityRadiusMultiplier, 1e-4f)
+        assertEquals(0.34f, hud.neutralBrowRatio, 1e-4f)
+        assertEquals(0.42f, hud.raisedBrowRatio, 1e-4f)
+
+        store.saveInteractionSettings(user, InteractionSettings(dwellTriggerMs = 99_999L, dwellSensitivityRadiusMultiplier = 0.1f))
+        val clampedHigh = newVm(user, store).liveHudState.value
+        assertEquals(2500L, clampedHigh.dwellTriggerMs)
+        assertEquals(0.6f, clampedHigh.dwellSensitivityRadiusMultiplier, 1e-4f)
     }
 }

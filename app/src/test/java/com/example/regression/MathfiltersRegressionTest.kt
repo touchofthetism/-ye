@@ -72,6 +72,43 @@ class MathfiltersRegressionTest {
         assertFalse(GazeCalibrationMath.qualifiesFor3x3Grid(metrics.meanErrorPct, metrics.maxErrorPct))
     }
 
+    // Integration (honest metrics): the held-out means were floored at 1.5 % and 2 mm, so a better fit was
+    // reported as exactly the floor. They are now the measured values; only a > 100 % cap remains.
+    @Test
+    fun `validation metrics report the measured error without 1_5 percent or 2 mm floors`() {
+        val perfect = GazeCalibrationMath.evaluateHeldOutValidation(
+            DEFAULT_AFFINE_MATRIX_2X6, listOf(Pair(neutralFeature, Pair(0.50f, 0.50f))), 148.0
+        )
+        assertEquals(0.0, perfect.meanErrorPct, 1e-12)
+        assertEquals(0.0, perfect.maxErrorPct, 1e-12)
+        assertEquals(0.0, perfect.approxMeanErrorMm, 1e-12)
+
+        // 0.5 % horizontal error on a 71.3 mm wide screen = 0.3565 mm
+        val small = GazeCalibrationMath.evaluateHeldOutValidation(
+            DEFAULT_AFFINE_MATRIX_2X6, listOf(Pair(neutralFeature, Pair(0.505f, 0.50f))), 148.0,
+            screenWidthMm = 71.3, screenHeightMm = 158.4
+        )
+        assertEquals(0.5, small.meanErrorPct, 1e-4)
+        assertEquals(0.5, small.maxErrorPct, 1e-4)
+        assertEquals(0.3565, small.approxMeanErrorMm, 1e-4)
+        assertEquals(GazeCalibrationMath.gridLayoutLabel(true), small.recommendedGridDesc)
+
+        // An off-screen target gives > 100 % (141 %): reported as the 100 % cap
+        val absurd = GazeCalibrationMath.evaluateHeldOutValidation(
+            DEFAULT_AFFINE_MATRIX_2X6, listOf(Pair(neutralFeature, Pair(1.5f, 1.5f))), 148.0
+        )
+        assertEquals(GazeCalibrationMath.MAX_REPORTED_ERROR_PCT, absurd.meanErrorPct, 0.0)
+        assertEquals(GazeCalibrationMath.MAX_REPORTED_ERROR_PCT, absurd.maxErrorPct, 0.0)
+
+        // A non-finite feature is not a measurement: NaN, never a made-up value
+        val broken = GazeCalibrationMath.evaluateHeldOutValidation(
+            DEFAULT_AFFINE_MATRIX_2X6, listOf(Pair(neutralFeature.copy(gx = Double.NaN), Pair(0.5f, 0.5f))), 148.0
+        )
+        assertTrue(broken.meanErrorPct.isNaN())
+        assertTrue(broken.approxMeanErrorMm.isNaN())
+        assertFalse(GazeCalibrationMath.qualifiesFor3x3Grid(broken.meanErrorPct, broken.maxErrorPct))
+    }
+
     // A11: real (landscape) screen dimensions are used as given, without the 55 x 110 mm floors.
     @Test
     fun `approximate mm error uses the supplied screen size without arbitrary floors`() {

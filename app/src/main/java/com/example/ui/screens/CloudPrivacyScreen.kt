@@ -80,13 +80,14 @@ internal fun formatSensitivityLabel(multiplier: Float): String =
     String.format(Locale.US, "%.2f× (%d dp)", multiplier, (14f * multiplier).roundToInt())
 
 /**
- * Saved error is held-out validation error only when the wizard ran the 4-point validation; otherwise it is the
- * in-sample fit residual, so the label does not claim validation.
+ * Saved error is held-out validation error only when the wizard ran the 4-point validation
+ * ([CalibrationProfile.heldOutValidated]); otherwise it is the in-sample fit residual, and the label says so.
  */
 internal fun formatProfileErrorLine(profile: CalibrationProfile): String = String.format(
     Locale.US,
-    "%s • Calib. error (fit, or held-out if validated): mean ±%.1f%% (approx. ~%.1fmm) • worst ±%.1f%%",
+    "%s • Calib. error (%s): mean ±%.1f%% (approx. ~%.1fmm) • worst ±%.1f%%",
     profile.deviceModel,
+    if (profile.heldOutValidated) "held-out validation" else "in-sample fit (unvalidated)",
     profile.meanErrorPct,
     profile.meanErrorMm,
     profile.maxErrorPct
@@ -110,28 +111,12 @@ internal fun formatSessionSummaryLine(session: TrackingSession): String = String
 )
 
 /**
- * Index of the single row to mark as the loaded calibration, or -1. Names are not unique (every wizard run defaults
- * to "<model> Profile"), so among same-named rows the one whose device model and saved errors match the values the
- * engine loaded wins; if none matches exactly, the first same-named row is used.
+ * Index of the single row to mark as the loaded calibration, or -1. Rows are matched by the id of the profile the
+ * engine applied ([LiveGazeHudState.activeProfileId], null = default matrix): names are not unique (every wizard
+ * run defaults to "<model> Profile"), and unvalidated profiles expose no HUD metrics to tell same-named rows apart.
  */
-internal fun indexOfActiveProfile(
-    profiles: List<CalibrationProfile>,
-    activeProfileName: String,
-    activeDeviceModel: String,
-    activeMeanErrorPct: Float?,
-    activeMaxErrorPct: Float?,
-    activeErrorMm: Double?
-): Int {
-    val sameName = profiles.indices.filter { profiles[it].name == activeProfileName }
-    if (sameName.size <= 1) return sameName.firstOrNull() ?: -1
-    return sameName.firstOrNull { i ->
-        val p = profiles[i]
-        p.deviceModel == activeDeviceModel &&
-            p.meanErrorPct.toFloat() == activeMeanErrorPct &&
-            p.maxErrorPct.toFloat() == activeMaxErrorPct &&
-            p.meanErrorMm == activeErrorMm
-    } ?: sameName.first()
-}
+internal fun indexOfActiveProfile(profiles: List<CalibrationProfile>, activeProfileId: String?): Int =
+    if (activeProfileId.isNullOrBlank()) -1 else profiles.indexOfFirst { it.id == activeProfileId }
 
 @Composable
 fun CloudPrivacyScreen(
@@ -191,11 +176,7 @@ fun CloudPrivacyScreen(
 
         SavedProfilesCard(
             profilesState = profilesState,
-            activeProfileName = hudState.activeProfileName,
-            activeDeviceModel = hudState.activeProfileDeviceModel,
-            activeMeanErrorPct = hudState.activeErrorRadiusPct,
-            activeMaxErrorPct = hudState.activeMaxQuadrantErrorPct,
-            activeErrorMm = hudState.activeErrorMm,
+            activeProfileId = hudState.activeProfileId,
             onActivateProfile = onActivateProfile,
             onRequestDeleteProfile = { profile ->
                 pendingDestructive = PendingDestructiveAction.DeleteProfile(profile.id, profile.name)
@@ -565,11 +546,7 @@ private fun PrivacySettingsCard(
 @Composable
 private fun SavedProfilesCard(
     profilesState: UiDataState<List<CalibrationProfile>>,
-    activeProfileName: String,
-    activeDeviceModel: String,
-    activeMeanErrorPct: Float?,
-    activeMaxErrorPct: Float?,
-    activeErrorMm: Double?,
+    activeProfileId: String?,
     onActivateProfile: (CalibrationProfile) -> Unit,
     onRequestDeleteProfile: (CalibrationProfile) -> Unit
 ) {
@@ -610,14 +587,7 @@ private fun SavedProfilesCard(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     } else {
-                        val activeIndex = indexOfActiveProfile(
-                            profiles = profilesState.data,
-                            activeProfileName = activeProfileName,
-                            activeDeviceModel = activeDeviceModel,
-                            activeMeanErrorPct = activeMeanErrorPct,
-                            activeMaxErrorPct = activeMaxErrorPct,
-                            activeErrorMm = activeErrorMm
-                        )
+                        val activeIndex = indexOfActiveProfile(profilesState.data, activeProfileId)
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             profilesState.data.forEachIndexed { index, profile ->
                                 val isCurrent = index == activeIndex

@@ -13,6 +13,7 @@ import com.example.data.model.DEFAULT_AFFINE_MATRIX_2X6
 import com.example.data.model.FixationClusterPoint
 import com.example.data.model.GazeFeatureVector
 import com.example.data.model.GazePostureProfile
+import com.example.data.model.InteractionSettings
 import com.example.data.model.SectionDwellSummary
 import com.example.data.model.SectionPassageItem
 import com.example.data.model.TrackingSession
@@ -417,6 +418,7 @@ class EyeTrackingViewModel(
     )
 
     init {
+        restoreInteractionSettings()
         val localProfiles = _localProfilesFlow.value
         val localInitial = localProfiles.firstOrNull { it.id == selectedProfileId }
             ?: localProfiles.firstOrNull { it.isActive }
@@ -443,6 +445,54 @@ class EyeTrackingViewModel(
 
     fun setTriggerMode(mode: com.example.data.model.GazeTriggerMode) {
         _liveHudState.update { it.copy(triggerMode = mode) }
+        persistInteractionSettings()
+    }
+
+    /**
+     * Restores this account's saved dwell, trigger, filter, posture and brow settings (A101). The store
+     * returns values unclamped, so they pass through the setters' own ranges; brow ratios that no valid
+     * calibration could have produced are ignored and the defaults kept.
+     */
+    private fun restoreInteractionSettings() {
+        val saved = localStore?.loadInteractionSettings(currentUserId) ?: return
+        val neutral = saved.neutralBrowRatio
+        val raised = saved.raisedBrowRatio
+        val browValid = neutral in 0.20f..0.52f && raised in 0.24f..0.62f &&
+            raised >= neutral + MIN_BROW_RAISE_SEPARATION
+        if (browValid) {
+            browDetector.neutralBrowRatio = neutral
+            browDetector.raisedBrowRatio = raised
+        }
+        _liveHudState.update {
+            it.copy(
+                dwellTriggerMs = saved.dwellTriggerMs.coerceIn(400L, 2500L),
+                dwellSensitivityRadiusMultiplier = saved.dwellSensitivityRadiusMultiplier.coerceIn(0.6f, 2.0f),
+                activeDwellPreset = saved.activeDwellPreset,
+                triggerMode = saved.triggerMode,
+                filterMode = saved.filterMode,
+                activePosture = saved.activePosture,
+                neutralBrowRatio = if (browValid) neutral else it.neutralBrowRatio,
+                raisedBrowRatio = if (browValid) raised else it.raisedBrowRatio
+            )
+        }
+    }
+
+    /** Saves the current interaction settings for this account (cleared with the local vault). */
+    private fun persistInteractionSettings() {
+        val hud = _liveHudState.value
+        localStore?.saveInteractionSettings(
+            currentUserId,
+            InteractionSettings(
+                dwellTriggerMs = hud.dwellTriggerMs,
+                dwellSensitivityRadiusMultiplier = hud.dwellSensitivityRadiusMultiplier,
+                activeDwellPreset = hud.activeDwellPreset,
+                triggerMode = hud.triggerMode,
+                filterMode = hud.filterMode,
+                activePosture = hud.activePosture,
+                neutralBrowRatio = hud.neutralBrowRatio,
+                raisedBrowRatio = hud.raisedBrowRatio
+            )
+        )
     }
 
     fun cycleOverlayVisualMode() {
@@ -476,6 +526,7 @@ class EyeTrackingViewModel(
         _liveHudState.update {
             it.copy(neutralBrowRatio = currentRatio, raisedBrowRatio = raised)
         }
+        persistInteractionSettings()
         _statusBannerMessage.value = "Captured Neutral Brow baseline (${String.format(Locale.US, "%.3f", currentRatio)}). Now raise eyebrows and tap 'Sample Raised Brow'."
     }
 
@@ -496,6 +547,7 @@ class EyeTrackingViewModel(
         _liveHudState.update {
             it.copy(raisedBrowRatio = currentRatio)
         }
+        persistInteractionSettings()
         _statusBannerMessage.value = "Expression calibrated: Neutral ${String.format(Locale.US, "%.3f", neutral)} → Raised ${String.format(Locale.US, "%.3f", currentRatio)} (Trigger @ ${String.format(Locale.US, "%.3f", browDetector.raiseThreshold)})."
     }
 
@@ -1223,6 +1275,7 @@ class EyeTrackingViewModel(
 
     fun setPostureProfile(posture: com.example.data.model.GazePostureProfile) {
         _liveHudState.update { it.copy(activePosture = posture) }
+        persistInteractionSettings()
         _statusBannerMessage.value = String.format(
             Locale.US,
             "Posture Profile: %s (Y-bias %+.3f applied relative to the calibration posture).",
@@ -1235,6 +1288,7 @@ class EyeTrackingViewModel(
         // The newly selected filter starts from the next sample, never from state left over from its last use
         if (mode != _liveHudState.value.filterMode) resetScreenFilters()
         _liveHudState.update { it.copy(filterMode = mode) }
+        persistInteractionSettings()
         _statusBannerMessage.value = "Gaze Stabilization: ${mode.label}"
     }
 
@@ -1307,6 +1361,7 @@ class EyeTrackingViewModel(
         _liveHudState.update {
             it.copy(dwellTriggerMs = clamped, activeDwellPreset = matchedPreset)
         }
+        persistInteractionSettings()
     }
 
     fun setDwellSpeedPreset(preset: com.example.data.model.DwellSpeedPreset) {
@@ -1317,6 +1372,7 @@ class EyeTrackingViewModel(
                 activeDwellPreset = preset
             )
         }
+        persistInteractionSettings()
         _statusBannerMessage.value = "Dwell Speed Preset: ${preset.title} (${preset.durationMs}ms • ${(preset.radiusToleranceMultiplier * 100).toInt()}% tolerance)"
     }
 
@@ -1325,6 +1381,7 @@ class EyeTrackingViewModel(
         _liveHudState.update {
             it.copy(dwellSensitivityRadiusMultiplier = clamped)
         }
+        persistInteractionSettings()
     }
 
     fun setBlinkTimingThreshold(minCommandMs: Long, closeThresh: Float) {

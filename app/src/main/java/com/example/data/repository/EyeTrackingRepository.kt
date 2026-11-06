@@ -6,6 +6,7 @@ import com.example.R
 import com.example.data.model.CalibrationProfile
 import com.example.data.model.DEFAULT_AFFINE_MATRIX_2X6
 import com.example.data.model.TrackingSession
+import com.example.data.model.calibrationPostureProfile
 import com.google.firebase.Firebase
 import com.google.firebase.auth.auth
 import com.google.firebase.firestore.CollectionReference
@@ -147,6 +148,9 @@ class EyeTrackingRepository(
                 "openBlinkThreshold" to openBlinkThreshold,
                 "intentionalBlinkMinMs" to profile.intentionalBlinkMinMs.coerceIn(150L, MAX_INTENTIONAL_BLINK_MIN_MS),
                 "isActive" to profile.isActive,
+                // Read back by toObject; records saved without these keys read as not validated / UPRIGHT.
+                "heldOutValidated" to profile.heldOutValidated,
+                "calibrationPosture" to profile.calibrationPostureProfile().name,
                 "createdAt" to FieldValue.serverTimestamp(),
                 "updatedAt" to FieldValue.serverTimestamp()
             )

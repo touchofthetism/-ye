@@ -343,3 +343,27 @@ test("Owner: batched exclusive activation (one profile on, others off) is accept
   batch.update(col.doc("cal_new"), { isActive: false, updatedAt: serverNow() });
   await assertSucceeds(batch.commit());
 });
+
+test("Calibration: optional heldOutValidated / calibrationPosture are typed on create and immutable on update", async () => {
+  const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
+  const col = calibrations(aliceDb, ALICE_UID);
+
+  // The repository writes both keys; older documents without them stay valid.
+  const validated = { ...validCalibrationPayload(ALICE_UID), heldOutValidated: true, calibrationPosture: "RECLINING" };
+  await assertSucceeds(col.doc("cal_validated").set(validated));
+  await assertSucceeds(col.doc("cal_legacy").set(validCalibrationPayload(ALICE_UID)));
+  for (const posture of ["UPRIGHT", "LYING_DOWN"]) {
+    await assertSucceeds(col.doc(`cal_${posture}`).set({ ...validCalibrationPayload(ALICE_UID), heldOutValidated: false, calibrationPosture: posture }));
+  }
+
+  await assertFails(col.doc("cal_bad_flag").set({ ...validCalibrationPayload(ALICE_UID), heldOutValidated: "yes" }));
+  await assertFails(col.doc("cal_bad_posture").set({ ...validCalibrationPayload(ALICE_UID), calibrationPosture: "HANDSTAND" }));
+  await assertFails(col.doc("cal_num_posture").set({ ...validCalibrationPayload(ALICE_UID), calibrationPosture: 1 }));
+
+  // A saved profile cannot be flipped to "validated" (or re-postured) later; activation still works.
+  const unvalidatedRef = col.doc("cal_UPRIGHT");
+  await assertFails(unvalidatedRef.update({ heldOutValidated: true, updatedAt: serverNow() }));
+  await assertFails(unvalidatedRef.update({ calibrationPosture: "RECLINING", updatedAt: serverNow() }));
+  await assertFails(col.doc("cal_legacy").update({ heldOutValidated: true, updatedAt: serverNow() }));
+  await assertSucceeds(col.doc("cal_validated").update({ isActive: false, updatedAt: serverNow() }));
+});

@@ -588,6 +588,7 @@ fun AuthenticatedMainWorkbench(
                                 passageSections = viewModel.readingPassageSections,
                                 sectionSummaries = sectionSummaries,
                                 onUpdateLayoutHitSection = { viewModel.updateActiveReadingSectionFromLayout(it) },
+                                onUpdatePassageGazePoint = { viewModel.updatePassageGazePoint(it) },
                                 onClearReplay = { viewModel.clearSessionReplay() },
                                 onStartRecording = { viewModel.startAttentionRecording() },
                                 onStopAndSaveRecording = { viewModel.stopAndSaveAttentionSession() }
