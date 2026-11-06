@@ -2,6 +2,7 @@ package com.example.ui.viewmodel
 
 import android.os.Build
 import android.util.Log
+import androidx.compose.ui.geometry.Offset
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.model.AacActionTile
@@ -15,6 +16,7 @@ import com.example.data.model.GazePostureProfile
 import com.example.data.model.SectionDwellSummary
 import com.example.data.model.SectionPassageItem
 import com.example.data.model.TrackingSession
+import com.example.data.model.calibrationPostureProfile
 import com.example.data.repository.EyeTrackingRepository
 import com.example.data.repository.LocalTelemetryStore
 import com.example.domain.BenchmarkScorecard
@@ -72,10 +74,11 @@ data class CalibrationWizardState(
     val isSettlingDelay: Boolean = false,
     val fittedMatrix: List<Double> = DEFAULT_AFFINE_MATRIX_2X6,
     val capturedBaselineEyeDistPx: Double = 148.0,
-    val validationMeanErrorMm: Double = 13.4,
-    val validationMeanErrorPct: Double = 10.9,
-    val validationMaxErrorPct: Double = 14.2,
-    val recommendedGridLabel: String = "",
+    // NaN = not measured (the wizard sets these when it reaches COMPLETED_SUMMARY)
+    val validationMeanErrorMm: Double = Double.NaN,
+    val validationMeanErrorPct: Double = Double.NaN,
+    val validationMaxErrorPct: Double = Double.NaN,
+    val recommendedGridLabel: String = "Not validated",
     val draftProfileName: String = "Pixel 10 Pro XL Desk",
     // True only when the validation* metrics come from the 4 held-out targets. In 5-point-only mode
     // they are the in-sample residual on the fit targets themselves and must not be shown as validated.
@@ -106,6 +109,8 @@ data class LiveGazeHudState(
     val isDeletingCloudData: Boolean = false,
     val lastCloudDeletionSummary: String? = null,
     val activeProfileName: String = UNCALIBRATED_PROFILE_NAME,
+    // Id of the profile applied to the engine (null = default matrix), so screens can match rows by id
+    val activeProfileId: String? = null,
     val activeProfileDeviceModel: String = Build.MODEL?.takeIf { it.isNotBlank() } ?: "Pixel 10 Pro XL",
     // null = not validated (no calibration applied, or a 5-point fit without held-out validation).
     val activeErrorRadiusPct: Float? = null,
@@ -291,9 +296,9 @@ class EyeTrackingViewModel(
     // Posture the active matrix was calibrated in; only the posture difference is applied live
     private var calibrationPosture: GazePostureProfile = GazePostureProfile.UPRIGHT
     private val blinkDetector = BlinkHysteresisDetector(
-        closeThreshold = 0.45f,
-        openThreshold = 0.65f,
-        intentionalMinMs = 350L,
+        closeThreshold = DEFAULT_CLOSE_BLINK_THRESHOLD,
+        openThreshold = DEFAULT_OPEN_BLINK_THRESHOLD,
+        intentionalMinMs = DEFAULT_INTENTIONAL_BLINK_MIN_MS,
         maxCommandMs = 800L
     )
     private val browDetector = com.example.domain.BrowRaiseHysteresisDetector(
@@ -344,6 +349,8 @@ class EyeTrackingViewModel(
     private var onTileTriggeredCallback: ((AacActionTile) -> Unit)? = null
     private var layoutHitSectionId: String? = null
     private var readingLayoutAttached: Boolean = false
+    // Reticle normalized to the Attention passage Box (the heatmap frame); null = off the visible passage
+    private var layoutPassageGazePoint: Offset? = null
     // Normalized (root-overlay frame) tile centres, the reference for background drift correction
     private val tileCentersNorm = mutableMapOf<String, Pair<Float, Float>>()
     // This frame's smoothed gaze, so trigger side effects use the current position, not the previous frame's
@@ -518,10 +525,19 @@ class EyeTrackingViewModel(
         layoutHitSectionId = sectionId
     }
 
+    /**
+     * Reticle position normalized to the Attention passage Box (the frame the fixation heatmap is drawn in),
+     * or null while the reticle is off the visible passage. Fixation samples are recorded only in this frame.
+     */
+    fun updatePassageGazePoint(point: Offset?) {
+        layoutPassageGazePoint = point?.takeIf { it.x.isFinite() && it.y.isFinite() }
+    }
+
     /** Called when the Attention passage leaves composition: stop crediting section dwell. */
     fun detachReadingSectionLayout() {
         readingLayoutAttached = false
         layoutHitSectionId = null
+        layoutPassageGazePoint = null
     }
 
     fun updateAacTilePhrase(tileId: String, newTitle: String, newSpeechPhrase: String) {
@@ -540,16 +556,19 @@ class EyeTrackingViewModel(
         _liveHudState.update { it.copy(showRecalibrateNudge = false) }
     }
 
+    /**
+     * Physical size of the frame gaze normX/normY is normalized to (MainActivity's root content Box), used
+     * to convert calibration errors to mm. It is the measured frame on every model: substituting the full
+     * panel size would overstate mm errors. Bounds are orientation-agnostic (short side / long side), so
+     * a landscape frame keeps its real height.
+     */
     fun setDisplayPhysicalSizeMm(widthMm: Double, heightMm: Double) {
-        // Exact model only: Pixel 10, 10 Pro and 10 Pro Fold have different panels and use the measured size
-        val isPixel10ProXl = (Build.MODEL ?: "").trim().equals("Pixel 10 Pro XL", ignoreCase = true)
-        if (isPixel10ProXl) {
-            displayWidthMm = GazeCalibrationMath.PIXEL_10_PRO_XL_WIDTH_MM
-            displayHeightMm = GazeCalibrationMath.PIXEL_10_PRO_XL_HEIGHT_MM
-        } else {
-            displayWidthMm = widthMm.coerceIn(50.0, 400.0)
-            displayHeightMm = heightMm.coerceIn(90.0, 600.0)
-        }
+        if (!widthMm.isFinite() || !heightMm.isFinite() || widthMm <= 0.0 || heightMm <= 0.0) return
+        val landscape = widthMm > heightMm
+        val shortMm = minOf(widthMm, heightMm).coerceIn(MIN_FRAME_SIDE_MM, MAX_FRAME_SHORT_SIDE_MM)
+        val longMm = maxOf(widthMm, heightMm).coerceIn(MIN_FRAME_SIDE_MM, MAX_FRAME_LONG_SIDE_MM)
+        displayWidthMm = if (landscape) longMm else shortMm
+        displayHeightMm = if (landscape) shortMm else longMm
     }
 
     fun registerTileTriggerListener(listener: (AacActionTile) -> Unit) {
@@ -926,7 +945,7 @@ class EyeTrackingViewModel(
             if (!syntheticRepeat || lastSimulatorInputMs >= targetStartTimeMs) {
                 advanceCalibrationIfActive(feature, now, simulatedFrame)
             }
-            recordAttentionSampleIfActive(smoothedX, smoothedY, now, simulatedFrame)
+            recordAttentionSampleIfActive(smoothedX, smoothedY, now, simulatedFrame, eyesOpen = !isEyelidClosing)
         }
     }
 
@@ -977,8 +996,7 @@ class EyeTrackingViewModel(
         activeMatrix = updated
         // Later background drift updates stay near the recentered mapping
         driftAnchorMatrix = updated
-        screenGazeFilter.reset()
-        screenKalmanFilter.reset()
+        resetScreenFilters()
         edgePinnedDurationMs = 0L
         _statusBannerMessage.value = String.format(
             Locale.US,
@@ -1213,8 +1231,15 @@ class EyeTrackingViewModel(
     }
 
     fun setGazeFilterMode(mode: com.example.data.model.GazeFilterMode) {
+        // The newly selected filter starts from the next sample, never from state left over from its last use
+        if (mode != _liveHudState.value.filterMode) resetScreenFilters()
         _liveHudState.update { it.copy(filterMode = mode) }
         _statusBannerMessage.value = "Gaze Stabilization: ${mode.label}"
+    }
+
+    private fun resetScreenFilters() {
+        screenGazeFilter.reset()
+        screenKalmanFilter.reset()
     }
 
     fun runBenchmarkSuite() {
@@ -1346,6 +1371,10 @@ class EyeTrackingViewModel(
     }
 
     fun cancelCalibrationWizard() {
+        // Only a running collection can be cancelled. A late cancel (e.g. the screen disposing on the frame
+        // the wizard reached COMPLETED_SUMMARY) must not erase the unsaved summary.
+        val step = _calibrationState.value.step
+        if (step != CalibrationFlowStep.FIT_5_POINTS && step != CalibrationFlowStep.VALIDATE_4_POINTS) return
         _calibrationState.update {
             CalibrationWizardState(
                 step = CalibrationFlowStep.IDLE,
@@ -1369,6 +1398,7 @@ class EyeTrackingViewModel(
         driftAnchorMatrix = snapshot.driftAnchorMatrix
         activeBaselineEyeDistPx = snapshot.baselineEyeDistPx
         calibrationPosture = snapshot.calibrationPosture
+        resetScreenFilters()
     }
 
     /**
@@ -1519,6 +1549,7 @@ class EyeTrackingViewModel(
                         driftAnchorMatrix = solvedMatrix
                         activeBaselineEyeDistPx = avgEyeDist
                         calibrationPosture = pendingCalibrationPosture
+                        resetScreenFilters()
                         _calibrationState.update {
                             it.copy(
                                 step = CalibrationFlowStep.VALIDATE_4_POINTS,
@@ -1580,6 +1611,13 @@ class EyeTrackingViewModel(
         val cal = _calibrationState.value
         // Only a finished wizard has a fit to save (a second Save tap would persist the defaults)
         if (cal.step != CalibrationFlowStep.COMPLETED_SUMMARY) return
+        if (!cal.validationMeanErrorMm.isFinite() || !cal.validationMeanErrorPct.isFinite() ||
+            !cal.validationMaxErrorPct.isFinite()
+        ) {
+            // Nothing was measured: never persist NaN (the local vault cannot store it) or a made-up value
+            _statusBannerMessage.value = "Calibration error was not measured — run the calibration again before saving."
+            return
+        }
         val hud = _liveHudState.value
         val deviceName = Build.MODEL?.takeIf { it.isNotBlank() } ?: "Pixel 10 Pro XL"
         val simulated = calibrationUsedSimulatedFrames
@@ -1606,19 +1644,34 @@ class EyeTrackingViewModel(
             closeBlinkThreshold = blinkDetector.closeThreshold.toDouble(),
             openBlinkThreshold = blinkDetector.openThreshold.toDouble(),
             intentionalBlinkMinMs = blinkDetector.intentionalMinMs,
-            isActive = true
+            isActive = true,
+            // Persisted, so a quick fit's in-sample residual is never read back as validated accuracy
+            heldOutValidated = cal.metricsAreHeldOut,
+            calibrationPosture = pendingCalibrationPosture.name
         )
         sessionProfileMeta[profileId] = SessionProfileMeta(
             heldOutValidated = cal.metricsAreHeldOut,
             calibrationPosture = pendingCalibrationPosture
         )
+        val localProfiles = _localProfilesFlow.value
+        val evictionNote = if (
+            localStore != null &&
+            localProfiles.size >= LocalTelemetryStore.MAX_LOCAL_PROFILES &&
+            localProfiles.none { it.id == profileId }
+        ) {
+            " The on-device vault keeps the ${LocalTelemetryStore.MAX_LOCAL_PROFILES} most recent profiles, " +
+                "so the oldest on-device profile was removed."
+        } else {
+            ""
+        }
 
         // Commit: the wizard override (if any) ends and the saved profile becomes the explicit choice
         preWizardSnapshot = null
         selectedProfileId = profileId
         applyProfileToEngine(profile)
-        // Always persist to on-device LocalTelemetryStore so sync-off users retain calibration across restarts
-        localStore?.saveLocalProfile(currentUserId, profile)
+        // Always persist to on-device LocalTelemetryStore so sync-off users retain calibration across restarts.
+        // The cloud upload uses the entry exactly as persisted (same id), so the merged list de-duplicates them.
+        val persisted = localStore?.saveLocalProfile(currentUserId, profile) ?: profile
         _localProfilesFlow.value = localStore?.loadLocalProfiles(currentUserId).orEmpty()
 
         _calibrationState.value = CalibrationWizardState(
@@ -1627,22 +1680,23 @@ class EyeTrackingViewModel(
         )
 
         if (simulated) {
-            _statusBannerMessage.value = "Simulated calibration saved on this device only (not synced, labelled SIMULATED)."
+            _statusBannerMessage.value =
+                "Simulated calibration saved on this device only (not synced, labelled SIMULATED).$evictionNote"
             return
         }
         if (!hud.cloudSyncEnabled) {
-            _statusBannerMessage.value = "Calibration saved to on-device storage (Cloud Sync is paused)."
+            _statusBannerMessage.value = "Calibration saved to on-device storage (Cloud Sync is paused).$evictionNote"
             return
         }
 
         viewModelScope.launch {
-            val res = repository.createCalibrationProfile(profile)
+            // An active profile's create also deactivates every other active cloud profile in the same batch
+            val res = repository.createCalibrationProfile(persisted)
             if (res.isSuccess) {
-                // Exactly one cloud profile stays active, so other devices and restarts agree
-                deactivateOtherCloudProfiles(keepId = res.getOrNull() ?: profileId)
-                _statusBannerMessage.value = "Calibration profile synced to Cloud Firestore & local vault."
+                _statusBannerMessage.value = "Calibration profile synced to Cloud Firestore & local vault.$evictionNote"
             } else {
-                _statusBannerMessage.value = "Saved locally; Cloud sync error: ${res.exceptionOrNull()?.localizedMessage}"
+                _statusBannerMessage.value =
+                    "Saved locally; Cloud sync error: ${res.exceptionOrNull()?.localizedMessage}$evictionNote"
             }
         }
     }
@@ -1657,8 +1711,8 @@ class EyeTrackingViewModel(
 
         if (_liveHudState.value.cloudSyncEnabled && profile.id.isNotBlank() && !profile.id.startsWith("local_")) {
             viewModelScope.launch {
+                // Exclusive: the same batch deactivates every other active cloud profile
                 repository.updateCalibrationActiveState(profile.id, true)
-                deactivateOtherCloudProfiles(keepId = profile.id)
             }
         }
         _statusBannerMessage.value = if (isHeldOutValidated(profile)) {
@@ -1674,21 +1728,16 @@ class EyeTrackingViewModel(
         }
     }
 
-    private suspend fun deactivateOtherCloudProfiles(keepId: String) {
-        val others = latestCloudProfiles.filter {
-            it.id.isNotBlank() && it.id != keepId && !it.id.startsWith("local_") && it.isActive
-        }
-        for (other in others) {
-            repository.updateCalibrationActiveState(other.id, false)
-        }
-    }
-
     private fun profileKey(profile: CalibrationProfile): String =
         profile.id.ifBlank { profile.name + profile.createdAt }
 
-    /** Unknown (persisted before this session) profiles keep their stored metrics. */
+    /**
+     * Whether the profile's error metrics are held-out validation results. Profiles saved in this session are
+     * known exactly (their cloud copy may lack the field); otherwise the persisted flag decides, and records
+     * saved before it existed read back as not validated.
+     */
     private fun isHeldOutValidated(profile: CalibrationProfile): Boolean =
-        sessionProfileMeta[profile.id]?.heldOutValidated ?: true
+        sessionProfileMeta[profile.id]?.heldOutValidated ?: profile.heldOutValidated
 
     /**
      * Applies the profile that should be active (the user's explicit choice, else the flagged active one,
@@ -1716,15 +1765,15 @@ class EyeTrackingViewModel(
             driftAnchorMatrix = profile.matrixCoeffs
         }
         activeBaselineEyeDistPx = profile.baselineEyeDistancePx
-        blinkDetector.closeThreshold = profile.closeBlinkThreshold.toFloat()
-        blinkDetector.openThreshold = profile.openBlinkThreshold.toFloat()
-        blinkDetector.intentionalMinMs = profile.intentionalBlinkMinMs
+        applyProfileBlinkSettings(profile)
         val meta = sessionProfileMeta[profile.id]
-        calibrationPosture = meta?.calibrationPosture ?: GazePostureProfile.UPRIGHT
+        calibrationPosture = meta?.calibrationPosture ?: profile.calibrationPostureProfile()
         appliedProfileKey = profileKey(profile)
         activeProfileId = profile.id
         recenterDeadlineMs = 0L
         recenterSamples.clear()
+        // The previous mapping's smoothed state must not blend into the new one
+        resetScreenFilters()
 
         // A 5-point fit without held-out validation has no validated accuracy (null), which keeps the
         // Control Deck on its protective grid; non-finite stored values are never shown as numbers.
@@ -1732,6 +1781,7 @@ class EyeTrackingViewModel(
         _liveHudState.update {
             it.copy(
                 activeProfileName = profile.name,
+                activeProfileId = profile.id.takeIf { id -> id.isNotBlank() },
                 activeProfileDeviceModel = profile.deviceModel,
                 activeErrorRadiusPct = if (validated) profile.meanErrorPct.finiteOrNull()?.toFloat() else null,
                 activeMaxQuadrantErrorPct = if (validated) profile.maxErrorPct.finiteOrNull()?.toFloat() else null,
@@ -1739,6 +1789,33 @@ class EyeTrackingViewModel(
                 hasActiveCalibration = true,
                 backgroundRecalibrationCount = 0
             )
+        }
+    }
+
+    /**
+     * Profiles can come from the cloud or from older clients, so their blink settings are checked before use:
+     * the thresholds only as a consistent Schmitt pair (re-open at least [MIN_BLINK_HYSTERESIS_GAP] above
+     * close), the command minimum only below the command maximum. Otherwise the engine defaults apply.
+     */
+    private fun applyProfileBlinkSettings(profile: CalibrationProfile) {
+        val close = profile.closeBlinkThreshold
+        val open = profile.openBlinkThreshold
+        val thresholdsValid = close.isFinite() && open.isFinite() &&
+            close in MIN_CLOSE_BLINK_THRESHOLD..MAX_CLOSE_BLINK_THRESHOLD &&
+            open <= MAX_OPEN_BLINK_THRESHOLD &&
+            open >= close + MIN_BLINK_HYSTERESIS_GAP
+        if (thresholdsValid) {
+            blinkDetector.closeThreshold = close.toFloat()
+            blinkDetector.openThreshold = open.toFloat()
+        } else {
+            blinkDetector.closeThreshold = DEFAULT_CLOSE_BLINK_THRESHOLD
+            blinkDetector.openThreshold = DEFAULT_OPEN_BLINK_THRESHOLD
+        }
+        val minMs = profile.intentionalBlinkMinMs
+        blinkDetector.intentionalMinMs = if (minMs < blinkDetector.maxCommandMs) {
+            minMs.coerceIn(MIN_INTENTIONAL_BLINK_MS, MAX_INTENTIONAL_BLINK_MIN_MS)
+        } else {
+            DEFAULT_INTENTIONAL_BLINK_MIN_MS
         }
     }
 
@@ -1752,15 +1829,17 @@ class EyeTrackingViewModel(
         driftAnchorMatrix = DEFAULT_AFFINE_MATRIX_2X6
         activeBaselineEyeDistPx = 148.0
         calibrationPosture = GazePostureProfile.UPRIGHT
-        blinkDetector.closeThreshold = 0.45f
-        blinkDetector.openThreshold = 0.65f
-        blinkDetector.intentionalMinMs = 350L
+        blinkDetector.closeThreshold = DEFAULT_CLOSE_BLINK_THRESHOLD
+        blinkDetector.openThreshold = DEFAULT_OPEN_BLINK_THRESHOLD
+        blinkDetector.intentionalMinMs = DEFAULT_INTENTIONAL_BLINK_MIN_MS
         recenterDeadlineMs = 0L
         recenterSamples.clear()
+        resetScreenFilters()
         val defaults = LiveGazeHudState()
         _liveHudState.update {
             it.copy(
                 activeProfileName = defaults.activeProfileName,
+                activeProfileId = null,
                 activeProfileDeviceModel = defaults.activeProfileDeviceModel,
                 activeErrorRadiusPct = null,
                 activeMaxQuadrantErrorPct = null,
@@ -1841,23 +1920,38 @@ class EyeTrackingViewModel(
         }
     }
 
-    private fun recordAttentionSampleIfActive(normX: Float, normY: Float, nowMs: Long, simulatedFrame: Boolean) {
+    /**
+     * [normX]/[normY] are in the root overlay frame and feed the top/middle/bottom zone stats. Fixation samples
+     * use the passage-frame point from [updatePassageGazePoint] (the frame the heatmap is drawn in) and are
+     * recorded only while it is on the passage and the eyes are open, so frozen closed-eye positions never
+     * extend a fixation.
+     */
+    private fun recordAttentionSampleIfActive(
+        normX: Float,
+        normY: Float,
+        nowMs: Long,
+        simulatedFrame: Boolean,
+        eyesOpen: Boolean
+    ) {
         val state = _attentionState.value
         if (!state.isRecording) return
         if (simulatedFrame) sessionUsedSimulatedFrames = true
 
         val dt = (nowMs - lastAttentionSampleMs).coerceIn(16L, 250L)
         lastAttentionSampleMs = nowMs
-        if (rawSessionGazeSamples.size >= MAX_SESSION_GAZE_SAMPLES) {
-            // Fold the older half into archived clusters instead of discarding it, so the saved session
-            // covers the whole recording (not just its last few minutes)
-            val olderHalf = rawSessionGazeSamples.subList(0, MAX_SESSION_GAZE_SAMPLES / 2)
-            archivedSessionClusters.addAll(
-                GazeCalibrationMath.clusterFixations(ArrayList(olderHalf), maxClusters = Int.MAX_VALUE)
-            )
-            olderHalf.clear()
+        val passagePoint = layoutPassageGazePoint?.takeIf { readingLayoutAttached && eyesOpen }
+        if (passagePoint != null) {
+            if (rawSessionGazeSamples.size >= MAX_SESSION_GAZE_SAMPLES) {
+                // Fold the older half into archived clusters instead of discarding it, so the saved session
+                // covers the whole recording (not just its last few minutes)
+                val olderHalf = rawSessionGazeSamples.subList(0, MAX_SESSION_GAZE_SAMPLES / 2)
+                archivedSessionClusters.addAll(
+                    GazeCalibrationMath.clusterFixations(ArrayList(olderHalf), maxClusters = Int.MAX_VALUE)
+                )
+                olderHalf.clear()
+            }
+            rawSessionGazeSamples.add(Triple(passagePoint.x, passagePoint.y, nowMs))
         }
-        rawSessionGazeSamples.add(Triple(normX, normY, nowMs))
 
         val topAdd = if (normY < 0.34f) dt else 0L
         val midAdd = if (normY in 0.34f..0.67f) dt else 0L
@@ -1875,7 +1969,9 @@ class EyeTrackingViewModel(
         }
 
         // Recompute live fixation clusters periodically so the Reading Lab heatmap renders in real time during recording
-        val liveClusters = if (rawSessionGazeSamples.size % 4 == 0 || state.computedClusters.isEmpty()) {
+        val liveClusters = if (
+            passagePoint != null && (rawSessionGazeSamples.size % 4 == 0 || state.computedClusters.isEmpty())
+        ) {
             GazeCalibrationMath.clusterFixations(rawSessionGazeSamples.takeLast(240))
         } else {
             state.computedClusters

@@ -66,6 +66,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.data.model.CalibrationTargetPoint
+import com.example.data.model.GazeFeatureVector
 import com.example.domain.GazeCalibrationMath
 import com.example.ui.viewmodel.CalibrationFlowStep
 import com.example.ui.viewmodel.CalibrationWizardState
@@ -267,33 +268,37 @@ private fun CalibrationIdleOverview(
                 )
 
                 Spacer(modifier = Modifier.height(14.dp))
-                // Null means "not validated" (no calibration applied yet): never show a number nobody measured.
+                // Null means "not validated": either no calibration is applied (default matrix) or the
+                // applied profile is a 5-point fit without held-out validation. Never show a number nobody
+                // measured, and never call an applied fit "not calibrated".
                 val meanErrPct: Float? = hudState.activeErrorRadiusPct
                 val worstErrPct: Float? = hudState.activeMaxQuadrantErrorPct
                 val meanErrMm: Double? = hudState.activeErrorMm
                 val meanErrText = formatErrorPctOrNull(meanErrPct?.toDouble())
                 val worstErrText = formatErrorPctOrNull(worstErrPct?.toDouble())
+                val fitOnly = hudState.hasActiveCalibration
+                val unmeasuredValue = if (fitOnly) NOT_VALIDATED_TEXT else NOT_CALIBRATED_TEXT
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     MetricBadgeCard(
                         label = "MEAN SCREEN ERR",
-                        value = meanErrText ?: NOT_CALIBRATED_TEXT,
-                        sub = if (meanErrText != null) {
-                            formatApproxMmOrNull(meanErrMm) ?: "mm not measured"
-                        } else {
-                            "Run calibration to measure"
+                        value = meanErrText ?: unmeasuredValue,
+                        sub = when {
+                            meanErrText != null -> formatApproxMmOrNull(meanErrMm) ?: "mm not measured"
+                            fitOnly -> "$FIT_ONLY_TEXT, run 5+4 validation to measure"
+                            else -> "Run calibration to measure"
                         },
                         modifier = Modifier.weight(1f)
                     )
                     MetricBadgeCard(
                         label = "WORST QUADRANT",
-                        value = worstErrText ?: NOT_CALIBRATED_TEXT,
-                        sub = if (worstErrText != null) {
-                            "Profile: ${hudState.activeProfileName.take(16)}"
-                        } else {
-                            "Default matrix, not validated"
+                        value = worstErrText ?: unmeasuredValue,
+                        sub = when {
+                            worstErrText != null -> "Profile: ${hudState.activeProfileName.take(16)}"
+                            fitOnly -> "$FIT_ONLY_TEXT • Profile: ${hudState.activeProfileName.take(16)}"
+                            else -> "Default matrix, not validated"
                         },
                         modifier = Modifier.weight(1f)
                     )
@@ -349,19 +354,10 @@ private fun CalibrationIdleOverview(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = String.format(
-                        Locale.US,
-                        "Eye Confidence: Left %.0f%% • Right %.0f%% | IOD: %.1f px | Eye Open: %.2f | Tier: %s | Luma: %d/255%s",
-                        f.leftEyeConfidence * 100f,
-                        f.rightEyeConfidence * 100f,
-                        f.eyeDistancePx,
-                        f.combinedEyeOpenProb,
-                        hudState.resolutionTier.shortLabel,
-                        f.ambientLuma,
-                        if (f.isLowLightDegraded) " (LOW-LIGHT DEGRADED)" else ""
-                    ),
+                    text = formatEyeTelemetryLine(f, hudState.resolutionTier.shortLabel),
                     style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.testTag("calibration_eye_telemetry_text")
                 )
             }
         }
@@ -794,6 +790,31 @@ fun CalibrationTargetFullscreenOverlay(
 
 private const val NOT_CALIBRATED_TEXT = "Not calibrated"
 private const val NOT_MEASURED_TEXT = "Not measured"
+private const val NOT_VALIDATED_TEXT = "Not validated"
+private const val FIT_ONLY_TEXT = "5-point fit only"
+private const val NOT_DETECTED_TEXT = "--"
+
+/**
+ * Eye telemetry line. On a no-face frame the engine reports 0 confidence / 0 eye-open and the default
+ * inter-ocular distance: those are placeholders, not measurements, so they read "--".
+ */
+internal fun formatEyeTelemetryLine(f: GazeFeatureVector, tierLabel: String): String {
+    val leftConf = if (f.faceDetected) String.format(Locale.US, "%.0f%%", f.leftEyeConfidence * 100f) else NOT_DETECTED_TEXT
+    val rightConf = if (f.faceDetected) String.format(Locale.US, "%.0f%%", f.rightEyeConfidence * 100f) else NOT_DETECTED_TEXT
+    val iod = if (f.faceDetected) String.format(Locale.US, "%.1f px", f.eyeDistancePx) else NOT_DETECTED_TEXT
+    val eyeOpen = if (f.faceDetected) String.format(Locale.US, "%.2f", f.combinedEyeOpenProb) else NOT_DETECTED_TEXT
+    return String.format(
+        Locale.US,
+        "Eye Confidence: Left %s • Right %s | IOD: %s | Eye Open: %s | Tier: %s | Luma: %d/255%s",
+        leftConf,
+        rightConf,
+        iod,
+        eyeOpen,
+        tierLabel,
+        f.ambientLuma,
+        if (f.isLowLightDegraded) " (LOW-LIGHT DEGRADED)" else ""
+    )
+}
 
 /** True while the wizard records camera frames under an on-screen target. */
 internal fun isCalibrationCollectingStep(step: CalibrationFlowStep): Boolean =
@@ -866,9 +887,11 @@ private fun CalibrationValidationSummaryCard(
                 Spacer(modifier = Modifier.height(14.dp))
 
                 // Quick-fit mode scores the fit on the very samples it was trained on: that is a fit
-                // residual, not a screen error, and no quadrant point was measured. Only the held-out
-                // run earns the validated labels. Non-finite metrics were not measured at all.
-                val metricsAreHeldOut = calibrationState.includeHeldOutValidation
+                // residual, not a screen error, and no quadrant point was measured. Only metrics the
+                // ViewModel marks as computed on the held-out targets earn the validated labels (the
+                // selected mode alone does not prove any held-out sample was collected). Non-finite
+                // metrics were not measured at all.
+                val metricsAreHeldOut = calibrationState.metricsAreHeldOut
                 val meanErrText = formatErrorPctOrNull(calibrationState.validationMeanErrorPct)
                 val worstErrText = formatErrorPctOrNull(calibrationState.validationMaxErrorPct)
                 Row(
@@ -900,10 +923,17 @@ private fun CalibrationValidationSummaryCard(
                 if (!metricsAreHeldOut) {
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "Quick fit: these are residuals on the same ${calibrationState.totalCollectedSamples} " +
-                            "samples the fit was trained on. No held-out point was measured, so the real screen " +
-                            "error is unknown and usually larger. Run " +
-                            "'${stringResource(R.string.calibration_mode_5_plus_4)}' to measure it.",
+                        text = if (calibrationState.includeHeldOutValidation) {
+                            // 5+4 run whose held-out targets produced no scored sample: nothing was validated.
+                            "No held-out validation sample was scored, so the screen error of this fit was " +
+                                "not measured. Run '${stringResource(R.string.calibration_mode_5_plus_4)}' again " +
+                                "to measure it."
+                        } else {
+                            "Quick fit: these are residuals on the same ${calibrationState.totalCollectedSamples} " +
+                                "samples the fit was trained on. No held-out point was measured, so the real screen " +
+                                "error is unknown and usually larger. Run " +
+                                "'${stringResource(R.string.calibration_mode_5_plus_4)}' to measure it."
+                        },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.tertiary,
                         modifier = Modifier.testTag("calibration_in_sample_caveat")

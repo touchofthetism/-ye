@@ -219,6 +219,74 @@ class CalibscreenRegressionTest {
     }
 
     @Test
+    fun idleOverview_appliedFitWithoutHeldOutValidation_showsNotValidated_notNotCalibrated() {
+        // A 5-point fit is applied (hasActiveCalibration) but was never validated: error fields stay null.
+        composeRule.setContent {
+            CalibrationStudioScreen(
+                calibrationState = CalibrationWizardState(),
+                hudState = LiveGazeHudState(hasActiveCalibration = true, activeProfileName = "Desk A"),
+                onStartWizard = {},
+                onCancelWizard = {},
+                onUpdateProfileName = {},
+                onSaveProfile = {},
+                onSnapSimulatorToCurrentTarget = { _, _ -> }
+            )
+        }
+
+        composeRule.onAllNodesWithText("Not validated").assertCountEquals(2)
+        composeRule.onAllNodesWithText("5-point fit only", substring = true).assertCountEquals(2)
+        composeRule.onAllNodesWithText("Not calibrated").assertCountEquals(0)
+        composeRule.onAllNodesWithText("Default matrix", substring = true).assertCountEquals(0)
+    }
+
+    @Test
+    fun idleTelemetry_noFaceFrame_showsDashes_notZeroConfidenceOrDefaultIod() {
+        var hud by mutableStateOf(
+            LiveGazeHudState(
+                rawFeature = GazeFeatureVector(
+                    faceDetected = false,
+                    leftEyeConfidence = 0f,
+                    rightEyeConfidence = 0f,
+                    leftEyeOpenProb = 0f,
+                    rightEyeOpenProb = 0f
+                )
+            )
+        )
+
+        composeRule.setContent {
+            CalibrationStudioScreen(
+                calibrationState = CalibrationWizardState(),
+                hudState = hud,
+                onStartWizard = {},
+                onCancelWizard = {},
+                onUpdateProfileName = {},
+                onSaveProfile = {},
+                onSnapSimulatorToCurrentTarget = { _, _ -> }
+            )
+        }
+
+        composeRule.onNodeWithTag("calibration_eye_telemetry_text")
+            .assertTextContains("Eye Confidence: Left -- • Right -- | IOD: -- | Eye Open: --", substring = true)
+        composeRule.onAllNodesWithText("148.0 px", substring = true).assertCountEquals(0)
+
+        // A face-detected frame shows the measured values.
+        composeRule.runOnIdle {
+            hud = hud.copy(
+                rawFeature = GazeFeatureVector(
+                    faceDetected = true,
+                    leftEyeConfidence = 0.81f,
+                    rightEyeConfidence = 0.77f,
+                    leftEyeOpenProb = 0.9f,
+                    rightEyeOpenProb = 0.9f,
+                    eyeDistancePx = 151.2
+                )
+            )
+        }
+        composeRule.onNodeWithTag("calibration_eye_telemetry_text")
+            .assertTextContains("Left 81% • Right 77% | IOD: 151.2 px | Eye Open: 0.90", substring = true)
+    }
+
+    @Test
     fun summary_quickFit_labelsInSampleResidual_notValidatedScreenError() {
         var state by mutableStateOf(
             CalibrationWizardState(
@@ -249,8 +317,15 @@ class CalibscreenRegressionTest {
         composeRule.onAllNodesWithText("WORST QUADRANT").assertCountEquals(0)
         composeRule.onNodeWithTag("calibration_in_sample_caveat").assertExists()
 
-        // A held-out run keeps the validated labels and drops the caveat.
+        // Choosing the 5+4 mode alone proves nothing: until the ViewModel marks the metrics as held-out,
+        // they stay labelled as an in-sample residual.
         composeRule.runOnIdle { state = state.copy(includeHeldOutValidation = true) }
+        composeRule.onNodeWithText("FIT RESIDUAL (IN-SAMPLE)").assertExists()
+        composeRule.onAllNodesWithText("MEAN SCREEN ERROR").assertCountEquals(0)
+        composeRule.onNodeWithTag("calibration_in_sample_caveat").assertExists()
+
+        // A held-out run keeps the validated labels and drops the caveat.
+        composeRule.runOnIdle { state = state.copy(metricsAreHeldOut = true) }
         composeRule.onNodeWithText("MEAN SCREEN ERROR").assertExists()
         composeRule.onNodeWithText("WORST QUADRANT").assertExists()
         composeRule.onNodeWithText("±2.3%").assertExists()
@@ -264,6 +339,7 @@ class CalibscreenRegressionTest {
                 calibrationState = CalibrationWizardState(
                     step = CalibrationFlowStep.COMPLETED_SUMMARY,
                     includeHeldOutValidation = true,
+                    metricsAreHeldOut = true,
                     validationMeanErrorPct = Double.NaN,
                     validationMaxErrorPct = Double.NaN,
                     validationMeanErrorMm = Double.NaN

@@ -56,6 +56,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
@@ -264,6 +267,9 @@ fun AuthenticatedMainWorkbench(
     // Size of the root content Box that hosts RegionConfidenceReticleOverlay. Gaze normX/normY is
     // normalized to this frame, so mm errors must be scaled by its physical size, not the panel's.
     var contentRootSizePx by remember { mutableStateOf(IntSize.Zero) }
+    // Root-coordinate bounds of that same Box: the frame the deck normalizes its tile centres to
+    // (the ViewModel's drift-correction reference).
+    var contentRootBoundsInRoot by remember { mutableStateOf(Rect.Zero) }
     LaunchedEffect(viewModel, contentRootSizePx) {
         if (contentRootSizePx.width > 0 && contentRootSizePx.height > 0) {
             val metrics = context.resources.displayMetrics
@@ -428,6 +434,7 @@ fun AuthenticatedMainWorkbench(
                 .fillMaxSize()
                 .padding(innerPadding)
                 .onSizeChanged { contentRootSizePx = it }
+                .onGloballyPositioned { contentRootBoundsInRoot = it.boundsInRoot() }
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
                 OpticalDiagnosticsBar(
@@ -457,7 +464,8 @@ fun AuthenticatedMainWorkbench(
                         viewModel.dismissRecalibrateNudge()
                     },
                     onFeatureFrame = { frame ->
-                        // Called on the CameraX analysis thread; the ViewModel hops to main.
+                        // Delivered on the main thread: OpticalDiagnosticsBar conflates the engine's
+                        // analysis-thread frames onto Main before invoking this callback.
                         viewModel.submitCameraFrame(frame)
                     }
                 )
@@ -557,7 +565,9 @@ fun AuthenticatedMainWorkbench(
                                 },
                                 onSelectPosture = { viewModel.setPostureProfile(it) },
                                 onSelectFilterMode = { viewModel.setGazeFilterMode(it) },
-                                onRunBenchmark = { viewModel.runBenchmarkSuite() }
+                                onRunBenchmark = { viewModel.runBenchmarkSuite() },
+                                gazeFrameRootBounds = contentRootBoundsInRoot,
+                                onUpdateTileCentersNorm = { viewModel.updateTileCentersNorm(it) }
                             )
                         }
                         2 -> {
