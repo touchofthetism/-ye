@@ -140,12 +140,19 @@ object GazeCalibrationMath {
     }
 
     /**
-     * Frame-rate-independent exponential smoothing factor alpha = 1 - exp(-dt / tauMs)
-     * so 10-15 FPS camera pipelines and 30 FPS pipelines exhibit identical physical damping.
+     * Frame-rate-independent 1€ (EuroFilter)-inspired adaptive exponential smoothing:
+     * - Fixation / small motion (delta < 0.02): tau = 135 ms (heavy jitter suppression, buttery steady hold)
+     * - Fast saccadic sweep (delta >= 0.08): tau = 42 ms (instant response, zero perceived lag)
      */
-    fun computeAdaptiveSmoothingAlpha(dtMs: Long, tauMs: Double = 115.0): Float {
+    fun computeAdaptiveSmoothingAlpha(
+        dtMs: Long,
+        deltaDisplacement: Float = 0.0f,
+        baseTauMs: Double = 95.0
+    ): Float {
         val clampedDt = dtMs.coerceIn(16L, 250L).toDouble()
-        return (1.0 - exp(-clampedDt / tauMs)).toFloat().coerceIn(0.15f, 0.85f)
+        val saccadeBoost = (deltaDisplacement / 0.12f).coerceIn(0f, 1f)
+        val dynamicTau = baseTauMs * (1.0 - 0.58 * saccadeBoost).coerceAtLeast(35.0)
+        return (1.0 - exp(-clampedDt / dynamicTau)).toFloat().coerceIn(0.20f, 0.92f)
     }
 
     /**

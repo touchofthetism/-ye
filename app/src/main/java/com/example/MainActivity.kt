@@ -474,12 +474,17 @@ fun AuthenticatedMainWorkbench(
                             onUpdateFocusedTile = { viewModel.updateFocusedTile(it) },
                             onManualTileClick = { viewModel.fireTileAction(it, "Tap") },
                             onChangeDwellDurationMs = { viewModel.setDwellTriggerDuration(it) },
+                            onChangeDwellSensitivityMultiplier = { viewModel.setDwellSensitivityMultiplier(it) },
+                            onSelectDwellPreset = { viewModel.setDwellSpeedPreset(it) },
                             onChangeTriggerMode = { viewModel.setTriggerMode(it) },
                             onCalibrateNeutralBrow = { viewModel.calibrateNeutralBrowBaseline() },
                             onCalibrateRaisedBrow = { viewModel.calibrateRaisedBrowPeak() },
                             onEditTilePhrase = { id, title, phrase ->
                                 viewModel.updateAacTilePhrase(id, title, phrase)
-                            }
+                            },
+                            onSelectPosture = { viewModel.setPostureProfile(it) },
+                            onSelectFilterMode = { viewModel.setGazeFilterMode(it) },
+                            onRunBenchmark = { viewModel.runBenchmarkSuite() }
                         )
                         2 -> AttentionAnalyticsScreen(
                             attentionState = attentionState,
@@ -517,7 +522,10 @@ fun AuthenticatedMainWorkbench(
                                     scope = coroutineScope,
                                     auth = auth
                                 )
-                            }
+                            },
+                            onChangeDwellDurationMs = { viewModel.setDwellTriggerDuration(it) },
+                            onChangeDwellSensitivityMultiplier = { viewModel.setDwellSensitivityMultiplier(it) },
+                            onSelectDwellPreset = { viewModel.setDwellSpeedPreset(it) }
                         )
                     }
                 }

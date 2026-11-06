@@ -24,6 +24,7 @@ import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.CenterFocusWeak
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.RecordVoiceOver
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -66,23 +67,47 @@ fun GazeControlDeckScreen(
     onUpdateFocusedTile: (String?) -> Unit,
     onManualTileClick: (String) -> Unit,
     onChangeDwellDurationMs: (Long) -> Unit,
+    onChangeDwellSensitivityMultiplier: (Float) -> Unit = {},
+    onSelectDwellPreset: (com.example.data.model.DwellSpeedPreset) -> Unit = {},
     onChangeTriggerMode: (GazeTriggerMode) -> Unit = {},
     onCalibrateNeutralBrow: () -> Unit = {},
     onCalibrateRaisedBrow: () -> Unit = {},
-    onEditTilePhrase: (String, String, String) -> Unit = { _, _, _ -> }
+    onEditTilePhrase: (String, String, String) -> Unit = { _, _, _ -> },
+    onSelectPosture: (com.example.data.model.GazePostureProfile) -> Unit = {},
+    onSelectFilterMode: (com.example.data.model.GazeFilterMode) -> Unit = {},
+    onRunBenchmark: () -> Unit = {}
 ) {
     val tileBoundsMap = remember { mutableStateMapOf<String, Rect>() }
     var editingTile by remember { mutableStateOf<AacActionTile?>(null) }
     var editTitleText by remember { mutableStateOf("") }
     var editPhraseText by remember { mutableStateOf("") }
+    var showDwellSettingsDialog by remember { mutableStateOf(false) }
 
     // Hit-test using the exact root-window pixel coordinate of the rendered confidence reticle
+    // with 14dp focus hysteresis expansion to prevent jitter/flicker at tile boundaries
     LaunchedEffect(reticleRootPosition, tileBoundsMap.size) {
         if (reticleRootPosition != Offset.Zero) {
-            val hitEntry = tileBoundsMap.entries.firstOrNull { (_, rect) ->
-                rect.contains(reticleRootPosition)
+            val currentFocusedId = hudState.focusedTileId
+            val currentRect = currentFocusedId?.let { tileBoundsMap[it] }
+
+            // Dynamic focus hysteresis scaled by user sensitivity multiplier (default 14dp ~ 38.5px)
+            val baseHysteresisPx = 14f * 2.75f
+            val hysteresisPx = baseHysteresisPx * hudState.dwellSensitivityRadiusMultiplier
+            val stillInCurrent = currentRect != null &&
+                reticleRootPosition.x >= (currentRect.left - hysteresisPx) &&
+                reticleRootPosition.x <= (currentRect.right + hysteresisPx) &&
+                reticleRootPosition.y >= (currentRect.top - hysteresisPx) &&
+                reticleRootPosition.y <= (currentRect.bottom + hysteresisPx)
+
+            if (stillInCurrent) {
+                // Maintain focus on currently fixated tile
+                onUpdateFocusedTile(currentFocusedId)
+            } else {
+                val hitEntry = tileBoundsMap.entries.firstOrNull { (_, rect) ->
+                    rect.contains(reticleRootPosition)
+                }
+                onUpdateFocusedTile(hitEntry?.key)
             }
-            onUpdateFocusedTile(hitEntry?.key)
         }
     }
 
@@ -92,6 +117,19 @@ fun GazeControlDeckScreen(
     val use3x3Grid = hudState.activeErrorRadiusPct <= 12.0f && hudState.activeMaxQuadrantErrorPct <= 16.5f
     val columnCount = if (use3x3Grid) 3 else 2
     val visibleTiles = if (use3x3Grid) tiles.take(9) else tiles.take(4)
+
+    if (showDwellSettingsDialog) {
+        com.example.ui.components.DwellTriggerSettingsDialog(
+            hudState = hudState,
+            onDismissRequest = { showDwellSettingsDialog = false },
+            onChangeDurationMs = onChangeDwellDurationMs,
+            onChangeSensitivityMultiplier = onChangeDwellSensitivityMultiplier,
+            onSelectPreset = onSelectDwellPreset,
+            onSelectPosture = onSelectPosture,
+            onSelectFilterMode = onSelectFilterMode,
+            onRunBenchmark = onRunBenchmark
+        )
+    }
 
     if (editingTile != null) {
         val currentTile = editingTile!!
@@ -164,11 +202,24 @@ fun GazeControlDeckScreen(
                             color = MaterialTheme.colorScheme.onSurface
                         )
                     }
-                    Text(
-                        text = "Dwell: ${hudState.dwellTriggerMs} ms",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedButton(
+                            onClick = { showDwellSettingsDialog = true },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                            modifier = Modifier.testTag("open_dwell_settings_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Tune,
+                                contentDescription = "Dwell Settings",
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Dwell: ${hudState.dwellTriggerMs}ms (${String.format(java.util.Locale.US, "%.1f×", hudState.dwellSensitivityRadiusMultiplier)})",
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        }
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(4.dp))
