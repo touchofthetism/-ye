@@ -33,11 +33,13 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -46,11 +48,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.example.R
 import com.example.data.model.CalibrationProfile
+import com.example.data.model.DwellSpeedPreset
 import com.example.data.model.TrackingSession
 import com.example.ui.components.DWELL_DURATION_SLIDER_RANGE_MS
 import com.example.ui.viewmodel.LiveGazeHudState
@@ -59,10 +64,9 @@ import java.util.Locale
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
 
-import androidx.compose.material.icons.filled.CloudQueue
-import androidx.compose.material.icons.filled.Security
-import androidx.compose.ui.res.stringResource
-import com.example.R
+// Shapes reused by every card and every list row.
+private val CardShape = RoundedCornerShape(16.dp)
+private val ListRowShape = RoundedCornerShape(12.dp)
 
 /** Irreversible actions on this screen; each one runs only after the user confirms it in a dialog. */
 private sealed interface PendingDestructiveAction {
@@ -93,22 +97,22 @@ internal fun formatProfileErrorLine(profile: CalibrationProfile): String = Strin
     profile.maxErrorPct
 )
 
-/** A session without gaze samples saves 0/0/0 zones; that is "no zone data", not a 0% share of every zone. */
+/**
+ * A session without gaze samples saves 0/0/0 zones; that is "no zone data", not a 0% share of every zone.
+ * Locale.US `%d` is plain `Int.toString()`, so templates give the same text without a Formatter.
+ */
 internal fun formatZoneSummary(topPct: Int, middlePct: Int, bottomPct: Int): String =
     if (topPct + middlePct + bottomPct <= 0) {
         "Zones n/a"
     } else {
-        String.format(Locale.US, "Zones T:%d%% M:%d%% B:%d%%", topPct, middlePct, bottomPct)
+        "Zones T:$topPct% M:$middlePct% B:$bottomPct%"
     }
 
-internal fun formatSessionSummaryLine(session: TrackingSession): String = String.format(
-    Locale.US,
-    "%ds • %s • %.1f blinks/min • %s",
-    session.durationSeconds,
-    formatEstimatedWpm(session.effectiveWordsPerMinute),
-    session.blinksPerMinute,
-    formatZoneSummary(session.topZonePercentage, session.middleZonePercentage, session.bottomZonePercentage)
-)
+/** Only the blink rate needs a Formatter (`%.1f`); `%d` and `%s` are plain string conversions. */
+internal fun formatSessionSummaryLine(session: TrackingSession): String =
+    "${session.durationSeconds}s • ${formatEstimatedWpm(session.effectiveWordsPerMinute)} • " +
+        "${String.format(Locale.US, "%.1f", session.blinksPerMinute)} blinks/min • " +
+        formatZoneSummary(session.topZonePercentage, session.middleZonePercentage, session.bottomZonePercentage)
 
 /**
  * Index of the single row to mark as the loaded calibration, or -1. Rows are matched by the id of the profile the
@@ -137,13 +141,71 @@ fun CloudPrivacyScreen(
     onSignOut: () -> Unit,
     onChangeDwellDurationMs: (Long) -> Unit = {},
     onChangeDwellSensitivityMultiplier: (Float) -> Unit = {},
-    onSelectDwellPreset: (com.example.data.model.DwellSpeedPreset) -> Unit = {},
+    onSelectDwellPreset: (DwellSpeedPreset) -> Unit = {},
     isAttentionRecording: Boolean = false
+) {
+    // hudState changes on every camera frame. The screen shows only the seven fields passed below, so its content
+    // (scroll container, cards and dialog) is skipped unless one of them or another argument changes.
+    CloudPrivacyScreenContent(
+        dwellTriggerMs = hudState.dwellTriggerMs,
+        dwellSensitivityRadiusMultiplier = hudState.dwellSensitivityRadiusMultiplier,
+        activeDwellPreset = hudState.activeDwellPreset,
+        cloudSyncEnabled = hudState.cloudSyncEnabled,
+        isDeletingCloudData = hudState.isDeletingCloudData,
+        lastCloudDeletionSummary = hudState.lastCloudDeletionSummary,
+        activeProfileId = hudState.activeProfileId,
+        currentUserId = currentUserId,
+        currentUserEmail = currentUserEmail,
+        currentUserName = currentUserName,
+        firestoreDatabaseId = firestoreDatabaseId,
+        profilesState = profilesState,
+        sessionsState = sessionsState,
+        onToggleCloudSync = onToggleCloudSync,
+        onActivateProfile = onActivateProfile,
+        onDeleteProfile = onDeleteProfile,
+        onSelectSessionReplay = onSelectSessionReplay,
+        onDeleteSession = onDeleteSession,
+        onDeleteFirestoreOnly = onDeleteFirestoreOnly,
+        onEraseAllTelemetry = onEraseAllTelemetry,
+        onSignOut = onSignOut,
+        onChangeDwellDurationMs = onChangeDwellDurationMs,
+        onChangeDwellSensitivityMultiplier = onChangeDwellSensitivityMultiplier,
+        onSelectDwellPreset = onSelectDwellPreset,
+        isAttentionRecording = isAttentionRecording
+    )
+}
+
+@Composable
+private fun CloudPrivacyScreenContent(
+    dwellTriggerMs: Long,
+    dwellSensitivityRadiusMultiplier: Float,
+    activeDwellPreset: DwellSpeedPreset,
+    cloudSyncEnabled: Boolean,
+    isDeletingCloudData: Boolean,
+    lastCloudDeletionSummary: String?,
+    activeProfileId: String?,
+    currentUserId: String,
+    currentUserEmail: String,
+    currentUserName: String,
+    firestoreDatabaseId: String,
+    profilesState: UiDataState<List<CalibrationProfile>>,
+    sessionsState: UiDataState<List<TrackingSession>>,
+    onToggleCloudSync: (Boolean) -> Unit,
+    onActivateProfile: (CalibrationProfile) -> Unit,
+    onDeleteProfile: (String) -> Unit,
+    onSelectSessionReplay: (TrackingSession) -> Unit,
+    onDeleteSession: (String) -> Unit,
+    onDeleteFirestoreOnly: () -> Unit,
+    onEraseAllTelemetry: () -> Unit,
+    onSignOut: () -> Unit,
+    onChangeDwellDurationMs: (Long) -> Unit,
+    onChangeDwellSensitivityMultiplier: (Float) -> Unit,
+    onSelectDwellPreset: (DwellSpeedPreset) -> Unit,
+    isAttentionRecording: Boolean
 ) {
     var pendingDestructive by remember { mutableStateOf<PendingDestructiveAction?>(null) }
 
-    // hudState changes on every camera frame; each card below takes only the fields it shows, so the cards are
-    // skipped unless those fields change.
+    // Each card takes only the fields it shows, so a change in one card's fields recomposes only that card.
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -152,18 +214,18 @@ fun CloudPrivacyScreen(
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         DwellSettingsCard(
-            dwellTriggerMs = hudState.dwellTriggerMs,
-            dwellSensitivityRadiusMultiplier = hudState.dwellSensitivityRadiusMultiplier,
-            activeDwellPreset = hudState.activeDwellPreset,
+            dwellTriggerMs = dwellTriggerMs,
+            dwellSensitivityRadiusMultiplier = dwellSensitivityRadiusMultiplier,
+            activeDwellPreset = activeDwellPreset,
             onChangeDwellDurationMs = onChangeDwellDurationMs,
             onChangeDwellSensitivityMultiplier = onChangeDwellSensitivityMultiplier,
             onSelectDwellPreset = onSelectDwellPreset
         )
 
         PrivacySettingsCard(
-            cloudSyncEnabled = hudState.cloudSyncEnabled,
-            isDeletingCloudData = hudState.isDeletingCloudData,
-            lastCloudDeletionSummary = hudState.lastCloudDeletionSummary,
+            cloudSyncEnabled = cloudSyncEnabled,
+            isDeletingCloudData = isDeletingCloudData,
+            lastCloudDeletionSummary = lastCloudDeletionSummary,
             currentUserId = currentUserId,
             currentUserEmail = currentUserEmail,
             currentUserName = currentUserName,
@@ -176,7 +238,7 @@ fun CloudPrivacyScreen(
 
         SavedProfilesCard(
             profilesState = profilesState,
-            activeProfileId = hudState.activeProfileId,
+            activeProfileId = activeProfileId,
             onActivateProfile = onActivateProfile,
             onRequestDeleteProfile = { profile ->
                 pendingDestructive = PendingDestructiveAction.DeleteProfile(profile.id, profile.name)
@@ -197,7 +259,7 @@ fun CloudPrivacyScreen(
         DestructiveActionConfirmDialog(
             action = action,
             currentUserId = currentUserId,
-            isDeletingCloudData = hudState.isDeletingCloudData,
+            isDeletingCloudData = isDeletingCloudData,
             onConfirm = {
                 pendingDestructive = null
                 when (action) {
@@ -216,10 +278,10 @@ fun CloudPrivacyScreen(
 private fun DwellSettingsCard(
     dwellTriggerMs: Long,
     dwellSensitivityRadiusMultiplier: Float,
-    activeDwellPreset: com.example.data.model.DwellSpeedPreset,
+    activeDwellPreset: DwellSpeedPreset,
     onChangeDwellDurationMs: (Long) -> Unit,
     onChangeDwellSensitivityMultiplier: (Float) -> Unit,
-    onSelectDwellPreset: (com.example.data.model.DwellSpeedPreset) -> Unit
+    onSelectDwellPreset: (DwellSpeedPreset) -> Unit
 ) {
     // Dwell Trigger & Eye-Tracking Speed Settings Menu Card
     Card(
@@ -227,7 +289,7 @@ private fun DwellSettingsCard(
             .fillMaxWidth()
             .testTag("dwell_settings_card"),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        shape = RoundedCornerShape(16.dp)
+        shape = CardShape
     ) {
         Column(
             modifier = Modifier.padding(16.dp),
@@ -272,7 +334,7 @@ private fun DwellSettingsCard(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                com.example.data.model.DwellSpeedPreset.entries.forEach { preset ->
+                DwellSpeedPreset.entries.forEach { preset ->
                     val isSelected = activeDwellPreset == preset && dwellTriggerMs == preset.durationMs
                     FilterChip(
                         selected = isSelected,
@@ -307,7 +369,7 @@ private fun DwellSettingsCard(
                         fontWeight = FontWeight.Bold
                     )
                 }
-                androidx.compose.material3.Slider(
+                Slider(
                     value = dwellTriggerMs.toFloat(),
                     onValueChange = { onChangeDwellDurationMs(sliderValueToDwellMs(it)) },
                     valueRange = DWELL_DURATION_SLIDER_RANGE_MS,
@@ -336,9 +398,9 @@ private fun DwellSettingsCard(
                         fontWeight = FontWeight.Bold
                     )
                 }
-                androidx.compose.material3.Slider(
+                Slider(
                     value = dwellSensitivityRadiusMultiplier,
-                    onValueChange = { onChangeDwellSensitivityMultiplier(it) },
+                    onValueChange = onChangeDwellSensitivityMultiplier,
                     valueRange = 0.6f..2.0f,
                     steps = 13,
                     modifier = Modifier
@@ -370,7 +432,7 @@ private fun PrivacySettingsCard(
             .fillMaxWidth()
             .testTag("privacy_settings_card"),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        shape = RoundedCornerShape(16.dp)
+        shape = CardShape
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             val cloudOptInTitle = stringResource(R.string.cloud_telemetry_opt_in_title)
@@ -554,7 +616,7 @@ private fun SavedProfilesCard(
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        shape = RoundedCornerShape(16.dp)
+        shape = CardShape
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text(
@@ -590,55 +652,59 @@ private fun SavedProfilesCard(
                         val activeIndex = indexOfActiveProfile(profilesState.data, activeProfileId)
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             profilesState.data.forEachIndexed { index, profile ->
-                                val isCurrent = index == activeIndex
-                                val errorLine = remember(profile) { formatProfileErrorLine(profile) }
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(MaterialTheme.colorScheme.surfaceVariant)
-                                        .border(
-                                            width = if (isCurrent) 1.5.dp else 1.dp,
-                                            color = if (isCurrent) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outline,
-                                            shape = RoundedCornerShape(12.dp)
-                                        )
-                                        .clickable { onActivateProfile(profile) }
-                                        .padding(12.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                            Icon(
-                                                imageVector = Icons.Default.PhoneAndroid,
-                                                contentDescription = "Device Model",
-                                                tint = MaterialTheme.colorScheme.primary,
-                                                modifier = Modifier.size(16.dp)
+                                // Keyed by id: deleting or adding a profile moves the other rows (and their
+                                // remembered error lines) instead of re-binding every row after it.
+                                key(profile.id) {
+                                    val isCurrent = index == activeIndex
+                                    val errorLine = remember(profile) { formatProfileErrorLine(profile) }
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(ListRowShape)
+                                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                                            .border(
+                                                width = if (isCurrent) 1.5.dp else 1.dp,
+                                                color = if (isCurrent) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outline,
+                                                shape = ListRowShape
                                             )
-                                            Spacer(modifier = Modifier.width(6.dp))
+                                            .clickable { onActivateProfile(profile) }
+                                            .padding(12.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Icon(
+                                                    imageVector = Icons.Default.PhoneAndroid,
+                                                    contentDescription = "Device Model",
+                                                    tint = MaterialTheme.colorScheme.primary,
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Text(
+                                                    text = profile.name,
+                                                    style = MaterialTheme.typography.titleMedium,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    color = MaterialTheme.colorScheme.onSurface
+                                                )
+                                            }
+                                            Spacer(modifier = Modifier.height(2.dp))
                                             Text(
-                                                text = profile.name,
-                                                style = MaterialTheme.typography.titleMedium,
-                                                fontWeight = FontWeight.SemiBold,
-                                                color = MaterialTheme.colorScheme.onSurface
+                                                text = errorLine,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
                                             )
                                         }
-                                        Spacer(modifier = Modifier.height(2.dp))
-                                        Text(
-                                            text = errorLine,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-                                    IconButton(
-                                        onClick = { onRequestDeleteProfile(profile) },
-                                        modifier = Modifier.testTag("delete_profile_${profile.id}")
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Default.Delete,
-                                            contentDescription = "Delete Profile",
-                                            tint = MaterialTheme.colorScheme.error
-                                        )
+                                        IconButton(
+                                            onClick = { onRequestDeleteProfile(profile) },
+                                            modifier = Modifier.testTag("delete_profile_${profile.id}")
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Delete,
+                                                contentDescription = "Delete Profile",
+                                                tint = MaterialTheme.colorScheme.error
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -661,7 +727,7 @@ private fun SessionsCard(
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        shape = RoundedCornerShape(16.dp)
+        shape = CardShape
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text(
@@ -707,41 +773,45 @@ private fun SessionsCard(
                     } else {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             sessionsState.data.forEach { session ->
-                                val summaryLine = remember(session) { formatSessionSummaryLine(session) }
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(MaterialTheme.colorScheme.surfaceVariant)
-                                        .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(12.dp))
-                                        .clickable(enabled = !isAttentionRecording) { onSelectSessionReplay(session) }
-                                        .testTag("session_row_${session.id}")
-                                        .padding(12.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text = session.title,
-                                            style = MaterialTheme.typography.titleMedium,
-                                            fontWeight = FontWeight.SemiBold,
-                                            color = MaterialTheme.colorScheme.onSurface
-                                        )
-                                        Text(
-                                            text = summaryLine,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-                                    IconButton(
-                                        onClick = { onRequestDeleteSession(session) },
-                                        modifier = Modifier.testTag("delete_session_${session.id}")
+                                // Keyed by id: a newly saved session is inserted at the top, which would
+                                // otherwise re-bind every row and re-format every summary line below it.
+                                key(session.id) {
+                                    val summaryLine = remember(session) { formatSessionSummaryLine(session) }
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(ListRowShape)
+                                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                                            .border(1.dp, MaterialTheme.colorScheme.outline, ListRowShape)
+                                            .clickable(enabled = !isAttentionRecording) { onSelectSessionReplay(session) }
+                                            .testTag("session_row_${session.id}")
+                                            .padding(12.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
                                     ) {
-                                        Icon(
-                                            imageVector = Icons.Default.Delete,
-                                            contentDescription = "Delete Session",
-                                            tint = MaterialTheme.colorScheme.error
-                                        )
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = session.title,
+                                                style = MaterialTheme.typography.titleMedium,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = MaterialTheme.colorScheme.onSurface
+                                            )
+                                            Text(
+                                                text = summaryLine,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                        IconButton(
+                                            onClick = { onRequestDeleteSession(session) },
+                                            modifier = Modifier.testTag("delete_session_${session.id}")
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Delete,
+                                                contentDescription = "Delete Session",
+                                                tint = MaterialTheme.colorScheme.error
+                                            )
+                                        }
                                     }
                                 }
                             }

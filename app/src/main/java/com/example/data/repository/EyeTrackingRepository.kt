@@ -7,6 +7,7 @@ import com.example.data.model.CalibrationProfile
 import com.example.data.model.DEFAULT_AFFINE_MATRIX_2X6
 import com.example.data.model.TrackingSession
 import com.example.data.model.calibrationPostureProfile
+import com.google.android.gms.tasks.Task
 import com.google.firebase.Firebase
 import com.google.firebase.auth.auth
 import com.google.firebase.firestore.CollectionReference
@@ -68,6 +69,10 @@ class EyeTrackingRepository(
     private fun reportError(e: Exception, operationType: OperationType, path: String) {
         handleFirestoreError(e, operationType, path, signedInOrNull())
     }
+
+    /** Error-log path under the signed-in user ("unauthenticated" when signed out); the uid is redacted when logged. */
+    private fun currentUserPath(suffix: String = ""): String =
+        "users/${auth.currentUser?.uid ?: "unauthenticated"}$suffix"
 
     private fun calibrationsOf(uid: String): CollectionReference =
         db.collection("users").document(uid).collection("calibrations")
@@ -163,7 +168,7 @@ class EyeTrackingRepository(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            reportError(e, OperationType.CREATE, "users/${auth.currentUser?.uid ?: "unauthenticated"}/calibrations")
+            reportError(e, OperationType.CREATE, currentUserPath("/calibrations"))
             Result.failure(e)
         }
     }
@@ -197,7 +202,7 @@ class EyeTrackingRepository(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            reportError(e, OperationType.UPDATE, "users/${auth.currentUser?.uid ?: "unauthenticated"}/calibrations/$profileId")
+            reportError(e, OperationType.UPDATE, currentUserPath("/calibrations/$profileId"))
             Result.failure(e)
         }
     }
@@ -216,10 +221,12 @@ class EyeTrackingRepository(
             .filter { it.id != keepId && (it.get("isActive") == true || it.id in alsoDeactivateIds) }
             .map { it.reference }
 
-    private fun activeStateFields(isActive: Boolean): Map<String, Any> = mapOf(
-        "isActive" to isActive,
-        "updatedAt" to FieldValue.serverTimestamp()
-    )
+    /**
+     * Shared read-only maps, so a batch that deactivates N profiles allocates none: WriteBatch.update
+     * parses the map during the call and FieldValue.serverTimestamp() is a singleton sentinel.
+     */
+    private fun activeStateFields(isActive: Boolean): Map<String, Any> =
+        if (isActive) ACTIVATE_FIELDS else DEACTIVATE_FIELDS
 
     suspend fun deleteCalibrationProfile(profileId: String): Result<Unit> {
         return try {
@@ -230,7 +237,7 @@ class EyeTrackingRepository(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            reportError(e, OperationType.DELETE, "users/${auth.currentUser?.uid ?: "unauthenticated"}/calibrations/$profileId")
+            reportError(e, OperationType.DELETE, currentUserPath("/calibrations/$profileId"))
             Result.failure(e)
         }
     }
@@ -275,7 +282,7 @@ class EyeTrackingRepository(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            reportError(e, OperationType.CREATE, "users/${auth.currentUser?.uid ?: "unauthenticated"}/sessions")
+            reportError(e, OperationType.CREATE, currentUserPath("/sessions"))
             Result.failure(e)
         }
     }
@@ -289,7 +296,7 @@ class EyeTrackingRepository(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            reportError(e, OperationType.DELETE, "users/${auth.currentUser?.uid ?: "unauthenticated"}/sessions/$sessionId")
+            reportError(e, OperationType.DELETE, currentUserPath("/sessions/$sessionId"))
             Result.failure(e)
         }
     }
@@ -300,17 +307,20 @@ class EyeTrackingRepository(
      *
      * The documents are listed from the server, never the offline cache, so an offline erase fails
      * fast (UNAVAILABLE) instead of deleting only cached documents and reporting success, or waiting
-     * forever for acknowledgements. Deletes go out in batches of at most [MAX_BATCH_WRITES]. A batch
-     * the server does not confirm within [ERASE_BATCH_TIMEOUT_MS], or a failure after some batches
-     * were committed, is reported as [CloudEraseIncompleteException] with the confirmed count.
+     * forever for acknowledgements. Both listings are in flight together (one round trip, not two);
+     * the calibrations listing is awaited first, so its failure is still the one reported when both
+     * fail. Deletes go out in batches of at most [MAX_BATCH_WRITES]. A batch the server does not
+     * confirm within [ERASE_BATCH_TIMEOUT_MS], or a failure after some batches were committed, is
+     * reported as [CloudEraseIncompleteException] with the confirmed count.
      */
     suspend fun eraseAllUserCloudTelemetry(): Result<Int> {
         var deletedCount = 0
         var totalCount = 0
         return try {
             val uid = requireUserId()
-            val refs = ownedDocumentRefsFromServer(calibrationsOf(uid), uid) +
-                ownedDocumentRefsFromServer(sessionsOf(uid), uid)
+            val calibrationListing = ownedDocumentsFromServer(calibrationsOf(uid), uid)
+            val sessionListing = ownedDocumentsFromServer(sessionsOf(uid), uid)
+            val refs = calibrationListing.await().documentRefs() + sessionListing.await().documentRefs()
             totalCount = refs.size
             for (chunk in refs.chunked(MAX_BATCH_WRITES)) {
                 val batch = db.batch()
@@ -333,7 +343,7 @@ class EyeTrackingRepository(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            reportError(e, OperationType.DELETE, "users/${auth.currentUser?.uid ?: "unauthenticated"}")
+            reportError(e, OperationType.DELETE, currentUserPath())
             val failure = if (e !is CloudEraseIncompleteException && deletedCount > 0) {
                 CloudEraseIncompleteException(
                     deletedCount,
@@ -348,13 +358,13 @@ class EyeTrackingRepository(
         }
     }
 
-    private suspend fun ownedDocumentRefsFromServer(collection: CollectionReference, uid: String): List<DocumentReference> =
+    /** Starts a server-only listing of [uid]'s documents in [collection]; the request is sent on this call. */
+    private fun ownedDocumentsFromServer(collection: CollectionReference, uid: String): Task<QuerySnapshot> =
         collection
             .whereEqualTo("userId", uid)
             .get(Source.SERVER)
-            .await()
-            .documents
-            .map { it.reference }
+
+    private fun QuerySnapshot.documentRefs(): List<DocumentReference> = documents.map { it.reference }
 
     /**
      * Maps each document on its own, so one document the mapper cannot read (for example a list
@@ -400,5 +410,7 @@ class EyeTrackingRepository(
          * that window non-empty and matches the ViewModel's blink-timing setter and firestore.rules.
          */
         const val MAX_INTENTIONAL_BLINK_MIN_MS = 700L
+        val ACTIVATE_FIELDS: Map<String, Any> = mapOf("isActive" to true, "updatedAt" to FieldValue.serverTimestamp())
+        val DEACTIVATE_FIELDS: Map<String, Any> = mapOf("isActive" to false, "updatedAt" to FieldValue.serverTimestamp())
     }
 }

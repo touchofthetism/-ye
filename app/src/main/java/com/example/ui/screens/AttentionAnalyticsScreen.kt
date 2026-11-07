@@ -1,10 +1,10 @@
 package com.example.ui.screens
 
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -39,9 +39,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.snapshots.SnapshotStateMap
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
@@ -52,15 +54,20 @@ import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.toSize
+import com.example.data.model.FixationClusterPoint
 import com.example.data.model.SectionDwellSummary
 import com.example.data.model.SectionPassageItem
+import com.example.data.model.TrackingSession
 import com.example.ui.viewmodel.AttentionSessionLiveState
 import kotlinx.coroutines.flow.distinctUntilChanged
 import java.util.Locale
@@ -72,6 +79,20 @@ import java.util.Locale
  * yet", which is the only case where the ViewModel may fall back to fixed vertical bands.
  */
 const val ATTENTION_OFF_PASSAGE_SECTION_ID = "__off_passage__"
+
+// Shapes and spacing reused across recompositions (the passage Box recomposes on every recorded frame).
+private val PassageShape = RoundedCornerShape(16.dp)
+private val SectionShape = RoundedCornerShape(12.dp)
+private val PassageSpacing = Arrangement.spacedBy(12.dp)
+
+private val ClusterLabelStyle = TextStyle(
+    color = Color(0xFF0B0F17),
+    fontSize = 10.sp,
+    fontWeight = FontWeight.Bold
+)
+
+/** Labels "1".."N" kept by [ClusterLabelLayouts]; live and saved sessions show at most 40 clusters. */
+private const val MAX_CACHED_CLUSTER_LABELS = 64
 
 /** Passage Box geometry in root coordinates: unclipped origin and size (scroll included) plus the visible, clipped bounds. */
 internal data class PassageLayoutSnapshot(
@@ -113,6 +134,85 @@ internal fun formatEstimatedWpm(wordsPerMinute: Int): String =
  */
 internal fun formatSectionDwellLabel(percentage: Int, anySectionDwell: Boolean): String =
     if (anySectionDwell) "$percentage% dwell" else "dwell n/a"
+
+/**
+ * Heatmap geometry for one cluster list and canvas size: centers, splat radii and splat brushes per cluster, plus
+ * the trajectory stroke and node radii. Built once per cluster list and size instead of once per draw.
+ */
+internal class FixationHeatmapFrame(
+    val centerX: FloatArray,
+    val centerY: FloatArray,
+    val splatRadius: FloatArray,
+    val splatBrush: Array<Brush>,
+    val trajectoryStrokeWidthPx: Float,
+    val nodeOutlineRadiusPx: Float,
+    val nodeFillRadiusPx: Float
+)
+
+internal fun buildFixationHeatmapFrame(
+    clusters: List<FixationClusterPoint>,
+    size: Size,
+    density: Density
+): FixationHeatmapFrame = with(density) {
+    val count = clusters.size
+    val centerX = FloatArray(count)
+    val centerY = FloatArray(count)
+    val splatRadius = FloatArray(count)
+    val minSplatRadiusPx = 42.dp.toPx()
+    val splatRadiusRangePx = 46.dp.toPx()
+    val splatBrush = Array(count) { i ->
+        val cluster = clusters[i]
+        val cx = cluster.normX * size.width
+        val cy = cluster.normY * size.height
+        val weightNorm = (cluster.dwellMs.toFloat() / 2200f).coerceIn(0.25f, 1.0f)
+        val radius = (minSplatRadiusPx + weightNorm * splatRadiusRangePx)
+        centerX[i] = cx
+        centerY[i] = cy
+        splatRadius[i] = radius
+        Brush.radialGradient(
+            colors = listOf(
+                Color(0xFFEF4444).copy(alpha = 0.46f * weightNorm),
+                Color(0xFFF59E0B).copy(alpha = 0.28f * weightNorm),
+                Color.Transparent
+            ),
+            center = Offset(cx, cy),
+            radius = radius
+        )
+    }
+    FixationHeatmapFrame(
+        centerX = centerX,
+        centerY = centerY,
+        splatRadius = splatRadius,
+        splatBrush = splatBrush,
+        trajectoryStrokeWidthPx = 2.dp.toPx(),
+        nodeOutlineRadiusPx = 11.dp.toPx(),
+        nodeFillRadiusPx = 10.dp.toPx()
+    )
+}
+
+/**
+ * Layouts of the cluster labels "1".."N" for the lifetime of [textMeasurer]. TextMeasurer's own LRU keeps 8 layouts,
+ * so drawing up to 40 labels in index order missed on every label of every draw and laid all of them out again.
+ * The first [MAX_CACHED_CLUSTER_LABELS] are kept; like TextMeasurer's cache, a layout whose fonts went stale is
+ * measured again.
+ */
+internal class ClusterLabelLayouts(private val textMeasurer: TextMeasurer) {
+    private val layouts = ArrayList<TextLayoutResult>()
+
+    fun layoutFor(index: Int): TextLayoutResult {
+        if (index < layouts.size) {
+            val cached = layouts[index]
+            if (!cached.multiParagraph.intrinsics.hasStaleResolvedFonts) return cached
+            return measure(index).also { layouts[index] = it }
+        }
+        val layout = measure(index)
+        if (index == layouts.size && index < MAX_CACHED_CLUSTER_LABELS) layouts.add(layout)
+        return layout
+    }
+
+    private fun measure(index: Int): TextLayoutResult =
+        textMeasurer.measure(text = "${index + 1}", style = ClusterLabelStyle)
+}
 
 /** Compatibility overload for callers that read the reticle state in their own scope. */
 @Composable
@@ -162,7 +262,6 @@ fun AttentionAnalyticsScreen(
 ) {
     val sectionBoundsMap = remember { mutableStateMapOf<String, Rect>() }
     var passageLayout by remember { mutableStateOf<PassageLayoutSnapshot?>(null) }
-    val textMeasurer = rememberTextMeasurer()
     val scrollState = rememberScrollState()
     val latestReticle by rememberUpdatedState(reticleRootPosition)
     val latestOnHit by rememberUpdatedState(onUpdateLayoutHitSection)
@@ -191,102 +290,27 @@ fun AttentionAnalyticsScreen(
         }
     }
 
+    // attentionState and sectionSummaries change on every analysed frame while recording. The header, each section
+    // and the heatmap are separate composables that take only the values they show, so such a frame re-runs this
+    // body and skips them unless those values changed.
     Column(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(scrollState)
             .padding(horizontal = 12.dp, vertical = 6.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+        verticalArrangement = PassageSpacing
     ) {
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            shape = RoundedCornerShape(14.dp)
-        ) {
-            Column(modifier = Modifier.padding(14.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    val replay = attentionState.selectedReplaySession
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = if (replay != null && !attentionState.isRecording) {
-                                "Session Replay: ${replay.title}"
-                            } else {
-                                "Section Dwell & Fixation Centroid Lab"
-                            },
-                            style = MaterialTheme.typography.titleMedium,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Text(
-                            text = when {
-                                attentionState.isRecording ->
-                                    "Recording (${attentionState.elapsedSeconds}s) • Nat Blinks: ${attentionState.sessionNaturalBlinks} • Cmd Blinks: ${attentionState.sessionIntentionalBlinks}"
-                                replay != null ->
-                                    "${replay.durationSeconds}s • ${formatEstimatedWpm(replay.effectiveWordsPerMinute)} • ${String.format(Locale.US, "%.1f", replay.blinksPerMinute)} blinks/min • ${replay.fixationClusterCount} clusters"
-                                else ->
-                                    "Measures layout section dwell (%) & dispersion fixation clusters at camera FPS."
-                            },
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.width(8.dp))
-
-                    if (!attentionState.isRecording) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            if (replay != null) {
-                                OutlinedButton(
-                                    onClick = onClearReplay,
-                                    modifier = Modifier.testTag("close_session_replay_button")
-                                ) {
-                                    Icon(imageVector = Icons.Default.Close, contentDescription = "Close Replay")
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("Exit Replay", style = MaterialTheme.typography.labelSmall)
-                                }
-                            }
-                            Button(
-                                onClick = onStartRecording,
-                                modifier = Modifier.testTag("start_attention_session_button"),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = MaterialTheme.colorScheme.primary,
-                                    contentColor = MaterialTheme.colorScheme.onPrimary
-                                )
-                            ) {
-                                Icon(imageVector = Icons.Default.FiberManualRecord, contentDescription = "Record")
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Record", style = MaterialTheme.typography.labelLarge)
-                            }
-                        }
-                    } else {
-                        Button(
-                            onClick = onStopAndSaveRecording,
-                            modifier = Modifier.testTag("stop_attention_session_button"),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.error,
-                                contentColor = Color.White
-                            )
-                        ) {
-                            Icon(imageVector = Icons.Default.Stop, contentDescription = "Stop")
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Stop & Save", style = MaterialTheme.typography.labelLarge)
-                        }
-                    }
-                }
-
-                if (shouldShowThermalGuard(attentionState)) {
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = "Thermal Guard: Device warming up (>40% FPS drop from baseline) — Performance Mode engaged automatically.",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.tertiary
-                    )
-                }
-            }
-        }
+        AttentionSessionHeaderCard(
+            isRecording = attentionState.isRecording,
+            elapsedSeconds = attentionState.elapsedSeconds,
+            sessionNaturalBlinks = attentionState.sessionNaturalBlinks,
+            sessionIntentionalBlinks = attentionState.sessionIntentionalBlinks,
+            replay = attentionState.selectedReplaySession,
+            showThermalGuard = shouldShowThermalGuard(attentionState),
+            onClearReplay = onClearReplay,
+            onStartRecording = onStartRecording,
+            onStopAndSaveRecording = onStopAndSaveRecording
+        )
 
         Box(
             modifier = Modifier
@@ -300,146 +324,264 @@ fun AttentionAnalyticsScreen(
                         visibleBoundsInRoot = coords.boundsInRoot()
                     )
                 }
-                .clip(RoundedCornerShape(16.dp))
+                .clip(PassageShape)
                 .background(MaterialTheme.colorScheme.surface)
-                .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(16.dp))
+                .border(1.dp, MaterialTheme.colorScheme.outline, PassageShape)
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                verticalArrangement = PassageSpacing
             ) {
                 val anySectionDwell = sectionSummaries.sumOf { it.percentage } > 0
                 passageSections.forEach { section ->
                     val summary = sectionSummaries.firstOrNull { it.sectionId == section.sectionId }
-                    val isCurrentlyLookedAt = attentionState.isRecording && attentionState.activeSectionId == section.sectionId
-                    val pct = summary?.percentage ?: 0
+                    PassageSectionCard(
+                        section = section,
+                        dwellPercentage = summary?.percentage ?: 0,
+                        anySectionDwell = anySectionDwell,
+                        isCurrentlyLookedAt = attentionState.isRecording &&
+                            attentionState.activeSectionId == section.sectionId,
+                        sectionBoundsMap = sectionBoundsMap
+                    )
+                }
+            }
 
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(
-                                if (isCurrentlyLookedAt) {
-                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
-                                } else {
-                                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
-                                }
-                            )
-                            .border(
-                                width = if (isCurrentlyLookedAt) 1.5.dp else 1.dp,
-                                color = if (isCurrentlyLookedAt) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
-                                shape = RoundedCornerShape(12.dp)
-                            )
-                            .onGloballyPositioned { coords ->
-                                sectionBoundsMap[section.sectionId] = coords.boundsInRoot()
+            val clusters = attentionState.computedClusters
+            if (clusters.isNotEmpty()) {
+                FixationHeatmapOverlay(clusters)
+            }
+        }
+    }
+}
+
+@Composable
+private fun AttentionSessionHeaderCard(
+    isRecording: Boolean,
+    elapsedSeconds: Int,
+    sessionNaturalBlinks: Int,
+    sessionIntentionalBlinks: Int,
+    replay: TrackingSession?,
+    showThermalGuard: Boolean,
+    onClearReplay: () -> Unit,
+    onStartRecording: () -> Unit,
+    onStopAndSaveRecording: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(14.dp)
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = if (replay != null && !isRecording) {
+                            "Session Replay: ${replay.title}"
+                        } else {
+                            "Section Dwell & Fixation Centroid Lab"
+                        },
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = when {
+                            isRecording ->
+                                "Recording (${elapsedSeconds}s) • Nat Blinks: $sessionNaturalBlinks • Cmd Blinks: $sessionIntentionalBlinks"
+                            replay != null ->
+                                "${replay.durationSeconds}s • ${formatEstimatedWpm(replay.effectiveWordsPerMinute)} • ${String.format(Locale.US, "%.1f", replay.blinksPerMinute)} blinks/min • ${replay.fixationClusterCount} clusters"
+                            else ->
+                                "Measures layout section dwell (%) & dispersion fixation clusters at camera FPS."
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
+                Spacer(modifier = Modifier.width(8.dp))
+
+                if (!isRecording) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        if (replay != null) {
+                            OutlinedButton(
+                                onClick = onClearReplay,
+                                modifier = Modifier.testTag("close_session_replay_button")
+                            ) {
+                                Icon(imageVector = Icons.Default.Close, contentDescription = "Close Replay")
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Exit Replay", style = MaterialTheme.typography.labelSmall)
                             }
-                            .padding(12.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = section.heading,
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.SemiBold,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                modifier = Modifier.weight(1f)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = formatSectionDwellLabel(pct, anySectionDwell),
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.primary
-                            )
                         }
-                        Spacer(modifier = Modifier.height(6.dp))
-                        Text(
-                            text = section.body,
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onSurface
+                        Button(
+                            onClick = onStartRecording,
+                            modifier = Modifier.testTag("start_attention_session_button"),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.primary,
+                                contentColor = MaterialTheme.colorScheme.onPrimary
+                            )
+                        ) {
+                            Icon(imageVector = Icons.Default.FiberManualRecord, contentDescription = "Record")
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Record", style = MaterialTheme.typography.labelLarge)
+                        }
+                    }
+                } else {
+                    Button(
+                        onClick = onStopAndSaveRecording,
+                        modifier = Modifier.testTag("stop_attention_session_button"),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.error,
+                            contentColor = Color.White
                         )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        LinearProgressIndicator(
-                            progress = { (pct / 100f).coerceIn(0f, 1f) },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(5.dp)
-                                .clip(RoundedCornerShape(3.dp)),
-                            color = MaterialTheme.colorScheme.tertiary,
-                            trackColor = MaterialTheme.colorScheme.background
-                        )
+                    ) {
+                        Icon(imageVector = Icons.Default.Stop, contentDescription = "Stop")
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Stop & Save", style = MaterialTheme.typography.labelLarge)
                     }
                 }
             }
 
-            if (attentionState.computedClusters.isNotEmpty()) {
-                val clusters = attentionState.computedClusters
-                Canvas(
-                    modifier = Modifier
-                        .matchParentSize()
-                        .testTag("attention_heatmap_canvas")
-                ) {
-                    // 1. Gaussian-splat density heatmap circles
-                    for (cluster in clusters) {
-                        val cx = cluster.normX * size.width
-                        val cy = cluster.normY * size.height
-                        val weightNorm = (cluster.dwellMs.toFloat() / 2200f).coerceIn(0.25f, 1.0f)
-                        val radius = (42.dp.toPx() + weightNorm * 46.dp.toPx())
+            if (showThermalGuard) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "Thermal Guard: Device warming up (>40% FPS drop from baseline) — Performance Mode engaged automatically.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.tertiary
+                )
+            }
+        }
+    }
+}
 
+@Composable
+private fun PassageSectionCard(
+    section: SectionPassageItem,
+    dwellPercentage: Int,
+    anySectionDwell: Boolean,
+    isCurrentlyLookedAt: Boolean,
+    sectionBoundsMap: SnapshotStateMap<String, Rect>
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(SectionShape)
+            .background(
+                if (isCurrentlyLookedAt) {
+                    MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+                } else {
+                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+                }
+            )
+            .border(
+                width = if (isCurrentlyLookedAt) 1.5.dp else 1.dp,
+                color = if (isCurrentlyLookedAt) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+                shape = SectionShape
+            )
+            .onGloballyPositioned { coords ->
+                sectionBoundsMap[section.sectionId] = coords.boundsInRoot()
+            }
+            .padding(12.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = section.heading,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = formatSectionDwellLabel(dwellPercentage, anySectionDwell),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary
+            )
+        }
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = section.body,
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        LinearProgressIndicator(
+            progress = { (dwellPercentage / 100f).coerceIn(0f, 1f) },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(5.dp)
+                .clip(RoundedCornerShape(3.dp)),
+            color = MaterialTheme.colorScheme.tertiary,
+            trackColor = MaterialTheme.colorScheme.background
+        )
+    }
+}
+
+/**
+ * Fixation heatmap over the passage Box (same frame as the passage-local gaze samples). Splat brushes, centers and
+ * the dash effect are rebuilt only when the cluster list or the canvas size changes, and label layouts are kept
+ * across cluster updates, so a redraw issues draw calls only.
+ */
+@Composable
+private fun BoxScope.FixationHeatmapOverlay(clusters: List<FixationClusterPoint>) {
+    val textMeasurer = rememberTextMeasurer()
+    val labelLayouts = remember(textMeasurer) { ClusterLabelLayouts(textMeasurer) }
+    // Canvas(modifier, onDraw) is Spacer(modifier.drawBehind(onDraw)); drawWithCache keeps per-size draw objects.
+    Spacer(
+        modifier = Modifier
+            .matchParentSize()
+            .testTag("attention_heatmap_canvas")
+            .drawWithCache {
+                val frame = buildFixationHeatmapFrame(clusters, size, this)
+                val trajectoryEffect = PathEffect.dashPathEffect(floatArrayOf(12f, 8f), 0f)
+                onDrawBehind {
+                    val centerX = frame.centerX
+                    val centerY = frame.centerY
+                    val count = centerX.size
+
+                    // 1. Gaussian-splat density heatmap circles
+                    for (i in 0 until count) {
                         drawCircle(
-                            brush = Brush.radialGradient(
-                                colors = listOf(
-                                    Color(0xFFEF4444).copy(alpha = 0.46f * weightNorm),
-                                    Color(0xFFF59E0B).copy(alpha = 0.28f * weightNorm),
-                                    Color.Transparent
-                                ),
-                                center = Offset(cx, cy),
-                                radius = radius
-                            ),
-                            radius = radius,
-                            center = Offset(cx, cy)
+                            brush = frame.splatBrush[i],
+                            radius = frame.splatRadius[i],
+                            center = Offset(centerX[i], centerY[i])
                         )
                     }
 
                     // 2. Dashed centroid sequence trajectory lines
-                    for (i in 0 until (clusters.size - 1)) {
-                        val p1 = Offset(clusters[i].normX * size.width, clusters[i].normY * size.height)
-                        val p2 = Offset(clusters[i + 1].normX * size.width, clusters[i + 1].normY * size.height)
+                    for (i in 0 until (count - 1)) {
                         drawLine(
                             color = Color(0xFF00E5FF).copy(alpha = 0.72f),
-                            start = p1,
-                            end = p2,
-                            strokeWidth = 2.dp.toPx(),
-                            pathEffect = PathEffect.dashPathEffect(floatArrayOf(12f, 8f), 0f)
+                            start = Offset(centerX[i], centerY[i]),
+                            end = Offset(centerX[i + 1], centerY[i + 1]),
+                            strokeWidth = frame.trajectoryStrokeWidthPx,
+                            pathEffect = trajectoryEffect
                         )
                     }
 
                     // 3. Numbered fixation cluster sequence nodes (1..N)
-                    clusters.forEachIndexed { index, cluster ->
-                        val cx = cluster.normX * size.width
-                        val cy = cluster.normY * size.height
+                    for (i in 0 until count) {
+                        val cx = centerX[i]
+                        val cy = centerY[i]
                         drawCircle(
                             color = Color(0xFF0B0F17),
-                            radius = 11.dp.toPx(),
+                            radius = frame.nodeOutlineRadiusPx,
                             center = Offset(cx, cy)
                         )
                         drawCircle(
                             color = Color(0xFF00E5FF),
-                            radius = 10.dp.toPx(),
+                            radius = frame.nodeFillRadiusPx,
                             center = Offset(cx, cy)
                         )
-                        val labelLayout = textMeasurer.measure(
-                            text = "${index + 1}",
-                            style = TextStyle(
-                                color = Color(0xFF0B0F17),
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                        )
+                        val labelLayout = labelLayouts.layoutFor(i)
                         drawText(
                             textLayoutResult = labelLayout,
                             topLeft = Offset(
@@ -450,6 +592,5 @@ fun AttentionAnalyticsScreen(
                     }
                 }
             }
-        }
-    }
+    )
 }

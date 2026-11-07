@@ -2,6 +2,8 @@ package com.example
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.Context
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -16,6 +18,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -23,29 +26,39 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.CenterFocusStrong
+import androidx.compose.material.icons.filled.CloudDone
+import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.CloudSync
+import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.outlined.Analytics
 import androidx.compose.material.icons.outlined.CenterFocusStrong
 import androidx.compose.material.icons.outlined.CloudSync
 import androidx.compose.material.icons.outlined.GridView
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -66,6 +79,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -104,18 +118,6 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import java.util.Locale
 
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.size
-import androidx.compose.material.icons.filled.CloudDone
-import androidx.compose.material.icons.filled.CloudOff
-import androidx.compose.material.icons.filled.DeleteForever
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Switch
-import androidx.compose.material3.TextButton
-import androidx.compose.ui.text.font.FontWeight
-
 internal fun FirebaseAuth.authStateFlow(): Flow<FirebaseUser?> = callbackFlow {
     val listener = FirebaseAuth.AuthStateListener { auth ->
         trySend(auth.currentUser)
@@ -149,9 +151,27 @@ internal fun shouldClearUserScopedViewModels(previousUid: String?, newUid: Strin
 internal fun pixelsToMillimeters(px: Int, dpi: Float): Double =
     (px / dpi.coerceAtLeast(120f)) * 25.4
 
+/** Whether this app currently holds the CAMERA runtime permission. */
+internal fun Context.isCameraPermissionGranted(): Boolean =
+    ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+
+/** The wizard steps during which the full-screen fixation target is drawn over the workbench. */
+internal fun isCalibrationTargetStep(step: CalibrationFlowStep): Boolean =
+    step == CalibrationFlowStep.FIT_5_POINTS || step == CalibrationFlowStep.VALIDATE_4_POINTS
+
+/**
+ * Starts loading the on-device vault file on the framework's SharedPreferences loader thread and
+ * returns it. [LocalTelemetryStore] opens the same file with the same mode, so it gets this cached
+ * instance; without the prefetch the ViewModel's first vault read blocks the main thread on the
+ * file's parse during the first composition.
+ */
+internal fun prefetchLocalVault(context: Context): SharedPreferences =
+    context.applicationContext.getSharedPreferences(LocalTelemetryStore.VAULT_PREFS_NAME, Context.MODE_PRIVATE)
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        prefetchLocalVault(this)
         // The theme is always dark, so the system bars must always use light icons. The default
         // SystemBarStyle.auto follows the system light/dark mode instead (dark icons on dark).
         enableEdgeToEdge(
@@ -168,7 +188,11 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun AppRootNavigation(auth: FirebaseAuth = Firebase.auth) {
-    val currentUser by auth.authStateFlow().collectAsStateWithLifecycle(initialValue = auth.currentUser)
+    // Remembered: collectAsStateWithLifecycle restarts its collector whenever the Flow instance
+    // changes, so a fresh callbackFlow per recomposition re-registered the Firebase listener on
+    // every auth change.
+    val authUserFlow = remember(auth) { auth.authStateFlow() }
+    val currentUser by authUserFlow.collectAsStateWithLifecycle(initialValue = auth.currentUser)
     val user = currentUser
 
     // After sign-out, clear the signed-out user's ViewModel so its simulator ticker and session
@@ -303,22 +327,13 @@ fun AuthenticatedMainWorkbench(
         }
     }
 
-    var hasCameraPermission by remember {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
-                PackageManager.PERMISSION_GRANTED
-        )
-    }
+    var hasCameraPermission by remember { mutableStateOf(context.isCameraPermissionGranted()) }
 
     val cameraPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         hasCameraPermission = granted
-        if (granted) {
-            viewModel.toggleSimulatorProxyMode(false)
-        } else {
-            viewModel.toggleSimulatorProxyMode(true)
-        }
+        viewModel.toggleSimulatorProxyMode(!granted)
     }
 
     // Automatically request front-camera permission on first launch so physical devices lock immediately.
@@ -326,10 +341,7 @@ fun AuthenticatedMainWorkbench(
     // mode the user chose; it resets when the workbench leaves composition (sign-out).
     var initialCameraCheckDone by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(Unit) {
-        val currentlyGranted = ContextCompat.checkSelfPermission(
-            context,
-            Manifest.permission.CAMERA
-        ) == PackageManager.PERMISSION_GRANTED
+        val currentlyGranted = context.isCameraPermissionGranted()
         hasCameraPermission = currentlyGranted
         if (!initialCameraCheckDone) {
             initialCameraCheckDone = true
@@ -343,19 +355,24 @@ fun AuthenticatedMainWorkbench(
 
     // Permission granted from system Settings while the app was in the background: pick it up on resume.
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
-        val granted = ContextCompat.checkSelfPermission(
-            context,
-            Manifest.permission.CAMERA
-        ) == PackageManager.PERMISSION_GRANTED
+        val granted = context.isCameraPermissionGranted()
         if (granted && !hasCameraPermission) {
             viewModel.toggleSimulatorProxyMode(false)
         }
         hasCameraPermission = granted
     }
 
-    val hudState by viewModel.liveHudState.collectAsStateWithLifecycle()
-    val calibrationState by viewModel.calibrationState.collectAsStateWithLifecycle()
-    val attentionState by viewModel.attentionState.collectAsStateWithLifecycle()
+    // Hot states (the HUD changes on every camera frame; calibration and attention on every sample
+    // while a wizard or recording runs) stay State holders. They are read only inside
+    // ReadInOwnScope or the composable lambda that passes them on, so a frame recomposes the
+    // composables that show it rather than this whole Scaffold content.
+    val hudStateHolder = viewModel.liveHudState.collectAsStateWithLifecycle()
+    val calibrationStateHolder = viewModel.calibrationState.collectAsStateWithLifecycle()
+    val attentionStateHolder = viewModel.attentionState.collectAsStateWithLifecycle()
+    // Flips only when the wizard enters or leaves a fixation step, not on every collected sample.
+    val showCalibrationTargets by remember(calibrationStateHolder) {
+        derivedStateOf { isCalibrationTargetStep(calibrationStateHolder.value.step) }
+    }
     val aacTiles by viewModel.aacTilesState.collectAsStateWithLifecycle()
     val profilesState by viewModel.calibrationProfilesState.collectAsStateWithLifecycle()
     val sessionsState by viewModel.trackingSessionsState.collectAsStateWithLifecycle()
@@ -437,49 +454,54 @@ fun AuthenticatedMainWorkbench(
                 .onGloballyPositioned { contentRootBoundsInRoot = it.boundsInRoot() }
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
-                OpticalDiagnosticsBar(
-                    hudState = hudState,
-                    hasCameraPermission = hasCameraPermission,
-                    onRequestCameraPermission = {
-                        cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
-                    },
-                    onToggleSimulator = { viewModel.toggleSimulatorProxyMode(it) },
-                    onCycleOverlayMode = { viewModel.cycleOverlayVisualMode() },
-                    onCycleResolutionTier = { viewModel.cycleAnalysisResolutionTier() },
-                    onSimulatorDragTarget = { nx, ny ->
-                        viewModel.updateSimulatorGazeTarget(nx, ny)
-                    },
-                    onSimulateCommandBlink = {
-                        viewModel.simulateIntentionalCommandBlink()
-                    },
-                    onSimulateBrowRaise = {
-                        viewModel.simulateBrowRaiseCommand()
-                    },
-                    onTriggerRecalibration = {
-                        viewModel.dismissRecalibrateNudge()
-                        selectedTab = 0
-                        viewModel.startCalibrationAndValidationWizard()
-                    },
-                    onDismissRecalibrateNudge = {
-                        viewModel.dismissRecalibrateNudge()
-                    },
-                    onFeatureFrame = { frame ->
-                        // Delivered on the main thread: OpticalDiagnosticsBar conflates the engine's
-                        // analysis-thread frames onto Main before invoking this callback.
-                        viewModel.submitCameraFrame(frame)
-                    }
-                )
+                ReadInOwnScope(hudStateHolder) { hudState ->
+                    OpticalDiagnosticsBar(
+                        hudState = hudState,
+                        hasCameraPermission = hasCameraPermission,
+                        onRequestCameraPermission = {
+                            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                        },
+                        onToggleSimulator = { viewModel.toggleSimulatorProxyMode(it) },
+                        onCycleOverlayMode = { viewModel.cycleOverlayVisualMode() },
+                        onCycleResolutionTier = { viewModel.cycleAnalysisResolutionTier() },
+                        onSimulatorDragTarget = { nx, ny ->
+                            viewModel.updateSimulatorGazeTarget(nx, ny)
+                        },
+                        onSimulateCommandBlink = {
+                            viewModel.simulateIntentionalCommandBlink()
+                        },
+                        onSimulateBrowRaise = {
+                            viewModel.simulateBrowRaiseCommand()
+                        },
+                        onTriggerRecalibration = {
+                            viewModel.dismissRecalibrateNudge()
+                            selectedTab = 0
+                            viewModel.startCalibrationAndValidationWizard()
+                        },
+                        onDismissRecalibrateNudge = {
+                            viewModel.dismissRecalibrateNudge()
+                        },
+                        onFeatureFrame = { frame ->
+                            // Delivered on the main thread: OpticalDiagnosticsBar conflates the engine's
+                            // analysis-thread frames onto Main before invoking this callback.
+                            viewModel.submitCameraFrame(frame)
+                        }
+                    )
+                }
 
                 // Always-visible Privacy Settings Toggle (Cloud Telemetry Opt-In/Out) & Firestore Data Deletion Bar
                 // when on Calibrate, Control Deck, or Attention Lab tabs (Tab 3 renders the expanded CloudPrivacyScreen card)
                 if (selectedTab != 3) {
-                    InlineCloudPrivacyBar(
-                        cloudSyncEnabled = hudState.cloudSyncEnabled,
-                        isDeletingCloudData = hudState.isDeletingCloudData,
-                        currentUserId = currentUserId,
-                        onToggleCloudSync = { viewModel.toggleCloudSync(it) },
-                        onConfirmDeleteCloud = { viewModel.deleteFirestoreCloudTelemetry() }
-                    )
+                    // Re-run per HUD frame, but the bar skips unless one of its inputs changed.
+                    ReadInOwnScope(hudStateHolder) { hudState ->
+                        InlineCloudPrivacyBar(
+                            cloudSyncEnabled = hudState.cloudSyncEnabled,
+                            isDeletingCloudData = hudState.isDeletingCloudData,
+                            currentUserId = currentUserId,
+                            onToggleCloudSync = { viewModel.toggleCloudSync(it) },
+                            onConfirmDeleteCloud = { viewModel.deleteFirestoreCloudTelemetry() }
+                        )
+                    }
                 }
 
                 if (ttsUnavailable) {
@@ -501,7 +523,8 @@ fun AuthenticatedMainWorkbench(
                     }
                 }
 
-                if (statusBanner != null) {
+                val banner = statusBanner
+                if (banner != null) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -514,7 +537,7 @@ fun AuthenticatedMainWorkbench(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = statusBanner!!,
+                            text = banner,
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.secondary,
                             modifier = Modifier.weight(1f)
@@ -530,26 +553,30 @@ fun AuthenticatedMainWorkbench(
 
                 Box(modifier = Modifier.weight(1f)) {
                     when (selectedTab) {
-                        0 -> CalibrationStudioScreen(
-                            calibrationState = calibrationState,
-                            hudState = hudState,
-                            onStartWizard = { viewModel.startCalibrationAndValidationWizard() },
-                            onCancelWizard = { viewModel.cancelCalibrationWizard() },
-                            onUpdateProfileName = { viewModel.updateDraftProfileName(it) },
-                            onSaveProfile = { viewModel.saveCompletedCalibrationProfile() },
-                            onSnapSimulatorToCurrentTarget = { tx, ty ->
-                                viewModel.updateSimulatorGazeTarget(tx, ty)
-                            },
-                            onToggleIncludeValidation = { includeVal ->
-                                viewModel.setIncludeHeldOutValidation(includeVal)
-                            },
-                            onCaptureManualSamples = {
-                                viewModel.captureManualSamplesForCurrentTarget()
-                            }
-                        )
+                        // The calibration state is read inside this lambda, so its per-sample
+                        // updates also recompose only the lambda.
+                        0 -> ReadInOwnScope(hudStateHolder) { hudState ->
+                            CalibrationStudioScreen(
+                                calibrationState = calibrationStateHolder.value,
+                                hudState = hudState,
+                                onStartWizard = { viewModel.startCalibrationAndValidationWizard() },
+                                onCancelWizard = { viewModel.cancelCalibrationWizard() },
+                                onUpdateProfileName = { viewModel.updateDraftProfileName(it) },
+                                onSaveProfile = { viewModel.saveCompletedCalibrationProfile() },
+                                onSnapSimulatorToCurrentTarget = { tx, ty ->
+                                    viewModel.updateSimulatorGazeTarget(tx, ty)
+                                },
+                                onToggleIncludeValidation = { includeVal ->
+                                    viewModel.setIncludeHeldOutValidation(includeVal)
+                                },
+                                onCaptureManualSamples = {
+                                    viewModel.captureManualSamplesForCurrentTarget()
+                                }
+                            )
+                        }
                         1 -> ReadInOwnScope(reticleRootPositionState) { reticleRootPosition ->
                             GazeControlDeckScreen(
-                                hudState = hudState,
+                                hudState = hudStateHolder.value,
                                 reticleRootPosition = reticleRootPosition,
                                 tiles = aacTiles,
                                 onUpdateFocusedTile = { viewModel.updateFocusedTile(it) },
@@ -571,98 +598,106 @@ fun AuthenticatedMainWorkbench(
                             )
                         }
                         2 -> {
-                            // Summaries depend only on attentionState; do not rebuild them on
-                            // unrelated recompositions.
-                            val sectionSummaries = remember(viewModel, attentionState) {
-                                viewModel.computeSectionSummariesForDisplay()
-                            }
                             // A recording keeps running on other tabs; once the passage leaves
                             // composition no section may be credited with dwell.
                             DisposableEffect(viewModel) {
                                 onDispose { viewModel.detachReadingSectionLayout() }
                             }
-                            AttentionAnalyticsScreen(
-                                attentionState = attentionState,
-                                // Provider: read only inside the screen's hit-test coroutine.
-                                reticleRootPosition = { reticleRootPositionState.value },
-                                passageSections = viewModel.readingPassageSections,
-                                sectionSummaries = sectionSummaries,
-                                onUpdateLayoutHitSection = { viewModel.updateActiveReadingSectionFromLayout(it) },
-                                onUpdatePassageGazePoint = { viewModel.updatePassageGazePoint(it) },
-                                onClearReplay = { viewModel.clearSessionReplay() },
-                                onStartRecording = { viewModel.startAttentionRecording() },
-                                onStopAndSaveRecording = { viewModel.stopAndSaveAttentionSession() }
+                            // The HUD is not read here: camera frames leave this tab alone unless
+                            // a recording updates the attention state.
+                            ReadInOwnScope(attentionStateHolder) { attentionState ->
+                                // Summaries depend only on attentionState; do not rebuild them on
+                                // unrelated recompositions.
+                                val sectionSummaries = remember(viewModel, attentionState) {
+                                    viewModel.computeSectionSummariesForDisplay()
+                                }
+                                AttentionAnalyticsScreen(
+                                    attentionState = attentionState,
+                                    // Provider: read only inside the screen's hit-test coroutine.
+                                    reticleRootPosition = { reticleRootPositionState.value },
+                                    passageSections = viewModel.readingPassageSections,
+                                    sectionSummaries = sectionSummaries,
+                                    onUpdateLayoutHitSection = { viewModel.updateActiveReadingSectionFromLayout(it) },
+                                    onUpdatePassageGazePoint = { viewModel.updatePassageGazePoint(it) },
+                                    onClearReplay = { viewModel.clearSessionReplay() },
+                                    onStartRecording = { viewModel.startAttentionRecording() },
+                                    onStopAndSaveRecording = { viewModel.stopAndSaveAttentionSession() }
+                                )
+                            }
+                        }
+                        3 -> ReadInOwnScope(hudStateHolder) { hudState ->
+                            CloudPrivacyScreen(
+                                hudState = hudState,
+                                currentUserId = currentUserId,
+                                currentUserEmail = currentUserEmail,
+                                currentUserName = currentUserName,
+                                firestoreDatabaseId = firestoreDatabaseId,
+                                profilesState = profilesState,
+                                sessionsState = sessionsState,
+                                onToggleCloudSync = { viewModel.toggleCloudSync(it) },
+                                onActivateProfile = { viewModel.activateSavedProfile(it) },
+                                onDeleteProfile = { viewModel.deleteCalibrationProfile(it) },
+                                onSelectSessionReplay = { session ->
+                                    viewModel.selectSessionForReplay(session)
+                                    selectedTab = 2
+                                },
+                                onDeleteSession = { viewModel.deleteTrackingSession(it) },
+                                onDeleteFirestoreOnly = { viewModel.deleteFirestoreCloudTelemetry() },
+                                onEraseAllTelemetry = { viewModel.eraseAllCloudTelemetry() },
+                                onSignOut = {
+                                    // Run the credential clear on the Activity's lifecycle scope: the
+                                    // sign-out removes this composition, which would cancel a scope
+                                    // remembered here while clearCredentialState is still in flight.
+                                    if (!isSigningOut) {
+                                        isSigningOut = true
+                                        signOutUser(
+                                            context = context,
+                                            credentialManager = credentialManager,
+                                            onSignOutComplete = { isSigningOut = false },
+                                            scope = lifecycleOwner.lifecycleScope,
+                                            auth = auth
+                                        )
+                                    }
+                                },
+                                onChangeDwellDurationMs = { viewModel.setDwellTriggerDuration(it) },
+                                onChangeDwellSensitivityMultiplier = { viewModel.setDwellSensitivityMultiplier(it) },
+                                onSelectDwellPreset = { viewModel.setDwellSpeedPreset(it) },
+                                isAttentionRecording = attentionStateHolder.value.isRecording
                             )
                         }
-                        3 -> CloudPrivacyScreen(
-                            hudState = hudState,
-                            currentUserId = currentUserId,
-                            currentUserEmail = currentUserEmail,
-                            currentUserName = currentUserName,
-                            firestoreDatabaseId = firestoreDatabaseId,
-                            profilesState = profilesState,
-                            sessionsState = sessionsState,
-                            onToggleCloudSync = { viewModel.toggleCloudSync(it) },
-                            onActivateProfile = { viewModel.activateSavedProfile(it) },
-                            onDeleteProfile = { viewModel.deleteCalibrationProfile(it) },
-                            onSelectSessionReplay = { session ->
-                                viewModel.selectSessionForReplay(session)
-                                selectedTab = 2
-                            },
-                            onDeleteSession = { viewModel.deleteTrackingSession(it) },
-                            onDeleteFirestoreOnly = { viewModel.deleteFirestoreCloudTelemetry() },
-                            onEraseAllTelemetry = { viewModel.eraseAllCloudTelemetry() },
-                            onSignOut = {
-                                // Run the credential clear on the Activity's lifecycle scope: the
-                                // sign-out removes this composition, which would cancel a scope
-                                // remembered here while clearCredentialState is still in flight.
-                                if (!isSigningOut) {
-                                    isSigningOut = true
-                                    signOutUser(
-                                        context = context,
-                                        credentialManager = credentialManager,
-                                        onSignOutComplete = { isSigningOut = false },
-                                        scope = lifecycleOwner.lifecycleScope,
-                                        auth = auth
-                                    )
-                                }
-                            },
-                            onChangeDwellDurationMs = { viewModel.setDwellTriggerDuration(it) },
-                            onChangeDwellSensitivityMultiplier = { viewModel.setDwellSensitivityMultiplier(it) },
-                            onSelectDwellPreset = { viewModel.setDwellSpeedPreset(it) },
-                            isAttentionRecording = attentionState.isRecording
-                        )
                     }
                 }
             }
 
             // Calibration fixation targets are drawn in the same frame as the reticle overlay
             // (this root Box), which is the frame gaze normX/normY is normalized to.
-            if (selectedTab == 0 &&
-                (calibrationState.step == CalibrationFlowStep.FIT_5_POINTS ||
-                    calibrationState.step == CalibrationFlowStep.VALIDATE_4_POINTS)
-            ) {
-                CalibrationTargetFullscreenOverlay(
-                    calibrationState = calibrationState,
-                    modifier = Modifier.fillMaxSize()
-                )
+            if (selectedTab == 0 && showCalibrationTargets) {
+                ReadInOwnScope(calibrationStateHolder) { calibrationState ->
+                    CalibrationTargetFullscreenOverlay(
+                        calibrationState = calibrationState,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
             }
 
             // Live 120Hz Region-Level Confidence Circle Reticle Overlay reporting root coordinates
-            RegionConfidenceReticleOverlay(
-                hudState = hudState,
-                onReticleRootPositionChanged = { reticleRootPositionState.value = it }
-            )
+            ReadInOwnScope(hudStateHolder) { hudState ->
+                RegionConfidenceReticleOverlay(
+                    hudState = hudState,
+                    onReticleRootPositionChanged = { reticleRootPositionState.value = it }
+                )
+            }
         }
     }
 }
 
 /**
  * Reads [state] inside its own restart scope, so frequent writes (the reticle position is written
- * up to every display frame) recompose only [content], not the caller.
+ * up to every display frame, the HUD on every camera frame) recompose only [content], not the
+ * caller. States read inside [content] are likewise tracked by [content]'s own scope.
  */
 @Composable
-private fun <T> ReadInOwnScope(state: State<T>, content: @Composable (T) -> Unit) {
+internal fun <T> ReadInOwnScope(state: State<T>, content: @Composable (T) -> Unit) {
     content(state.value)
 }
 

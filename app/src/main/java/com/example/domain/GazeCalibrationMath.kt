@@ -147,17 +147,72 @@ object GazeCalibrationMath {
         baselineEyeDistPx: Double = 148.0
     ): Pair<Float, Float> {
         val w = if (matrixCoeffs.size == 12) matrixCoeffs else DEFAULT_AFFINE_MATRIX_2X6
-        val f = feature.toStandardizedFeatureArray(baselineEyeDistPx)
-        var predX = 0.0
-        var predY = 0.0
-        for (j in 0 until 6) {
-            predX += w[j] * f[j]
-            predY += w[6 + j] * f[j]
+        return projectStandardized(feature, baselineEyeDistPx, { w[it] }) { x, y -> Pair(x, y) }
+    }
+
+    /**
+     * Allocation-free [projectGaze] for per-frame callers: writes the same clamped (x, y) to out[0] and
+     * out[1] and returns [out].
+     */
+    fun projectGazeInto(
+        feature: GazeFeatureVector,
+        matrixCoeffs: List<Double>,
+        baselineEyeDistPx: Double,
+        out: FloatArray
+    ): FloatArray {
+        val w = if (matrixCoeffs.size == 12) matrixCoeffs else DEFAULT_AFFINE_MATRIX_2X6
+        return projectStandardized(feature, baselineEyeDistPx, { w[it] }) { x, y ->
+            out[0] = x
+            out[1] = y
+            out
         }
-        return Pair(
-            predX.toFloat().coerceIn(0.02f, 0.98f),
-            predY.toFloat().coerceIn(0.02f, 0.98f)
+    }
+
+    /**
+     * Features 1..5 of [GazeFeatureVector.toStandardizedFeatureArray] (feature 0 is the constant 1.0),
+     * handed to [block] without allocating the array. Same expressions, so the values are bit-identical.
+     */
+    private inline fun <R> withStandardizedFeatures(
+        feature: GazeFeatureVector,
+        baselineEyeDistPx: Double,
+        block: (f1: Double, f2: Double, f3: Double, f4: Double, f5: Double) -> R
+    ): R {
+        val safeBaseDist = baselineEyeDistPx.coerceAtLeast(30.0)
+        val distScale = ((feature.eyeDistancePx - safeBaseDist) / safeBaseDist).coerceIn(-0.6, 0.6)
+        return block(
+            (feature.gx / 0.25).coerceIn(-2.5, 2.5),
+            (feature.gy / 0.20).coerceIn(-2.5, 2.5),
+            (feature.yaw / 20.0).coerceIn(-2.5, 2.5),
+            (feature.pitch / 15.0).coerceIn(-2.5, 2.5),
+            ((feature.roll / 15.0) + 0.5 * distScale).coerceIn(-2.5, 2.5)
         )
+    }
+
+    /**
+     * [projectGaze]'s weighted sums and clamp, reading coefficient j (0..11) through [coef]. Each axis is
+     * summed in the original j = 0..5 order; coef(0) * f0 is coef(0) exactly because f0 is 1.0.
+     */
+    private inline fun <R> projectStandardized(
+        feature: GazeFeatureVector,
+        baselineEyeDistPx: Double,
+        coef: (Int) -> Double,
+        block: (x: Float, y: Float) -> R
+    ): R = withStandardizedFeatures(feature, baselineEyeDistPx) { f1, f2, f3, f4, f5 ->
+        var predX = 0.0
+        predX += coef(0)
+        predX += coef(1) * f1
+        predX += coef(2) * f2
+        predX += coef(3) * f3
+        predX += coef(4) * f4
+        predX += coef(5) * f5
+        var predY = 0.0
+        predY += coef(6)
+        predY += coef(7) * f1
+        predY += coef(8) * f2
+        predY += coef(9) * f3
+        predY += coef(10) * f4
+        predY += coef(11) * f5
+        block(predX.toFloat().coerceIn(0.02f, 0.98f), predY.toFloat().coerceIn(0.02f, 0.98f))
     }
 
     /**
@@ -190,25 +245,47 @@ object GazeCalibrationMath {
     ): List<Double> {
         if (samples.size < 5) return DEFAULT_AFFINE_MATRIX_2X6
 
-        val cleanedSamples = trimOutliersByTargetMad(samples)
-        val activeSamples = if (cleanedSamples.size >= 5) cleanedSamples else samples
+        // Indexed below: copy once if the caller's list has no constant-time get
+        val list = if (samples is RandomAccess) samples else ArrayList(samples)
+        val n = list.size
+        val kept = IntArray(n)
+        val keptCount = trimOutliersByTargetMad(list, kept)
+        // Fewer than 5 survivors: fit every sample, in input order
+        val useKept = keptCount >= 5
+        val activeCount = if (useKept) keptCount else n
 
         val dim = 6
-        val a = Array(dim) { DoubleArray(dim) }
+        // Row-major dim x dim normal matrix and the two right-hand sides
+        val a = DoubleArray(dim * dim)
         val bx = DoubleArray(dim)
         val by = DoubleArray(dim)
+        val f = DoubleArray(dim)
+        f[0] = 1.0
 
-        for ((feat, target) in activeSamples) {
-            val f = feat.toStandardizedFeatureArray(baselineEyeDistPx)
+        for (k in 0 until activeCount) {
+            val (feat, target) = list[if (useKept) kept[k] else k]
+            withStandardizedFeatures(feat, baselineEyeDistPx) { f1, f2, f3, f4, f5 ->
+                f[1] = f1
+                f[2] = f2
+                f[3] = f3
+                f[4] = f4
+                f[5] = f5
+            }
             val tx = target.first.toDouble()
             val ty = target.second.toDouble()
             for (r in 0 until dim) {
-                bx[r] += f[r] * tx
-                by[r] += f[r] * ty
-                for (c in 0 until dim) {
-                    a[r][c] += f[r] * f[c]
+                val fr = f[r]
+                bx[r] += fr * tx
+                by[r] += fr * ty
+                // f[r] * f[c] == f[c] * f[r] exactly, so the upper triangle is accumulated and mirrored below
+                val row = r * dim
+                for (c in r until dim) {
+                    a[row + c] += fr * f[c]
                 }
             }
+        }
+        for (r in 1 until dim) {
+            for (c in 0 until r) a[r * dim + c] = a[c * dim + r]
         }
 
         // Ridge penalty + prior shrinkage toward the default weights. The fixed divisors leave real
@@ -219,102 +296,193 @@ object GazeCalibrationMath {
         // Head-pose features (3..5) keep the full penalty and the intercept the light 0.05 penalty. The
         // divisors themselves are unchanged, so stored matrices remain valid.
         val prior = DEFAULT_AFFINE_MATRIX_2X6
-        val sampleCount = activeSamples.size.coerceAtLeast(1)
+        val sampleCount = activeCount.coerceAtLeast(1)
         val effectiveLambda = ridgeLambda * sampleCount
         for (i in 0 until dim) {
+            val diag = i * dim + i
             val reg = when (i) {
                 0 -> effectiveLambda * 0.05
-                // a[i][i] is still the raw sum of f[i]^2 here (reg is added below)
-                1, 2 -> effectiveLambda * (a[i][i] / sampleCount).coerceIn(0.02, 1.0)
+                // a[diag] is still the raw sum of f[i]^2 here (reg is added below)
+                1, 2 -> effectiveLambda * (a[diag] / sampleCount).coerceIn(0.02, 1.0)
                 else -> effectiveLambda
             }
-            a[i][i] += reg
+            a[diag] += reg
             bx[i] += reg * prior[i]
             by[i] += reg * prior[6 + i]
         }
 
-        val wx = solveLinearSystem6x6(a, bx) ?: return DEFAULT_AFFINE_MATRIX_2X6
-        val wy = solveLinearSystem6x6(a, by) ?: return DEFAULT_AFFINE_MATRIX_2X6
+        val solution = DoubleArray(2 * dim)
+        if (!solveLinearSystem6x6(a, bx, by, solution)) return DEFAULT_AFFINE_MATRIX_2X6
 
         val combined = ArrayList<Double>(12)
-        for (v in wx) combined.add(v.coerceIn(-5.0, 5.0))
-        for (v in wy) combined.add(v.coerceIn(-5.0, 5.0))
+        for (v in solution) combined.add(v.coerceIn(-5.0, 5.0))
         return combined
     }
 
     /**
      * Groups samples by target coordinate, computes the median (gx, gy) per target, and discards
-     * outlier frames exceeding 2.5 * MAD (or blinks where combinedEyeOpenProb < 0.35).
+     * outlier frames exceeding 2.8 * MAD (or blinks where combinedEyeOpenProb < 0.35).
+     *
+     * Writes the indices of the kept samples to [kept] in fitting order (targets in first-seen order,
+     * input order within a target) and returns how many were kept. Targets are grouped by Pair equality
+     * as groupBy did, and medians are taken from primitive sorts, whose total order (-0.0 before 0.0,
+     * NaN last) is the one the boxed Double sort used, so the kept set is unchanged.
      */
     private fun trimOutliersByTargetMad(
-        samples: List<Pair<GazeFeatureVector, Pair<Float, Float>>>
-    ): List<Pair<GazeFeatureVector, Pair<Float, Float>>> {
-        val grouped = samples.groupBy { it.second }
-        val result = ArrayList<Pair<GazeFeatureVector, Pair<Float, Float>>>(samples.size)
+        samples: List<Pair<GazeFeatureVector, Pair<Float, Float>>>,
+        kept: IntArray
+    ): Int {
+        val n = samples.size
 
-        for ((_, group) in grouped) {
-            val openFiltered = group.filter { it.first.combinedEyeOpenProb >= 0.35f }
-                .ifEmpty { group }
-            if (openFiltered.size <= 3) {
-                result.addAll(openFiltered)
+        // Target group of every sample, numbered in first-seen order
+        val groupOf = IntArray(n)
+        val groupIds = HashMap<Pair<Float, Float>, Int>()
+        var groupSizes = IntArray(8)
+        var groupCount = 0
+        var lastKey: Pair<Float, Float>? = null
+        var lastGroup = -1
+        for (i in 0 until n) {
+            val key = samples[i].second
+            if (lastGroup < 0 || key != lastKey) {
+                lastGroup = groupIds[key] ?: groupCount.also { id ->
+                    groupIds[key] = id
+                    if (id == groupSizes.size) groupSizes = groupSizes.copyOf(id * 2)
+                    groupCount++
+                }
+                lastKey = key
+            }
+            groupOf[i] = lastGroup
+            groupSizes[lastGroup]++
+        }
+
+        // Stable counting sort of the sample indices by group (groupSizes becomes the write cursor)
+        val groupStart = IntArray(groupCount + 1)
+        var maxGroupSize = 0
+        for (g in 0 until groupCount) {
+            val size = groupSizes[g]
+            if (size > maxGroupSize) maxGroupSize = size
+            groupStart[g + 1] = groupStart[g] + size
+            groupSizes[g] = groupStart[g]
+        }
+        val order = IntArray(n)
+        for (i in 0 until n) order[groupSizes[groupOf[i]]++] = i
+
+        val values = DoubleArray(maxGroupSize) // sort scratch for the medians
+        val devs = DoubleArray(maxGroupSize) // distance of each open member to the median, in member order
+        var out = 0
+        for (g in 0 until groupCount) {
+            val start = groupStart[g]
+            val end = groupStart[g + 1]
+
+            // Open-eye members (or the whole group if none is open), written straight to kept[out until out + m]
+            var m = 0
+            for (p in start until end) {
+                val i = order[p]
+                if (samples[i].first.combinedEyeOpenProb >= 0.35f) kept[out + m++] = i
+            }
+            if (m == 0) {
+                for (p in start until end) kept[out + m++] = order[p]
+            }
+            if (m <= 3) {
+                out += m
                 continue
             }
-            val sortedGx = openFiltered.map { it.first.gx }.sorted()
-            val sortedGy = openFiltered.map { it.first.gy }.sorted()
-            val medGx = sortedGx[sortedGx.size / 2]
-            val medGy = sortedGy[sortedGy.size / 2]
 
-            val devs = openFiltered.map { hypot(it.first.gx - medGx, it.first.gy - medGy) }.sorted()
-            val mad = devs[devs.size / 2].coerceAtLeast(0.015)
+            for (k in 0 until m) values[k] = samples[kept[out + k]].first.gx
+            values.sort(0, m)
+            val medGx = values[m / 2]
+            for (k in 0 until m) values[k] = samples[kept[out + k]].first.gy
+            values.sort(0, m)
+            val medGy = values[m / 2]
+
+            for (k in 0 until m) {
+                val feat = samples[kept[out + k]].first
+                devs[k] = hypot(feat.gx - medGx, feat.gy - medGy)
+            }
+            devs.copyInto(values, 0, 0, m)
+            values.sort(0, m)
+            val mad = values[m / 2].coerceAtLeast(0.015)
             val cutoff = mad * 2.8
 
-            val inliers = openFiltered.filter {
-                hypot(it.first.gx - medGx, it.first.gy - medGy) <= cutoff
+            var inliers = 0
+            for (k in 0 until m) if (devs[k] <= cutoff) inliers++
+            if (inliers >= 2) {
+                // Compact in place, keeping member order (the write index never passes the read index)
+                var write = out
+                for (k in 0 until m) if (devs[k] <= cutoff) kept[write++] = kept[out + k]
+                out += inliers
+            } else {
+                out += m
             }
-            result.addAll(if (inliers.size >= 2) inliers else openFiltered)
         }
-        return result
+        return out
     }
 
-    private fun solveLinearSystem6x6(matrix: Array<DoubleArray>, rhs: DoubleArray): DoubleArray? {
-        val n = rhs.size
-        val aug = Array(n) { r ->
-            DoubleArray(n + 1) { c -> if (c < n) matrix[r][c] else rhs[r] }
+    /**
+     * Gauss-Jordan elimination with partial pivoting on the row-major 6x6 [matrix], for both right-hand
+     * sides at once. Pivot choice and row factors depend only on the matrix columns, so each solution is
+     * bit-identical to solving its right-hand side alone. Writes the solution for [rhsX] to out[0..5] and
+     * for [rhsY] to out[6..11]; returns false when a pivot is below 1e-10 (singular system).
+     */
+    private fun solveLinearSystem6x6(
+        matrix: DoubleArray,
+        rhsX: DoubleArray,
+        rhsY: DoubleArray,
+        out: DoubleArray
+    ): Boolean {
+        val n = rhsX.size
+        val width = n + 2
+        val aug = DoubleArray(n * width)
+        for (r in 0 until n) {
+            val row = r * width
+            matrix.copyInto(aug, row, r * n, r * n + n)
+            aug[row + n] = rhsX[r]
+            aug[row + n + 1] = rhsY[r]
         }
 
         for (col in 0 until n) {
             var pivotRow = col
-            var maxVal = abs(aug[col][col])
+            var maxVal = abs(aug[col * width + col])
             for (r in (col + 1) until n) {
-                if (abs(aug[r][col]) > maxVal) {
-                    maxVal = abs(aug[r][col])
+                val v = abs(aug[r * width + col])
+                if (v > maxVal) {
+                    maxVal = v
                     pivotRow = r
                 }
             }
-            if (maxVal < 1e-10) return null
+            if (maxVal < 1e-10) return false
 
+            val pivotBase = col * width
             if (pivotRow != col) {
-                val tmp = aug[col]
-                aug[col] = aug[pivotRow]
-                aug[pivotRow] = tmp
+                val otherBase = pivotRow * width
+                for (c in 0 until width) {
+                    val tmp = aug[pivotBase + c]
+                    aug[pivotBase + c] = aug[otherBase + c]
+                    aug[otherBase + c] = tmp
+                }
             }
 
-            val pivot = aug[col][col]
-            for (c in col..n) {
-                aug[col][c] /= pivot
+            val pivot = aug[pivotBase + col]
+            for (c in col until width) {
+                aug[pivotBase + c] /= pivot
             }
 
             for (r in 0 until n) {
                 if (r != col) {
-                    val factor = aug[r][col]
-                    for (c in col..n) {
-                        aug[r][c] -= factor * aug[col][c]
+                    val rowBase = r * width
+                    val factor = aug[rowBase + col]
+                    for (c in col until width) {
+                        aug[rowBase + c] -= factor * aug[pivotBase + c]
                     }
                 }
             }
         }
 
-        return DoubleArray(n) { r -> aug[r][n] }
+        for (r in 0 until n) {
+            out[r] = aug[r * width + n]
+            out[n + r] = aug[r * width + n + 1]
+        }
+        return true
     }
 
     /**
@@ -353,24 +521,37 @@ object GazeCalibrationMath {
 
         val safeWidthMm = if (screenWidthMm.isFinite() && screenWidthMm > 0.0) screenWidthMm else PIXEL_10_PRO_XL_WIDTH_MM
         val safeHeightMm = if (screenHeightMm.isFinite() && screenHeightMm > 0.0) screenHeightMm else PIXEL_10_PRO_XL_HEIGHT_MM
+        // Resolved and unboxed once instead of once per sample
+        val w = if (matrixCoeffs.size == 12) matrixCoeffs else DEFAULT_AFFINE_MATRIX_2X6
+        val coeffs = DoubleArray(12) { w[it] }
         var totalMmError = 0.0
         var totalNormError = 0.0
 
-        // Group by target coordinate to compute worst-quadrant error
-        val targetErrors = mutableMapOf<Pair<Float, Float>, MutableList<Double>>()
+        // Per-target running sums (first-seen order) for the worst-quadrant error. Summed in sample order
+        // and divided by the count, which is exactly what List.average() computed.
+        val targetErrors = LinkedHashMap<Pair<Float, Float>, TargetErrorSum>()
+        var lastTarget: Pair<Float, Float>? = null
+        var lastSum: TargetErrorSum? = null
 
         for ((feat, actualTarget) in validationSamples) {
-            val (predX, predY) = projectGaze(feat, matrixCoeffs, baselineEyeDistPx)
-            val dxNorm = (predX - actualTarget.first).toDouble()
-            val dyNorm = (predY - actualTarget.second).toDouble()
-            val dxMm = dxNorm * safeWidthMm
-            val dyMm = dyNorm * safeHeightMm
-            val errMm = hypot(dxMm, dyMm)
-            val errPct = hypot(dxNorm, dyNorm) * 100.0
-
-            totalMmError += errMm
+            val errPct = projectStandardized(feat, baselineEyeDistPx, { coeffs[it] }) { predX, predY ->
+                val dxNorm = (predX - actualTarget.first).toDouble()
+                val dyNorm = (predY - actualTarget.second).toDouble()
+                val dxMm = dxNorm * safeWidthMm
+                val dyMm = dyNorm * safeHeightMm
+                totalMmError += hypot(dxMm, dyMm)
+                hypot(dxNorm, dyNorm) * 100.0
+            }
             totalNormError += errPct
-            targetErrors.getOrPut(actualTarget) { mutableListOf() }.add(errPct)
+
+            var sum = lastSum
+            if (sum == null || actualTarget != lastTarget) {
+                sum = targetErrors.getOrPut(actualTarget) { TargetErrorSum() }
+                lastTarget = actualTarget
+                lastSum = sum
+            }
+            sum.total += errPct
+            sum.count++
         }
 
         // The measured means are reported as measured: a fit better than 1.5 % or 2 mm is shown as such.
@@ -381,11 +562,15 @@ object GazeCalibrationMath {
         val meanMm = totalMmError / count
         val meanPct = (totalNormError / count).coerceAtMost(MAX_REPORTED_ERROR_PCT)
         // The worst per-target mean is never below the overall mean (the lower bound only absorbs rounding).
-        val maxQuadrantPct = targetErrors.values
-            .mapNotNull { list -> if (list.isEmpty()) null else list.average() }
-            .maxOrNull()
-            ?.coerceIn(meanPct, MAX_REPORTED_ERROR_PCT)
-            ?: meanPct
+        // maxOf as in maxOrNull(), so a NaN target mean still propagates.
+        var worstTargetPct = 0.0
+        var hasTarget = false
+        for (sum in targetErrors.values) {
+            val targetMean = sum.total / sum.count
+            worstTargetPct = if (hasTarget) maxOf(worstTargetPct, targetMean) else targetMean
+            hasTarget = true
+        }
+        val maxQuadrantPct = if (hasTarget) worstTargetPct.coerceIn(meanPct, MAX_REPORTED_ERROR_PCT) else meanPct
 
         // Recommend exactly the layout the Control Deck renders for these metrics (same thresholds)
         val recommendation = gridLayoutLabel(qualifiesFor3x3Grid(meanPct, maxQuadrantPct)) +
@@ -414,37 +599,42 @@ object GazeCalibrationMath {
         maxClusters: Int = 40
     ): List<FixationClusterPoint> {
         if (rawTimedSamples.size < 2) return emptyList()
-        val clusters = mutableListOf<FixationClusterPoint>()
+        val clusters = ArrayList<FixationClusterPoint>()
 
-        var sumX = rawTimedSamples[0].first
-        var sumY = rawTimedSamples[0].second
+        // Squared-distance bounds that settle `hypot(dx, dy) <= dispersionThreshold` without hypot
+        // (see [withinDispersion]); only for a positive, normal, finite threshold.
+        val useSquaredBounds = dispersionThreshold.isFinite() && dispersionThreshold >= DISPERSION_SQUARED_MIN_THRESHOLD
+        val thresholdD = dispersionThreshold.toDouble()
+        val thresholdSq = thresholdD * thresholdD
+        val acceptBelowSq = thresholdSq * (1.0 - DISPERSION_SQUARED_MARGIN)
+        val rejectAboveSq = thresholdSq * (1.0 + DISPERSION_SQUARED_MARGIN)
+
+        val first = rawTimedSamples[0]
+        var sumX = first.first
+        var sumY = first.second
         var count = 1
-        var startTs = rawTimedSamples[0].third
+        var startTs = first.third
         var lastTs = startTs
 
         for (i in 1 until rawTimedSamples.size) {
-            val (x, y, ts) = rawTimedSamples[i]
+            val sample = rawTimedSamples[i]
+            val x = sample.first
+            val y = sample.second
+            val ts = sample.third
             val centroidX = sumX / count
             val centroidY = sumY / count
-            val dist = hypot(x - centroidX, y - centroidY)
             val gapBreak = ts - lastTs > maxGapMs
 
-            if (!gapBreak && dist <= dispersionThreshold) {
+            if (!gapBreak &&
+                withinDispersion(x - centroidX, y - centroidY, dispersionThreshold, useSquaredBounds, acceptBelowSq, rejectAboveSq)
+            ) {
                 sumX += x
                 sumY += y
                 count++
                 lastTs = ts
             } else {
                 val dwell = lastTs - startTs
-                if (dwell >= minDwellMs) {
-                    clusters.add(
-                        FixationClusterPoint(
-                            normX = (sumX / count).coerceIn(0.05f, 0.95f),
-                            normY = (sumY / count).coerceIn(0.05f, 0.95f),
-                            dwellMs = dwell
-                        )
-                    )
-                }
+                if (dwell >= minDwellMs) clusters.add(fixationPoint(sumX, sumY, count, dwell))
                 sumX = x
                 sumY = y
                 count = 1
@@ -454,19 +644,55 @@ object GazeCalibrationMath {
         }
 
         val finalDwell = lastTs - startTs
-        if (finalDwell >= minDwellMs) {
-            clusters.add(
-                FixationClusterPoint(
-                    normX = (sumX / count).coerceIn(0.05f, 0.95f),
-                    normY = (sumY / count).coerceIn(0.05f, 0.95f),
-                    dwellMs = finalDwell
-                )
-            )
-        }
+        if (finalDwell >= minDwellMs) clusters.add(fixationPoint(sumX, sumY, count, finalDwell))
 
         val cap = maxClusters.coerceAtLeast(0)
         return if (clusters.size > cap) clusters.takeLast(cap) else clusters
     }
+
+    private fun fixationPoint(sumX: Float, sumY: Float, count: Int, dwellMs: Long) = FixationClusterPoint(
+        normX = (sumX / count).coerceIn(0.05f, 0.95f),
+        normY = (sumY / count).coerceIn(0.05f, 0.95f),
+        dwellMs = dwellMs
+    )
+
+    /**
+     * Exactly `hypot(dx, dy) <= threshold` for kotlin.math's Float hypot (Math.hypot of the widened values,
+     * rounded to Float). Outside a 1e-6 relative band around threshold^2 the squared distance decides:
+     * the widened squares are exact, their sum is off by at most 2^-53, Math.hypot is within 1 ulp
+     * (2^-52) and the Float rounding moves the result by at most one half Float ulp (2^-24 for a normal
+     * threshold), all far inside the band. Inside the band, for NaN, or without [useSquaredBounds],
+     * hypot itself decides.
+     */
+    private fun withinDispersion(
+        dx: Float,
+        dy: Float,
+        threshold: Float,
+        useSquaredBounds: Boolean,
+        acceptBelowSq: Double,
+        rejectAboveSq: Double
+    ): Boolean {
+        if (useSquaredBounds) {
+            val ddx = dx.toDouble()
+            val ddy = dy.toDouble()
+            val distSq = ddx * ddx + ddy * ddy
+            if (distSq < acceptBelowSq) return true
+            if (distSq > rejectAboveSq) return false
+        }
+        return hypot(dx, dy) <= threshold
+    }
+
+    /** Running worst-quadrant error sum of one validation target. */
+    private class TargetErrorSum {
+        var total = 0.0
+        var count = 0
+    }
+
+    /** Relative band around threshold^2 inside which [withinDispersion] defers to hypot. */
+    private const val DISPERSION_SQUARED_MARGIN = 1e-6
+
+    /** Smallest threshold for the squared-distance shortcut (any normal Float works; tiny ones use hypot). */
+    private const val DISPERSION_SQUARED_MIN_THRESHOLD = 1e-30f
 }
 
 /**
@@ -503,9 +729,9 @@ class BlinkHysteresisDetector(
             if (eyeOpenProb < closeThreshold) {
                 isEyesClosedState = true
                 closedStartTimestampMs = timestampMs
-                return Pair(0.05f, null)
+                return CLOSURE_STARTED
             }
-            return Pair(0f, null)
+            return EYES_OPEN
         } else {
             val elapsedMs = (timestampMs - closedStartTimestampMs).coerceAtLeast(0L)
             if (eyeOpenProb > openThreshold) {
@@ -520,7 +746,7 @@ class BlinkHysteresisDetector(
                         BlinkClassificationEvent(BlinkType.EXTENDED_REST, elapsedMs, timestampMs)
                     else -> null
                 }
-                return Pair(0f, event)
+                return if (event == null) EYES_OPEN else Pair(0f, event)
             } else {
                 val progress = min(1f, elapsedMs.toFloat() / intentionalMinMs.toFloat())
                 return Pair(progress, null)
@@ -538,6 +764,10 @@ class BlinkHysteresisDetector(
     companion object {
         /** Initial frame-interval estimate (~15 FPS) before any timestamps have been observed. */
         const val DEFAULT_FRAME_INTERVAL_MS = 66.0
+
+        // Shared immutable results for the constant-valued updates (no per-frame Pair or Float boxing)
+        private val EYES_OPEN: Pair<Float, BlinkClassificationEvent?> = Pair(0f, null)
+        private val CLOSURE_STARTED: Pair<Float, BlinkClassificationEvent?> = Pair(0.05f, null)
     }
 }
 
@@ -582,20 +812,20 @@ class BrowRaiseHysteresisDetector(
                 isBrowRaisedState = true
                 raiseStartTimestampMs = timestampMs
                 firedForCurrentRaise = false
-                return Pair(0.08f, false)
+                return RAISE_STARTED
             }
-            return Pair(0f, false)
+            return NOT_RAISED
         } else {
             if (browToEyeRatio < releaseThreshold) {
                 isBrowRaisedState = false
                 firedForCurrentRaise = false
-                return Pair(0f, false)
+                return NOT_RAISED
             }
             val elapsed = (timestampMs - raiseStartTimestampMs).coerceAtLeast(0L)
             val progress = (elapsed.toFloat() / holdTargetMs.coerceAtLeast(250L).toFloat()).coerceIn(0f, 1f)
             if (progress >= 1f && !firedForCurrentRaise) {
                 firedForCurrentRaise = true
-                return Pair(1f, true)
+                return RAISE_FIRED
             }
             return Pair(progress, false)
         }
@@ -629,5 +859,10 @@ class BrowRaiseHysteresisDetector(
         /** The ratio below which a raise is released (same formula as [releaseThreshold]). */
         fun releaseThresholdFor(neutral: Float, raised: Float): Float =
             neutral + 0.32f * (raised - neutral).coerceAtLeast(0.035f)
+
+        // Shared immutable results for the constant-valued updates (no per-frame Pair or Float boxing)
+        private val NOT_RAISED = Pair(0f, false)
+        private val RAISE_STARTED = Pair(0.08f, false)
+        private val RAISE_FIRED = Pair(1f, true)
     }
 }

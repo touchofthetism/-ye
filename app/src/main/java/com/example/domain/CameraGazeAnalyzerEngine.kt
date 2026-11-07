@@ -78,6 +78,11 @@ class CameraGazeAnalyzerEngine(
     private val lowLightLatch = LowLightHysteresisLatch()
     private var lastReportedAmbientLuma: Int = GazeFeatureVector().ambientLuma
 
+    // Pass-1 lumas of the eye ROI being analysed, reused across frames so pass 2 never re-reads the camera
+    // plane. Only touched on analysisExecutor. Nullable (allocated on first use) so an instance created
+    // without running the constructor, as the reflection-based tests and benchmarks do, still works.
+    private var roiLumaBuffer: IntArray? = null
+
     private val detector: FaceDetector = FaceDetection.getClient(
         FaceDetectorOptions.Builder()
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
@@ -489,17 +494,29 @@ class CameraGazeAnalyzerEngine(
         val x1 = right.coerceIn(0, uprightW - 1)
         val y0 = top.coerceIn(0, uprightH - 1)
         val y1 = bottom.coerceIn(0, uprightH - 1)
+        if (x1 < x0 || y1 < y0) return null
         val s = step.coerceAtLeast(1)
+        val cols = (x1 - x0) / s + 1
+        val rows = (y1 - y0) / s + 1
+        // Same strided index walk as the ROI pass in analyzeEyeContourRoi (see uprightOriginIndex).
+        val dX = uprightIndexDeltaX(rotationDegrees, rowStride, pixelStride)
+        val dY = uprightIndexDeltaY(rotationDegrees, rowStride, pixelStride)
+        val colStep = dX * s
+        val rowStep = dY * s
+        var rowIdx = uprightOriginIndex(rawWidth, rawHeight, rotationDegrees, rowStride, pixelStride) + x0 * dX + y0 * dY
+        val limit = buf.limit()
         var sum = 0L
         var count = 0
-        for (uy in y0..y1 step s) {
-            for (ux in x0..x1 step s) {
-                val luma = sampleUprightLuma(buf, ux, uy, rawWidth, rawHeight, rotationDegrees, rowStride, pixelStride)
-                if (luma >= 0) {
-                    sum += luma
+        for (r in 0 until rows) {
+            var idx = rowIdx
+            for (c in 0 until cols) {
+                if (idx >= 0 && idx < limit) {
+                    sum += buf.get(idx).toInt() and 0xFF
                     count++
                 }
+                idx += colStep
             }
+            rowIdx += rowStep
         }
         return if (count > 0) (sum / count).toInt() else null
     }
@@ -574,7 +591,8 @@ class CameraGazeAnalyzerEngine(
         pixelStride: Int,
         sampleStep: Int = 1
     ): EyeRoiResult {
-        if (points.size < 4) {
+        val pointCount = points.size
+        if (pointCount < 4) {
             return EyeRoiResult(0.0, 0.0, (eyeOpenProb * 0.4f).coerceIn(0.05f, 1f), false, null)
         }
 
@@ -585,7 +603,7 @@ class CameraGazeAnalyzerEngine(
         var sumCx = 0f
         var sumCy = 0f
 
-        for (i in 0 until points.size) {
+        for (i in 0 until pointCount) {
             val pt = points[i]
             minX = min(minX, pt.x)
             maxX = max(maxX, pt.x)
@@ -595,17 +613,17 @@ class CameraGazeAnalyzerEngine(
             sumCy += pt.y
         }
 
-        val geomCenter = PointF(sumCx / points.size, sumCy / points.size)
+        val geomCenter = PointF(sumCx / pointCount, sumCy / pointCount)
         val boxW = (maxX - minX).coerceAtLeast(6f)
         val boxH = (maxY - minY).coerceAtLeast(4f)
 
         // Anatomical canthus anchor (medial corner = index 0, lateral corner = index 8 in ML Kit 16-pt eye contour)
-        val canthusMidX = if (points.size >= 9) {
+        val canthusMidX = if (pointCount >= 9) {
             ((points[0].x + points[8].x) * 0.5f).toDouble()
         } else {
             ((minX + maxX) * 0.5f).toDouble()
         }
-        val canthusMidY = if (points.size >= 9) {
+        val canthusMidY = if (pointCount >= 9) {
             ((points[0].y + points[8].y) * 0.5f).toDouble()
         } else {
             ((minY + maxY) * 0.5f).toDouble()
@@ -636,19 +654,39 @@ class CameraGazeAnalyzerEngine(
         }
 
         val step = sampleStep.coerceIn(1, 2)
+        // Sampled grid, row-major in upright space: x = ux0, ux0 + step, .. <= ux1 (cols) for each
+        // y = uy0, uy0 + step, .. <= uy1 (rows).
+        val cols = (ux1 - ux0) / step + 1
+        val rows = (uy1 - uy0) / step + 1
+        val sampleCount = cols * rows
 
-        // Pass 1: Find local min/max/mean luminance (excluding specular glare > 240) in rotated sensor buffer
+        // The upright -> raw rotation is affine in the buffer index, so it is resolved once per ROI rather than
+        // per pixel and the index is walked with per-sample strides. Every (ux, uy) of the clamped ROI lies
+        // inside the raw frame, so only the plane-buffer index check remains per pixel.
+        val dX = uprightIndexDeltaX(rotationDegrees, rowStride, pixelStride)
+        val dY = uprightIndexDeltaY(rotationDegrees, rowStride, pixelStride)
+        val colStep = dX * step
+        val rowStep = dY * step
+        var rowIdx = uprightOriginIndex(rawWidth, rawHeight, rotationDegrees, rowStride, pixelStride) + ux0 * dX + uy0 * dY
+        val limit = yBuffer.limit()
+        val lumas = roiLumaScratch(sampleCount)
+
+        // Pass 1: Find local min/max/mean luminance (excluding specular glare > 240) in rotated sensor buffer,
+        // reading every ROI pixel exactly once into lumas (-1 = index outside the plane buffer, not sampled).
         var localMinLuma = 255
         var localMaxLuma = 0
         var lumaSum = 0
         var brightGlarePixels = 0
-        var totalPixels = 0
+        var unreadablePixels = 0
+        var k = 0
 
-        for (uy in uy0..uy1 step step) {
-            for (ux in ux0..ux1 step step) {
-                val luma = sampleUprightLuma(yBuffer, ux, uy, rawWidth, rawHeight, rotationDegrees, rowStride, pixelStride)
-                if (luma >= 0) {
-                    totalPixels++
+        for (r in 0 until rows) {
+            var idx = rowIdx
+            for (c in 0 until cols) {
+                if (idx >= 0 && idx < limit) {
+                    // Absolute get: never moves the plane buffer's position.
+                    val luma = yBuffer.get(idx).toInt() and 0xFF
+                    lumas[k] = luma
                     lumaSum += luma
                     if (luma > 240) {
                         brightGlarePixels++
@@ -656,32 +694,42 @@ class CameraGazeAnalyzerEngine(
                         if (luma < localMinLuma) localMinLuma = luma
                         if (luma > localMaxLuma) localMaxLuma = luma
                     }
+                } else {
+                    lumas[k] = -1
+                    unreadablePixels++
                 }
+                k++
+                idx += colStep
             }
+            rowIdx += rowStep
         }
 
+        val totalPixels = sampleCount - unreadablePixels
         if (totalPixels == 0) {
             return EyeRoiResult(0.0, 0.0, 0.2f, false, geomCenter)
         }
 
         val meanLuma = (lumaSum / totalPixels).coerceIn(0, 255)
         val rawDynamicRange = (localMaxLuma - localMinLuma).coerceAtLeast(1)
-        val dynamicRange = rawDynamicRange.coerceAtLeast(10)
         val contrastScore = (rawDynamicRange.toFloat() / 55f).coerceIn(0.25f, 1.0f)
         val glareRatio = brightGlarePixels.toFloat() / totalPixels.toFloat()
         val hasGlare = glareRatio > 0.14f
         val glarePenalty = (glareRatio * 3.8f).coerceIn(0f, 0.85f)
 
-        // Pass 2: Adaptive dark-pupil thresholding with quadratic weighting
+        // Pass 2: Adaptive dark-pupil thresholding with quadratic weighting, over the pass-1 lumas in the same
+        // order (so the Double sums are accumulated exactly as before).
         // Focuses heavily on the darkest 35% of the dynamic range to isolate the iris/pupil from sclera
         val darkThreshold = localMinLuma + (rawDynamicRange * 0.40).toInt().coerceAtLeast(6)
         var darkWeightSum = 0.0
         var weightedUx = 0.0
         var weightedUy = 0.0
 
-        for (uy in uy0..uy1 step step) {
-            for (ux in ux0..ux1 step step) {
-                val luma = sampleUprightLuma(yBuffer, ux, uy, rawWidth, rawHeight, rotationDegrees, rowStride, pixelStride)
+        k = 0
+        var uy = uy0
+        for (r in 0 until rows) {
+            var ux = ux0
+            for (c in 0 until cols) {
+                val luma = lumas[k++]
                 if (luma in 0..darkThreshold) {
                     val darkness = (darkThreshold - luma + 1).toDouble()
                     val w = darkness * darkness
@@ -689,7 +737,9 @@ class CameraGazeAnalyzerEngine(
                     weightedUx += ux * w
                     weightedUy += uy * w
                 }
+                ux += step
             }
+            uy += step
         }
 
         if (darkWeightSum <= 1e-4) {
@@ -721,45 +771,48 @@ class CameraGazeAnalyzerEngine(
         )
     }
 
-    /**
-     * Inverse-maps an upright ML Kit pixel `(ux, uy)` back into the raw sensor buffer `(sx, sy)`
-     * according to `imageProxy.imageInfo.rotationDegrees` (0, 90, 180, 270).
-     */
-    private fun sampleUprightLuma(
-        yBuffer: ByteBuffer,
-        ux: Int,
-        uy: Int,
-        rawWidth: Int,
-        rawHeight: Int,
-        rotationDegrees: Int,
-        rowStride: Int,
-        pixelStride: Int
-    ): Int {
-        val sx: Int
-        val sy: Int
-        when (rotationDegrees) {
-            90 -> {
-                sx = uy
-                sy = rawHeight - 1 - ux
-            }
-            180 -> {
-                sx = rawWidth - 1 - ux
-                sy = rawHeight - 1 - uy
-            }
-            270 -> {
-                sx = rawWidth - 1 - uy
-                sy = ux
-            }
-            else -> {
-                sx = ux
-                sy = uy
-            }
-        }
-        if (sx !in 0 until rawWidth || sy !in 0 until rawHeight) return -1
-        val idx = sy * rowStride + sx * pixelStride
-        // Absolute get: never moves the plane buffer's position.
-        return if (idx >= 0 && idx < yBuffer.limit()) (yBuffer.get(idx).toInt() and 0xFF) else -1
+    /** [roiLumaBuffer], grown to hold [size] samples; an ROI above the retention cap gets a one-off array. */
+    private fun roiLumaScratch(size: Int): IntArray {
+        val retained = roiLumaBuffer
+        if (retained != null && retained.size >= size) return retained
+        if (size > ROI_LUMA_BUFFER_MAX_RETAINED) return IntArray(size)
+        val grown = IntArray(min(ROI_LUMA_BUFFER_MAX_RETAINED, max(ROI_LUMA_BUFFER_INITIAL, size + (size shr 1))))
+        roiLumaBuffer = grown
+        return grown
     }
+
+    /**
+     * Inverse-maps an upright ML Kit pixel `(ux, uy)` back into the raw sensor buffer according to
+     * `imageProxy.imageInfo.rotationDegrees`: the raw pixel `(sx, sy)` is `(uy, H-1-ux)` for 90,
+     * `(W-1-ux, H-1-uy)` for 180, `(W-1-uy, ux)` for 270 and `(ux, uy)` for anything else, so its index
+     * `sy * rowStride + sx * pixelStride` is `uprightOriginIndex + ux * uprightIndexDeltaX + uy * uprightIndexDeltaY`.
+     * Int arithmetic wraps identically in both forms, so the strided walk reads exactly the same bytes.
+     */
+    private fun uprightOriginIndex(rawWidth: Int, rawHeight: Int, rotationDegrees: Int, rowStride: Int, pixelStride: Int): Int =
+        when (rotationDegrees) {
+            90 -> (rawHeight - 1) * rowStride
+            180 -> (rawHeight - 1) * rowStride + (rawWidth - 1) * pixelStride
+            270 -> (rawWidth - 1) * pixelStride
+            else -> 0
+        }
+
+    /** Raw index change per +1 upright x; see [uprightOriginIndex]. */
+    private fun uprightIndexDeltaX(rotationDegrees: Int, rowStride: Int, pixelStride: Int): Int =
+        when (rotationDegrees) {
+            90 -> -rowStride
+            180 -> -pixelStride
+            270 -> rowStride
+            else -> pixelStride
+        }
+
+    /** Raw index change per +1 upright y; see [uprightOriginIndex]. */
+    private fun uprightIndexDeltaY(rotationDegrees: Int, rowStride: Int, pixelStride: Int): Int =
+        when (rotationDegrees) {
+            90 -> pixelStride
+            180 -> -rowStride
+            270 -> -pixelStride
+            else -> rowStride
+        }
 
     /**
      * Called on the main thread. The filters and low-light state are deliberately not reset here:
@@ -845,6 +898,10 @@ class CameraGazeAnalyzerEngine(
          * (TIER_HIGH_1280; 960 px short side for 4:3), so existing profiles and the 148 px default stay valid.
          */
         internal const val IOD_REFERENCE_LONG_SIDE_PX = 1280.0
+
+        /** Initial and largest retained roiLumaBuffer sizes (a 140 px eye samples about 3.8k pixels). */
+        private const val ROI_LUMA_BUFFER_INITIAL = 4096
+        private const val ROI_LUMA_BUFFER_MAX_RETAINED = 1 shl 16
 
         internal fun newPupilGazeFilter(): OneEuroFilter2D = OneEuroFilter2D(
             minCutoff = PUPIL_FILTER_MIN_CUTOFF_HZ,
@@ -934,20 +991,27 @@ class CameraGazeAnalyzerEngine(
             if (rawWidth <= 0 || rawHeight <= 0) return null
             val s = step.coerceAtLeast(1)
             val limit = buf.limit()
+            // idx = sy * rowStride + sx * pixelStride, walked with strides (Int wrap-around is identical).
+            val first = s / 2
+            val colStep = s * pixelStride
+            val rowStep = s * rowStride
+            var rowIdx = first * rowStride + first * pixelStride
             var sum = 0L
             var count = 0
-            var sy = s / 2
+            var sy = first
             while (sy < rawHeight) {
-                var sx = s / 2
+                var idx = rowIdx
+                var sx = first
                 while (sx < rawWidth) {
-                    val idx = sy * rowStride + sx * pixelStride
                     if (idx >= 0 && idx < limit) {
                         sum += buf.get(idx).toInt() and 0xFF
                         count++
                     }
                     sx += s
+                    idx += colStep
                 }
                 sy += s
+                rowIdx += rowStep
             }
             return if (count > 0) (sum / count).toInt() else null
         }

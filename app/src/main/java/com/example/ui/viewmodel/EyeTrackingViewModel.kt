@@ -7,6 +7,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.model.AacActionTile
 import com.example.data.model.AnalysisResolutionTier
+import com.example.data.model.BlinkClassificationEvent
 import com.example.data.model.BlinkType
 import com.example.data.model.CalibrationProfile
 import com.example.data.model.DEFAULT_AFFINE_MATRIX_2X6
@@ -14,6 +15,7 @@ import com.example.data.model.FixationClusterPoint
 import com.example.data.model.GazeFeatureVector
 import com.example.data.model.GazePostureProfile
 import com.example.data.model.InteractionSettings
+import com.example.data.model.LiveGazeTrailPoint
 import com.example.data.model.SectionDwellSummary
 import com.example.data.model.SectionPassageItem
 import com.example.data.model.TrackingSession
@@ -34,7 +36,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
@@ -45,6 +46,8 @@ import kotlinx.coroutines.withContext
 import java.util.Locale
 import java.util.UUID
 import kotlin.math.abs
+import kotlin.math.exp
+import kotlin.math.hypot
 import kotlin.math.roundToInt
 
 /** HUD profile name while no calibration profile is applied (the default matrix is in use). */
@@ -169,10 +172,14 @@ class EyeTrackingViewModel(
         localStore?.loadLocalSessions(currentUserId).orEmpty()
     )
 
+    // Consent is per account: a newly signed-in user never inherits another account's opt-in.
+    // Mirrors LiveGazeHudState.cloudSyncEnabled (both change only in toggleCloudSync). The cloud streams key
+    // off this flag instead of mapping every HUD emission, which happens on every camera frame.
+    private val _cloudSyncEnabledFlow = MutableStateFlow(localStore?.isCloudSyncEnabled(currentUserId) ?: false)
+
     private val _liveHudState = MutableStateFlow(
         LiveGazeHudState(
-            // Consent is per account: a newly signed-in user never inherits another account's opt-in
-            cloudSyncEnabled = localStore?.isCloudSyncEnabled(currentUserId) ?: false,
+            cloudSyncEnabled = _cloudSyncEnabledFlow.value,
             isSimulatorProxyEnabled = onEmulator
         )
     )
@@ -216,9 +223,7 @@ class EyeTrackingViewModel(
 
     // Strictly gate Cloud Firestore telemetry streams behind explicit user opt-in (cloudSyncEnabled)
     @OptIn(ExperimentalCoroutinesApi::class)
-    private val cloudProfilesResultFlow = _liveHudState
-        .map { it.cloudSyncEnabled }
-        .distinctUntilChanged()
+    private val cloudProfilesResultFlow = _cloudSyncEnabledFlow
         .flatMapLatest { syncEnabled ->
             if (syncEnabled) {
                 repository.observeCalibrationProfiles(currentUserId)
@@ -230,9 +235,7 @@ class EyeTrackingViewModel(
         }
 
     @OptIn(ExperimentalCoroutinesApi::class)
-    private val cloudSessionsResultFlow = _liveHudState
-        .map { it.cloudSyncEnabled }
-        .distinctUntilChanged()
+    private val cloudSessionsResultFlow = _cloudSyncEnabledFlow
         .flatMapLatest { syncEnabled ->
             if (syncEnabled) {
                 repository.observeTrackingSessions(currentUserId)
@@ -635,6 +638,7 @@ class EyeTrackingViewModel(
     fun toggleCloudSync(enabled: Boolean) {
         localStore?.setCloudSyncEnabled(currentUserId, enabled)
         _liveHudState.update { it.copy(cloudSyncEnabled = enabled) }
+        _cloudSyncEnabledFlow.value = enabled
         _statusBannerMessage.value = if (enabled) {
             "Cloud Telemetry OPTED IN — calibrations & sessions sync to Firestore (/users/$currentUserId) and local storage."
         } else {
@@ -744,7 +748,7 @@ class EyeTrackingViewModel(
         ensureFrameWatchdog()
         // Gap since the previous frame (-1 when unknown, e.g. first frame or after the stale-frame watchdog)
         val rawGapMs = if (lastFrameTimestampMs > 0L) now - lastFrameTimestampMs else -1L
-        val dtMs = if (lastFrameTimestampMs > 0L) (now - lastFrameTimestampMs).coerceIn(16L, 500L) else 66L
+        val dtMs = if (lastFrameTimestampMs > 0L) rawGapMs.coerceIn(16L, 500L) else 66L
         lastFrameTimestampMs = now
         smoothedFrameIntervalMs = 0.85 * smoothedFrameIntervalMs + 0.15 * dtMs.toDouble()
         val liveFps = (1000.0 / smoothedFrameIntervalMs.coerceAtLeast(25.0)).roundToInt().coerceIn(1, 60)
@@ -779,25 +783,21 @@ class EyeTrackingViewModel(
         }
         val canStepResolution = (now - lastResolutionStepChangeMs) >= 6000L
         val lowRateStep = below15FpsDurationMs >= 2500L
-        val stepCause = if (lowRateStep) {
-            "Low analysis rate ($liveFps FPS < 15)"
-        } else {
-            "Thermal guard ($liveFps FPS, >40% below session baseline)"
-        }
+        // The step-down cause label is built only on the frame that steps (it was a per-frame string build)
         val nextTier = if (canStepResolution && (lowRateStep || thermalDrop)) {
             when (prev.resolutionTier) {
                 AnalysisResolutionTier.TIER_HIGH_1280 -> {
                     lastResolutionStepChangeMs = now
                     below15FpsDurationMs = 0L
                     _statusBannerMessage.value =
-                        "$stepCause: stepping camera analysis 1280×960 → 960×720."
+                        "${resolutionStepCauseLabel(lowRateStep, liveFps)}: stepping camera analysis 1280×960 → 960×720."
                     AnalysisResolutionTier.TIER_MED_960
                 }
                 AnalysisResolutionTier.TIER_MED_960 -> {
                     lastResolutionStepChangeMs = now
                     below15FpsDurationMs = 0L
                     _statusBannerMessage.value =
-                        "$stepCause: stepping camera analysis 960×720 → 640×480."
+                        "${resolutionStepCauseLabel(lowRateStep, liveFps)}: stepping camera analysis 960×720 → 640×480."
                     AnalysisResolutionTier.TIER_LOW_640
                 }
                 AnalysisResolutionTier.TIER_LOW_640 -> AnalysisResolutionTier.TIER_LOW_640
@@ -838,29 +838,34 @@ class EyeTrackingViewModel(
 
         // CRITICAL AUDIT FIX: Freeze gaze position updates while eyelids are closing/closed (< 0.50 open prob)
         // so upper-eyelid sweep never drags the reticle off the focused tile during an intentional blink!
-        val isEyelidClosing = feature.combinedEyeOpenProb < 0.50f
+        val eyeOpenProb = feature.combinedEyeOpenProb
+        val isEyelidClosing = eyeOpenProb < 0.50f
         val gazeValid = feature.faceDetected && !isEyelidClosing
 
         if (recenterDeadlineMs > 0L) {
             updateRecenterCapture(postureAdjustedX, postureAdjustedY, gazeValid, now)
         }
 
-        val (smoothedX, smoothedY) = if (feature.faceDetected && !isEyelidClosing) {
+        // Plain locals instead of a Pair<Float, Float> (a Pair and two boxed Floats per frame)
+        var smoothedX = prev.normX
+        var smoothedY = prev.normY
+        if (gazeValid) {
             when (prev.filterMode) {
                 com.example.data.model.GazeFilterMode.ONE_EURO -> {
-                    val (fx, fy) = screenGazeFilter.filter(postureAdjustedX.toDouble(), postureAdjustedY.toDouble(), now)
-                    Pair(fx.toFloat().coerceIn(0.02f, 0.98f), fy.toFloat().coerceIn(0.02f, 0.98f))
+                    val filtered = screenGazeFilter.filter(postureAdjustedX.toDouble(), postureAdjustedY.toDouble(), now)
+                    smoothedX = filtered.first.toFloat().coerceIn(0.02f, 0.98f)
+                    smoothedY = filtered.second.toFloat().coerceIn(0.02f, 0.98f)
                 }
                 com.example.data.model.GazeFilterMode.KALMAN -> {
-                    val (kx, ky) = screenKalmanFilter.filter(postureAdjustedX.toDouble(), postureAdjustedY.toDouble(), now)
-                    Pair(kx.toFloat().coerceIn(0.02f, 0.98f), ky.toFloat().coerceIn(0.02f, 0.98f))
+                    val filtered = screenKalmanFilter.filter(postureAdjustedX.toDouble(), postureAdjustedY.toDouble(), now)
+                    smoothedX = filtered.first.toFloat().coerceIn(0.02f, 0.98f)
+                    smoothedY = filtered.second.toFloat().coerceIn(0.02f, 0.98f)
                 }
                 com.example.data.model.GazeFilterMode.RAW -> {
-                    Pair(postureAdjustedX, postureAdjustedY)
+                    smoothedX = postureAdjustedX
+                    smoothedY = postureAdjustedY
                 }
             }
-        } else {
-            Pair(prev.normX, prev.normY)
         }
         currentGazeX = smoothedX
         currentGazeY = smoothedY
@@ -873,24 +878,35 @@ class EyeTrackingViewModel(
 
         // No-face frames carry default (unmeasured) eye-open values: hold the blink state instead of
         // reading them as a reopen, so a dropout during a long rest cannot end it as a command blink.
-        val (blinkProgress, blinkEvent) = if (feature.faceDetected) {
-            blinkDetector.update(feature.combinedEyeOpenProb, now)
+        // (Split locals: the held / inactive branches no longer allocate a Pair per frame.)
+        val blinkProgress: Float
+        val blinkEvent: BlinkClassificationEvent?
+        if (feature.faceDetected) {
+            val blinkResult = blinkDetector.update(eyeOpenProb, now)
+            blinkProgress = blinkResult.first
+            blinkEvent = blinkResult.second
         } else {
-            Pair(prev.blinkHoldProgress, null)
+            blinkProgress = prev.blinkHoldProgress
+            blinkEvent = null
         }
-        val (browProgress, browFired) = if (browEnabled && feature.faceDetected && !isEyelidClosing) {
+        val browProgress: Float
+        val browFired: Boolean
+        if (browEnabled && gazeValid) {
             // Updates skipped for longer than the hold (eyelid closure) require a fresh full hold
             if (lastBrowEvalMs > 0L && now - lastBrowEvalMs > browDetector.holdTargetMs) {
                 browDetector.cancelPendingRaise()
             }
             lastBrowEvalMs = now
-            browDetector.update(feature.browToEyeRatio, now)
+            val browResult = browDetector.update(feature.browToEyeRatio, now)
+            browProgress = browResult.first
+            browFired = browResult.second
         } else {
             if (!browEnabled || !feature.faceDetected) {
                 // A raise that started before the gap must not fire on resume without a new 400 ms hold
                 browDetector.cancelPendingRaise()
             }
-            Pair(0f, false)
+            browProgress = 0f
+            browFired = false
         }
 
         var natBlinks = prev.naturalBlinkCount
@@ -962,7 +978,7 @@ class EyeTrackingViewModel(
         val updatedTrail = if (prev.overlayVisualMode == com.example.data.model.GazeOverlayVisualMode.RETICLE_ONLY) {
             if (prev.liveTrailPoints.isEmpty()) prev.liveTrailPoints else emptyList()
         } else {
-            updateLiveHeatmapTrail(
+            advanceLiveGazeTrail(
                 prevTrail = prev.liveTrailPoints,
                 normX = smoothedX,
                 normY = smoothedY,
@@ -1057,64 +1073,6 @@ class EyeTrackingViewModel(
             appliedX * 100.0,
             appliedY * 100.0
         )
-    }
-
-    /**
-     * Maintains a rolling real-time thermal gaze trail where dwelling near an existing node
-     * accumulates thermal intensity (Cyan -> Emerald -> Amber -> Crimson) and older nodes
-     * decay smoothly over a 4.8-second window with minimal list allocations.
-     */
-    private fun updateLiveHeatmapTrail(
-        prevTrail: List<com.example.data.model.LiveGazeTrailPoint>,
-        normX: Float,
-        normY: Float,
-        faceDetected: Boolean,
-        nowMs: Long,
-        dtMs: Long
-    ): List<com.example.data.model.LiveGazeTrailPoint> {
-        val decayFactor = kotlin.math.exp(-dtMs.toDouble() / 2400.0).toFloat().coerceIn(0.82f, 0.99f)
-        val decayed = ArrayList<com.example.data.model.LiveGazeTrailPoint>(minOf(prevTrail.size + 1, 32))
-        val startIndex = (prevTrail.size - 32).coerceAtLeast(0)
-        for (i in startIndex until prevTrail.size) {
-            val pt = prevTrail[i]
-            val age = nowMs - pt.timestampMs
-            val nextIntensity = pt.intensity * decayFactor
-            if (age <= 4800L && nextIntensity >= 0.08f) {
-                decayed.add(pt.copy(intensity = nextIntensity))
-            }
-        }
-
-        if (!faceDetected) return decayed
-
-        val last = decayed.lastOrNull()
-        if (last != null) {
-            val dist = kotlin.math.hypot((normX - last.normX).toDouble(), (normY - last.normY).toDouble()).toFloat()
-            if (dist <= 0.065f) {
-                val boosted = (last.intensity + 0.18f).coerceAtMost(1.0f)
-                val mergedX = (last.normX * 0.72f + normX * 0.28f).coerceIn(0.02f, 0.98f)
-                val mergedY = (last.normY * 0.72f + normY * 0.28f).coerceIn(0.02f, 0.98f)
-                decayed[decayed.lastIndex] = com.example.data.model.LiveGazeTrailPoint(
-                    normX = mergedX,
-                    normY = mergedY,
-                    intensity = boosted,
-                    timestampMs = nowMs
-                )
-                return decayed
-            }
-        }
-
-        if (decayed.size >= 32) {
-            decayed.removeAt(0)
-        }
-        decayed.add(
-            com.example.data.model.LiveGazeTrailPoint(
-                normX = normX,
-                normY = normY,
-                intensity = 0.34f,
-                timestampMs = nowMs
-            )
-        )
-        return decayed
     }
 
     /**
@@ -1955,14 +1913,15 @@ class EyeTrackingViewModel(
                 val currentFps = _liveHudState.value.analyzerFps
                 _attentionState.update { st ->
                     val nextElapsed = st.elapsedSeconds + 1
-                    val nextTimeline = (st.fpsTimeline + currentFps).takeLast(120)
+                    // One exact-size list per tick (plus + takeLast copied the timeline twice, takeLast(10) once more)
+                    val nextTimeline = appendFpsSample(st.fpsTimeline, currentFps, FPS_TIMELINE_MAX_SAMPLES)
                     // Rolling 60-second baseline vs recent window: if FPS drops >40% from first-minute baseline,
                     // flag thermal throttling and auto-enable Performance Mode; clear it again (hysteresis)
                     // once the recent rate recovers to 80% of the baseline.
                     if (nextElapsed <= 60 && nextTimeline.isNotEmpty()) {
-                        sessionBaselineFps = nextTimeline.average().coerceAtLeast(10.0)
+                        sessionBaselineFps = averageOfLastFpsSamples(nextTimeline, nextTimeline.size).coerceAtLeast(10.0)
                     }
-                    val recentAvg = nextTimeline.takeLast(10).average()
+                    val recentAvg = averageOfLastFpsSamples(nextTimeline, FPS_RECENT_WINDOW_SAMPLES)
                     val throttled = if (st.thermalThrottleDetected) {
                         recentAvg < sessionBaselineFps * 0.80
                     } else {
@@ -2001,10 +1960,11 @@ class EyeTrackingViewModel(
         if (passagePoint != null) {
             if (rawSessionGazeSamples.size >= MAX_SESSION_GAZE_SAMPLES) {
                 // Fold the older half into archived clusters instead of discarding it, so the saved session
-                // covers the whole recording (not just its last few minutes)
+                // covers the whole recording (not just its last few minutes). clusterFixations only reads
+                // its input, so the sub-list view is clustered directly (no 1,800-element copy).
                 val olderHalf = rawSessionGazeSamples.subList(0, MAX_SESSION_GAZE_SAMPLES / 2)
                 archivedSessionClusters.addAll(
-                    GazeCalibrationMath.clusterFixations(ArrayList(olderHalf), maxClusters = Int.MAX_VALUE)
+                    GazeCalibrationMath.clusterFixations(olderHalf, maxClusters = Int.MAX_VALUE)
                 )
                 olderHalf.clear()
             }
@@ -2026,11 +1986,15 @@ class EyeTrackingViewModel(
             state.sectionDwellMsMap
         }
 
-        // Recompute live fixation clusters periodically so the Reading Lab heatmap renders in real time during recording
+        // Recompute live fixation clusters periodically so the Reading Lab heatmap renders in real time during
+        // recording, over a view of the newest window (takeLast copied up to 240 samples every 4th frame)
         val liveClusters = if (
             passagePoint != null && (rawSessionGazeSamples.size % 4 == 0 || state.computedClusters.isEmpty())
         ) {
-            GazeCalibrationMath.clusterFixations(rawSessionGazeSamples.takeLast(240))
+            val sampleCount = rawSessionGazeSamples.size
+            GazeCalibrationMath.clusterFixations(
+                rawSessionGazeSamples.subList((sampleCount - LIVE_CLUSTER_WINDOW_SAMPLES).coerceAtLeast(0), sampleCount)
+            )
         } else {
             state.computedClusters
         }
@@ -2088,7 +2052,7 @@ class EyeTrackingViewModel(
         }
         val bpm = (state.sessionNaturalBlinks * 60.0) / durationSec.toDouble()
 
-        val totalSecMs = state.sectionDwellMsMap.values.sum().coerceAtLeast(1L)
+        val totalSecMs = sectionDwellTotalMs.coerceAtLeast(1L)
         val sectionLoadsEncoded = readingPassageSections.map { sec ->
             val ms = state.sectionDwellMsMap[sec.sectionId] ?: 0L
             val pct = ((ms * 100L) / totalSecMs).toInt()
@@ -2401,6 +2365,11 @@ class EyeTrackingViewModel(
         private const val SETTLING_DELAY_MS = 400L
         private const val SAMPLES_PER_TARGET = 18
         private const val MAX_SESSION_GAZE_SAMPLES = 3600
+        // Newest raw samples the live Reading Lab heatmap clusters over while recording
+        private const val LIVE_CLUSTER_WINDOW_SAMPLES = 240
+        // Session FPS timeline: samples kept (one per second) and the recent window for the thermal guard
+        private const val FPS_TIMELINE_MAX_SAMPLES = 120
+        private const val FPS_RECENT_WINDOW_SAMPLES = 10
         private const val MAX_SAVED_CLUSTERS = 40
         private const val SIMULATED_PREFIX = "[SIMULATED] "
         // Same layout name the Control Deck uses for unvalidated metrics (GazeCalibrationMath.gridLayoutLabel)
@@ -2426,12 +2395,159 @@ class EyeTrackingViewModel(
     }
 }
 
+// Compiled once instead of once per passage section per ViewModel
+private val WHITESPACE_RUN_REGEX = Regex("\\s+")
+
 private fun passageSection(sectionId: String, heading: String, body: String) = SectionPassageItem(
     sectionId = sectionId,
     heading = heading,
     body = body,
-    wordCount = body.trim().split(Regex("\\s+")).size
+    wordCount = body.trim().split(WHITESPACE_RUN_REGEX).size
 )
+
+/** Cause shown in the banner when the analysis resolution steps down. */
+internal fun resolutionStepCauseLabel(lowRateStep: Boolean, liveFps: Int): String =
+    if (lowRateStep) {
+        "Low analysis rate ($liveFps FPS < 15)"
+    } else {
+        "Thermal guard ($liveFps FPS, >40% below session baseline)"
+    }
+
+// --- Live heatmap trail -------------------------------------------------------------------------------------
+
+private const val LIVE_TRAIL_MAX_POINTS = 32
+private const val LIVE_TRAIL_MAX_AGE_MS = 4800L
+private const val LIVE_TRAIL_MIN_INTENSITY = 0.08f
+private const val LIVE_TRAIL_MERGE_RADIUS = 0.065f
+// Squared distances where the merge decision is certain without hypot: sqrt(0.0041) = 0.0640 and
+// sqrt(0.0044) = 0.0663 lie far outside any rounding of the 0.065 radius. Only the band in between (and
+// non-finite input) takes the exact hypot comparison, so the decision is the same as always using hypot.
+private const val LIVE_TRAIL_MERGE_SURE_INSIDE_SQ = 0.0041
+private const val LIVE_TRAIL_MERGE_SURE_OUTSIDE_SQ = 0.0044
+private const val LIVE_TRAIL_DECAY_TAU_MS = 2400.0
+// Frame intervals reach the trail clamped to 16..500 ms; the decay table covers 0..500 ms
+private const val LIVE_TRAIL_DECAY_TABLE_MAX_DT_MS = 500
+
+private fun computeLiveTrailDecayFactor(dtMs: Long): Float =
+    exp(-dtMs.toDouble() / LIVE_TRAIL_DECAY_TAU_MS).toFloat().coerceIn(0.82f, 0.99f)
+
+/** exp() per frame replaced by a lookup; built on first use from the same expression. */
+private object LiveTrailDecayTable {
+    val byDtMs = FloatArray(LIVE_TRAIL_DECAY_TABLE_MAX_DT_MS + 1) { dt -> computeLiveTrailDecayFactor(dt.toLong()) }
+}
+
+/** Per-frame intensity decay of the live trail for a frame interval of [dtMs]. */
+internal fun liveGazeTrailDecayFactor(dtMs: Long): Float =
+    if (dtMs in 0L..LIVE_TRAIL_DECAY_TABLE_MAX_DT_MS.toLong()) {
+        LiveTrailDecayTable.byDtMs[dtMs.toInt()]
+    } else {
+        computeLiveTrailDecayFactor(dtMs)
+    }
+
+/** Same decision as `hypot(dx, dy).toFloat() <= 0.065f`, calling hypot only near the radius. */
+private fun isWithinLiveTrailMergeRadius(dx: Double, dy: Double): Boolean {
+    val distSq = dx * dx + dy * dy
+    return when {
+        distSq < LIVE_TRAIL_MERGE_SURE_INSIDE_SQ -> true
+        distSq > LIVE_TRAIL_MERGE_SURE_OUTSIDE_SQ -> false
+        else -> hypot(dx, dy).toFloat() <= LIVE_TRAIL_MERGE_RADIUS
+    }
+}
+
+/**
+ * Maintains a rolling real-time thermal gaze trail where dwelling near an existing node
+ * accumulates thermal intensity (Cyan -> Emerald -> Amber -> Crimson) and older nodes
+ * decay smoothly over a 4.8-second window.
+ *
+ * Every surviving node decays, so a new immutable list is published each frame, but it is allocated once at
+ * its exact size: a first pass only counts the survivors, so the node that is about to be merged is never
+ * copied first and a full trail never shifts its backing array to drop the oldest node.
+ */
+internal fun advanceLiveGazeTrail(
+    prevTrail: List<LiveGazeTrailPoint>,
+    normX: Float,
+    normY: Float,
+    faceDetected: Boolean,
+    nowMs: Long,
+    dtMs: Long
+): List<LiveGazeTrailPoint> {
+    val decayFactor = liveGazeTrailDecayFactor(dtMs)
+    val prevSize = prevTrail.size
+    val startIndex = (prevSize - LIVE_TRAIL_MAX_POINTS).coerceAtLeast(0)
+
+    // Pass 1 (no allocation): how many nodes survive the decay, and which one is the newest survivor
+    var survivorCount = 0
+    var lastSurvivorIndex = -1
+    for (i in startIndex until prevSize) {
+        val pt = prevTrail[i]
+        if (nowMs - pt.timestampMs <= LIVE_TRAIL_MAX_AGE_MS && pt.intensity * decayFactor >= LIVE_TRAIL_MIN_INTENSITY) {
+            survivorCount++
+            lastSurvivorIndex = i
+        }
+    }
+
+    // A face frame near the newest survivor merges into it (dwell); any other face frame appends a node,
+    // first dropping the oldest survivor when the trail is full
+    val mergeIntoLast = faceDetected && lastSurvivorIndex >= 0 && prevTrail[lastSurvivorIndex].let { last ->
+        isWithinLiveTrailMergeRadius((normX - last.normX).toDouble(), (normY - last.normY).toDouble())
+    }
+    val appendNew = faceDetected && !mergeIntoLast
+    var survivorsToDrop = if (appendNew && survivorCount >= LIVE_TRAIL_MAX_POINTS) 1 else 0
+    val outSize = survivorCount - survivorsToDrop + (if (appendNew) 1 else 0)
+    if (outSize == 0) return emptyList()
+
+    // Pass 2: decayed copies of the kept survivors (the merged survivor is replaced, not copied)
+    val out = ArrayList<LiveGazeTrailPoint>(outSize)
+    val copyEnd = if (mergeIntoLast) lastSurvivorIndex else prevSize
+    for (i in startIndex until copyEnd) {
+        val pt = prevTrail[i]
+        val nextIntensity = pt.intensity * decayFactor
+        if (nowMs - pt.timestampMs <= LIVE_TRAIL_MAX_AGE_MS && nextIntensity >= LIVE_TRAIL_MIN_INTENSITY) {
+            if (survivorsToDrop > 0) {
+                survivorsToDrop--
+            } else {
+                out.add(pt.copy(intensity = nextIntensity))
+            }
+        }
+    }
+    if (mergeIntoLast) {
+        val last = prevTrail[lastSurvivorIndex]
+        out.add(
+            LiveGazeTrailPoint(
+                normX = (last.normX * 0.72f + normX * 0.28f).coerceIn(0.02f, 0.98f),
+                normY = (last.normY * 0.72f + normY * 0.28f).coerceIn(0.02f, 0.98f),
+                intensity = (last.intensity * decayFactor + 0.18f).coerceAtMost(1.0f),
+                timestampMs = nowMs
+            )
+        )
+    } else if (appendNew) {
+        out.add(LiveGazeTrailPoint(normX = normX, normY = normY, intensity = 0.34f, timestampMs = nowMs))
+    }
+    return out
+}
+
+// --- Session FPS timeline -----------------------------------------------------------------------------------
+
+/** `(timeline + fps).takeLast(maxSize)`, built as a single list of the exact size. */
+internal fun appendFpsSample(timeline: List<Int>, fps: Int, maxSize: Int): List<Int> {
+    require(maxSize >= 0) { "Requested element count $maxSize is less than zero." }
+    if (maxSize == 0) return emptyList()
+    val from = (timeline.size + 1 - maxSize).coerceAtLeast(0)
+    val next = ArrayList<Int>(timeline.size + 1 - from)
+    for (i in from until timeline.size) next.add(timeline[i])
+    next.add(fps)
+    return next
+}
+
+/** `timeline.takeLast(count).average()` without the copy: same summation order, NaN when empty. */
+internal fun averageOfLastFpsSamples(timeline: List<Int>, count: Int): Double {
+    require(count >= 0) { "Requested element count $count is less than zero." }
+    val from = (timeline.size - count).coerceAtLeast(0)
+    var sum = 0.0
+    for (i in from until timeline.size) sum += timeline[i]
+    val n = timeline.size - from
+    return if (n == 0) Double.NaN else sum / n
+}
 
 private fun Double.finiteOrNull(): Double? = takeIf { it.isFinite() }
 

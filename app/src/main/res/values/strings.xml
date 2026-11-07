@@ -9,11 +9,6 @@
     <string name="nav_control">Control Deck</string>
     <string name="nav_attention">Attention Lab</string>
     <string name="nav_cloud">Cloud &amp; Privacy</string>
-    <string name="camera_permission_required">Front Camera Permission Required</string>
-    <string name="grant_camera_permission">Grant Camera Access</string>
-    <string name="simulator_mode_label">Simulator Proxy</string>
-    <string name="erase_all_cloud_data">Erase All Cloud Telemetry</string>
-    <string name="privacy_telemetry_card_title">Privacy &amp; Cloud Telemetry Controls</string>
     <string name="cloud_telemetry_opt_in_title">Cloud Telemetry Opt-In (Firestore Sync)</string>
     <string name="cloud_telemetry_status_opted_in">OPTED IN: Calibrations &amp; session summaries sync to your private Firestore vault.</string>
     <string name="cloud_telemetry_status_opted_out">OPTED OUT (Default): Zero cloud telemetry — all data stays strictly on-device.</string>

@@ -39,9 +39,12 @@ class OneEuroFilter(
     var beta: Double = 1.2,
     var dCutoff: Double = 1.0
 ) {
-    private var xPrev: Double? = null
+    // Primitive state with a validity flag (nullable Double/Long fields boxed on every sample).
+    // reset() only clears the flag, so a racing lastValue read sees the old value or null, as before.
+    private var hasPrev: Boolean = false
+    private var xPrev: Double = 0.0
     private var dxPrev: Double = 0.0
-    private var tPrev: Long? = null
+    private var tPrev: Long = 0L
 
     /**
      * Filters a 1D scalar sample.
@@ -53,10 +56,11 @@ class OneEuroFilter(
         val lastT = tPrev
         val lastX = xPrev
 
-        if (lastT == null || lastX == null || isStaleGap(lastT, timestampMs)) {
+        if (!hasPrev || isStaleGap(lastT, timestampMs)) {
             xPrev = x
             dxPrev = 0.0
             tPrev = timestampMs
+            hasPrev = true
             return x
         }
 
@@ -83,13 +87,12 @@ class OneEuroFilter(
     }
 
     fun reset() {
-        xPrev = null
+        hasPrev = false
         dxPrev = 0.0
-        tPrev = null
     }
 
     val lastValue: Double?
-        get() = xPrev
+        get() = if (hasPrev) xPrev else null
 
     companion object {
         fun computeAlpha(dtSec: Double, cutoffHz: Double): Double {
@@ -112,11 +115,14 @@ class OneEuroFilter2D(
     var beta: Double = 1.2,
     var dCutoff: Double = 1.0
 ) {
-    private var xPrev: Double? = null
-    private var yPrev: Double? = null
+    // Primitive state with a validity flag (nullable Double/Long fields boxed on every sample).
+    // reset() only clears the flag, so a racing lastPosition read sees the old position or null, as before.
+    private var hasPrev: Boolean = false
+    private var xPrev: Double = 0.0
+    private var yPrev: Double = 0.0
     private var dxPrev: Double = 0.0
     private var dyPrev: Double = 0.0
-    private var tPrev: Long? = null
+    private var tPrev: Long = 0L
 
     /**
      * Filters a 2D coordinate pair.
@@ -125,18 +131,33 @@ class OneEuroFilter2D(
      * @param timestampMs Monotonic sample timestamp in milliseconds.
      * @return Filtered (X, Y) pair.
      */
-    fun filter(x: Double, y: Double, timestampMs: Long): Pair<Double, Double> {
+    fun filter(x: Double, y: Double, timestampMs: Long): Pair<Double, Double> =
+        advance(x, y, timestampMs) { fx, fy -> Pair(fx, fy) }
+
+    /**
+     * Allocation-free [filter] for per-frame callers: writes the same filtered (X, Y) to out[0] and
+     * out[1] and returns [out].
+     */
+    fun filterInto(x: Double, y: Double, timestampMs: Long, out: DoubleArray): DoubleArray =
+        advance(x, y, timestampMs) { fx, fy ->
+            out[0] = fx
+            out[1] = fy
+            out
+        }
+
+    private inline fun <R> advance(x: Double, y: Double, timestampMs: Long, result: (Double, Double) -> R): R {
         val lastT = tPrev
         val lastX = xPrev
         val lastY = yPrev
 
-        if (lastT == null || lastX == null || lastY == null || isStaleGap(lastT, timestampMs)) {
+        if (!hasPrev || isStaleGap(lastT, timestampMs)) {
             xPrev = x
             yPrev = y
             dxPrev = 0.0
             dyPrev = 0.0
             tPrev = timestampMs
-            return Pair(x, y)
+            hasPrev = true
+            return result(x, y)
         }
 
         val dtSec = ((timestampMs - lastT).coerceIn(1L, 1000L)) / 1000.0
@@ -165,30 +186,24 @@ class OneEuroFilter2D(
         xPrev = filteredX
         yPrev = filteredY
 
-        return Pair(filteredX, filteredY)
+        return result(filteredX, filteredY)
     }
 
     fun reset() {
-        xPrev = null
-        yPrev = null
+        hasPrev = false
         dxPrev = 0.0
         dyPrev = 0.0
-        tPrev = null
     }
 
     val lastPosition: Pair<Double, Double>?
-        get() {
-            // Read each field once so a concurrent reset() cannot null it between check and use.
-            val x = xPrev
-            val y = yPrev
-            return if (x != null && y != null) Pair(x, y) else null
-        }
+        get() = if (hasPrev) Pair(xPrev, yPrev) else null
 }
 
 /**
  * 2D Linear Kalman Filter tracking 4D state vector x = [x, y, vx, vy]^T with constant-velocity model.
  * Implemented with closed-form scalar 2x2 covariance updates per axis (no matrix objects). Note that
- * filter(), [state] and [velocity] return a boxed Pair<Double, Double>, so each call allocates.
+ * filter(), [state] and [velocity] return a boxed Pair<Double, Double>, so each call allocates;
+ * [filterInto] is the allocation-free variant of filter().
  *
  * Defaults are tuned for normalized [0,1] screen coordinates at 10-30 FPS: with Q = 1.0 and R = 1e-2 a
  * 0.4 step reaches 90% in about 330 ms after warm-up (Q = 1e-3 needed about 1.65 s). As with any
@@ -219,12 +234,27 @@ class GazeKalmanFilter2D(
     private var pY10: Double = 0.0
     private var pY11: Double = 1.0
 
-    private var tPrev: Long? = null
+    // Primitive timestamp (a nullable Long was boxed on every sample); valid only while isInitialized.
+    private var tPrev: Long = 0L
     private var isInitialized: Boolean = false
 
-    fun filter(measX: Double, measY: Double, timestampMs: Long): Pair<Double, Double> {
+    fun filter(measX: Double, measY: Double, timestampMs: Long): Pair<Double, Double> =
+        advance(measX, measY, timestampMs) { x, y -> Pair(x, y) }
+
+    /**
+     * Allocation-free [filter] for per-frame callers: writes the same filtered (X, Y) to out[0] and
+     * out[1] and returns [out].
+     */
+    fun filterInto(measX: Double, measY: Double, timestampMs: Long, out: DoubleArray): DoubleArray =
+        advance(measX, measY, timestampMs) { x, y ->
+            out[0] = x
+            out[1] = y
+            out
+        }
+
+    private inline fun <R> advance(measX: Double, measY: Double, timestampMs: Long, result: (Double, Double) -> R): R {
         val lastT = tPrev
-        if (!isInitialized || lastT == null || isStaleGap(lastT, timestampMs)) {
+        if (!isInitialized || isStaleGap(lastT, timestampMs)) {
             posX = measX
             posY = measY
             velX = 0.0
@@ -233,7 +263,7 @@ class GazeKalmanFilter2D(
             pY00 = 1.0; pY01 = 0.0; pY10 = 0.0; pY11 = 1.0
             tPrev = timestampMs
             isInitialized = true
-            return Pair(measX, measY)
+            return result(measX, measY)
         }
 
         val dt = ((timestampMs - lastT).coerceIn(1L, 1000L)) / 1000.0
@@ -286,12 +316,12 @@ class GazeKalmanFilter2D(
         pY10 = predPY10 - kY1 * predPY00
         pY11 = predPY11 - kY1 * predPY01
 
-        return Pair(posX, posY)
+        return result(posX, posY)
     }
 
     fun reset() {
         isInitialized = false
-        tPrev = null
+        tPrev = 0L
         posX = 0.0
         posY = 0.0
         velX = 0.0

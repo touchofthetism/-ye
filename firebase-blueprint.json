@@ -2,7 +2,7 @@
   "entities": {
     "CalibrationProfile": {
       "title": "CalibrationProfile",
-      "description": "Device-tagged eye-tracking regression profile from the 5-point fit (optionally checked on 4 held-out points) owned by an authenticated user. The stored document does not record whether held-out validation ran, so clients must treat cloud profiles as not held-out validated.",
+      "description": "Device-tagged eye-tracking regression profile from the 5-point fit (optionally checked on 4 held-out points) owned by an authenticated user. heldOutValidated records whether held-out validation ran; records saved before that field existed omit it and are treated as not held-out validated.",
       "type": "object",
       "properties": {
         "userId": {
@@ -257,7 +257,7 @@
       "schema": {
         "$ref": "#/entities/CalibrationProfile"
       },
-      "description": "User-scoped calibration profiles containing standardized 2x6 regression matrices and the wizard's error metrics (held-out when validation ran, otherwise in-sample fit residuals; the document does not say which)."
+      "description": "User-scoped calibration profiles containing standardized 2x6 regression matrices and the wizard's error metrics (held-out when validation ran, otherwise in-sample fit residuals; heldOutValidated says which, and an absent value means not validated)."
     },
     "/users/{userId}/sessions/{sessionId}": {
       "schema": {
