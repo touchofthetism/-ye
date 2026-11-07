@@ -318,7 +318,10 @@ class EyeTrackingViewModel(
     // Kalman Q = 1.0 settles a step in ~330 ms (Q = 1e-3 lagged ~1.7 s and overshot).
     private val screenGazeFilter = com.example.domain.OneEuroFilter2D(minCutoff = 0.90, beta = 1.2, dCutoff = 1.0)
     private val screenKalmanFilter = com.example.domain.GazeKalmanFilter2D(processNoiseQ = 1.0, measurementNoiseR = 1e-2)
-
+    // Per-frame scratch for the allocation-free projection and filter calls (a Pair and two boxed values
+    // each per frame otherwise). Main-thread single writer; read back into locals right after each call.
+    private val projectedGazeScratch = FloatArray(2)
+    private val filteredGazeScratch = DoubleArray(2)
 
     // Calibration sample buffers
     private val fitSamples = mutableListOf<Pair<GazeFeatureVector, Pair<Float, Float>>>()
@@ -824,11 +827,14 @@ class EyeTrackingViewModel(
             prev.resolutionTier
         }
 
-        val (rawPredX, rawPredY) = GazeCalibrationMath.projectGaze(
+        val projected = GazeCalibrationMath.projectGazeInto(
             feature = feature,
             matrixCoeffs = activeMatrix,
-            baselineEyeDistPx = activeBaselineEyeDistPx
+            baselineEyeDistPx = activeBaselineEyeDistPx,
+            out = projectedGazeScratch
         )
+        val rawPredX = projected[0]
+        val rawPredY = projected[1]
 
         // Posture profile compensation (pitch & gravity shift for reclining/lying down). The fitted
         // intercept already absorbed the posture used during calibration, so only the difference applies.
@@ -846,20 +852,25 @@ class EyeTrackingViewModel(
             updateRecenterCapture(postureAdjustedX, postureAdjustedY, gazeValid, now)
         }
 
-        // Plain locals instead of a Pair<Float, Float> (a Pair and two boxed Floats per frame)
+        // Plain locals instead of a Pair<Float, Float> (a Pair and two boxed Floats per frame), and the
+        // filters write into the scratch array instead of returning a Pair<Double, Double>
         var smoothedX = prev.normX
         var smoothedY = prev.normY
         if (gazeValid) {
             when (prev.filterMode) {
                 com.example.data.model.GazeFilterMode.ONE_EURO -> {
-                    val filtered = screenGazeFilter.filter(postureAdjustedX.toDouble(), postureAdjustedY.toDouble(), now)
-                    smoothedX = filtered.first.toFloat().coerceIn(0.02f, 0.98f)
-                    smoothedY = filtered.second.toFloat().coerceIn(0.02f, 0.98f)
+                    val filtered = screenGazeFilter.filterInto(
+                        postureAdjustedX.toDouble(), postureAdjustedY.toDouble(), now, filteredGazeScratch
+                    )
+                    smoothedX = filtered[0].toFloat().coerceIn(0.02f, 0.98f)
+                    smoothedY = filtered[1].toFloat().coerceIn(0.02f, 0.98f)
                 }
                 com.example.data.model.GazeFilterMode.KALMAN -> {
-                    val filtered = screenKalmanFilter.filter(postureAdjustedX.toDouble(), postureAdjustedY.toDouble(), now)
-                    smoothedX = filtered.first.toFloat().coerceIn(0.02f, 0.98f)
-                    smoothedY = filtered.second.toFloat().coerceIn(0.02f, 0.98f)
+                    val filtered = screenKalmanFilter.filterInto(
+                        postureAdjustedX.toDouble(), postureAdjustedY.toDouble(), now, filteredGazeScratch
+                    )
+                    smoothedX = filtered[0].toFloat().coerceIn(0.02f, 0.98f)
+                    smoothedY = filtered[1].toFloat().coerceIn(0.02f, 0.98f)
                 }
                 com.example.data.model.GazeFilterMode.RAW -> {
                     smoothedX = postureAdjustedX

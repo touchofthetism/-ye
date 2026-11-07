@@ -27,6 +27,7 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -71,7 +72,8 @@ private fun randomDocId(rng: Random): String {
 /**
  * Equivalence tests for the EyeTrackingRepository optimization pass that need no emulator: the
  * error-path helper (currentUserPath) must build the same logged path as the six inline
- * "users/${uid ?: "unauthenticated"}..." templates it replaced.
+ * "users/${uid ?: "unauthenticated"}..." templates it replaced, and the shared activation field
+ * maps must equal the per-call maps they replaced.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
@@ -131,6 +133,35 @@ class CloudOptimizationTest {
                 }
             )
             assertLogsMatchFrozenTemplates(cases, signedIn = false)
+        }
+    }
+
+    /**
+     * activeStateFields now returns one of two shared maps instead of building a map per call. The
+     * shared maps must hold exactly what the frozen per-call mapOf built (same keys in the same
+     * order, same values, the server-timestamp sentinel itself), and stay unchanged across calls.
+     */
+    @Test
+    fun activeStateFields_sharedMaps_matchTheFrozenPerCallMaps() {
+        val (auth, db) = signedOutAuthAndDb()
+        val repository = EyeTrackingRepository(db, auth)
+        val activeStateFields = EyeTrackingRepository::class.java
+            .getDeclaredMethod("activeStateFields", Boolean::class.javaPrimitiveType)
+            .apply { isAccessible = true }
+        val rng = Random(SEED + 2)
+        repeat(64) {
+            val isActive = rng.nextBoolean()
+            // Frozen reference, exactly as the pre-optimization activeStateFields built it.
+            val frozen: Map<String, Any> = mapOf(
+                "isActive" to isActive,
+                "updatedAt" to FieldValue.serverTimestamp()
+            )
+            @Suppress("UNCHECKED_CAST")
+            val actual = activeStateFields.invoke(repository, isActive) as Map<String, Any>
+            assertEquals(frozen, actual)
+            assertEquals(frozen.keys.toList(), actual.keys.toList())
+            assertEquals(isActive, actual["isActive"])
+            assertSame(FieldValue.serverTimestamp(), actual["updatedAt"])
         }
     }
 

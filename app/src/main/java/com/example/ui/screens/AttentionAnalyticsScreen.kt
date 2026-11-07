@@ -81,12 +81,19 @@ import java.util.Locale
 const val ATTENTION_OFF_PASSAGE_SECTION_ID = "__off_passage__"
 
 // Shapes and spacing reused across recompositions (the passage Box recomposes on every recorded frame).
+private val HeaderShape = RoundedCornerShape(14.dp)
 private val PassageShape = RoundedCornerShape(16.dp)
 private val SectionShape = RoundedCornerShape(12.dp)
+private val DwellBarShape = RoundedCornerShape(3.dp)
 private val PassageSpacing = Arrangement.spacedBy(12.dp)
 
+// Heatmap draw colors, resolved once instead of per line / per node on every draw.
+private val TrajectoryColor = Color(0xFF00E5FF).copy(alpha = 0.72f)
+private val NodeOutlineColor = Color(0xFF0B0F17)
+private val NodeFillColor = Color(0xFF00E5FF)
+
 private val ClusterLabelStyle = TextStyle(
-    color = Color(0xFF0B0F17),
+    color = NodeOutlineColor,
     fontSize = 10.sp,
     fontWeight = FontWeight.Bold
 )
@@ -371,7 +378,7 @@ private fun AttentionSessionHeaderCard(
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        shape = RoundedCornerShape(14.dp)
+        shape = HeaderShape
     ) {
         Column(modifier = Modifier.padding(14.dp)) {
             Row(
@@ -483,7 +490,10 @@ private fun PassageSectionCard(
                 shape = SectionShape
             )
             .onGloballyPositioned { coords ->
-                sectionBoundsMap[section.sectionId] = coords.boundsInRoot()
+                // Re-putting equal bounds still copied the snapshot map and re-ran the hit-test flow, whose
+                // snapshotFlow then dropped the identical value; skip the write instead.
+                val bounds = coords.boundsInRoot()
+                if (sectionBoundsMap[section.sectionId] != bounds) sectionBoundsMap[section.sectionId] = bounds
             }
             .padding(12.dp)
     ) {
@@ -518,7 +528,7 @@ private fun PassageSectionCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(5.dp)
-                .clip(RoundedCornerShape(3.dp)),
+                .clip(DwellBarShape),
             color = MaterialTheme.colorScheme.tertiary,
             trackColor = MaterialTheme.colorScheme.background
         )
@@ -559,7 +569,7 @@ private fun BoxScope.FixationHeatmapOverlay(clusters: List<FixationClusterPoint>
                     // 2. Dashed centroid sequence trajectory lines
                     for (i in 0 until (count - 1)) {
                         drawLine(
-                            color = Color(0xFF00E5FF).copy(alpha = 0.72f),
+                            color = TrajectoryColor,
                             start = Offset(centerX[i], centerY[i]),
                             end = Offset(centerX[i + 1], centerY[i + 1]),
                             strokeWidth = frame.trajectoryStrokeWidthPx,
@@ -572,12 +582,12 @@ private fun BoxScope.FixationHeatmapOverlay(clusters: List<FixationClusterPoint>
                         val cx = centerX[i]
                         val cy = centerY[i]
                         drawCircle(
-                            color = Color(0xFF0B0F17),
+                            color = NodeOutlineColor,
                             radius = frame.nodeOutlineRadiusPx,
                             center = Offset(cx, cy)
                         )
                         drawCircle(
-                            color = Color(0xFF00E5FF),
+                            color = NodeFillColor,
                             radius = frame.nodeFillRadiusPx,
                             center = Offset(cx, cy)
                         )

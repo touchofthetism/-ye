@@ -14,6 +14,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.test.core.app.ApplicationProvider
 import com.example.ReadInOwnScope
 import com.example.data.repository.LocalTelemetryStore
@@ -22,6 +23,9 @@ import com.example.isCameraPermissionGranted
 import com.example.prefetchLocalVault
 import com.example.ui.viewmodel.CalibrationFlowStep
 import com.example.ui.viewmodel.CalibrationWizardState
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
@@ -230,7 +234,8 @@ class ActivityOptimizationTest {
  * The workbench now passes camera-rate states to ReadInOwnScope (and a derivedStateOf for the
  * calibration overlay) instead of reading them in the Scaffold content. These tests check that the
  * scoped reads deliver exactly what the frozen direct reads delivered, while recomposing the caller
- * only once (or only when the derived value flips).
+ * only once (or only when the derived value flips). AppRootNavigation now remembers its auth-state
+ * flow; the last test checks it delivers the same users with a single listener registration.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
@@ -348,6 +353,44 @@ class ActivityOptimizationComposeTest {
         assertEquals(1 + writes, frozenCallerCompositions[0])
         assertEquals(1 + flips, derivedCallerCompositions[0])
     }
+
+    @Test
+    fun `remembered auth flow delivers the same users as a per-composition flow but registers one listener`() {
+        val rng = Random(0x5EED_0005L)
+        val users = arrayOf<String?>(null, "uid_a", "uid_b", "uid_c")
+        val frozenSource = FakeAuthStateSource()
+        val rememberedSource = FakeAuthStateSource()
+        val frozenSeen = mutableListOf<String?>()
+        val rememberedSeen = mutableListOf<String?>()
+
+        composeRule.setContent {
+            FrozenAuthUserCollector(frozenSource) { frozenSeen.add(it) }
+            RememberedAuthUserCollector(rememberedSource) { rememberedSeen.add(it) }
+        }
+        composeRule.waitForIdle()
+
+        val expected = mutableListOf<String?>(null)
+        repeat(60) {
+            // Repeats of the current user (no change) are part of the walk.
+            val next = users[rng.nextInt(users.size)]
+            composeRule.runOnIdle {
+                frozenSource.setUser(next)
+                rememberedSource.setUser(next)
+            }
+            composeRule.waitForIdle()
+            if (next != expected.last()) expected.add(next)
+        }
+
+        assertTrue("the walk must change the user", expected.size > 5)
+        assertEquals(expected, frozenSeen)
+        assertEquals(expected, rememberedSeen)
+        // The frozen pattern re-registered the listener after every user change; the remembered
+        // flow keeps its one registration. Neither leaks a listener.
+        assertEquals(expected.size, frozenSource.registrations)
+        assertEquals(1, rememberedSource.registrations)
+        assertEquals(1, frozenSource.activeListeners)
+        assertEquals(1, rememberedSource.activeListeners)
+    }
 }
 
 /** Robolectric tests for the non-Compose helpers. */
@@ -458,6 +501,53 @@ private fun FrozenOverlayCaller(
     if (show) {
         WizardStateSink(calibrationState, overlaySink)
     }
+}
+
+/**
+ * Stand-in for FirebaseAuth's listener API: like Firebase, it calls a newly added listener at once
+ * with the current user. [authStateFlow] has the same shape as `FirebaseAuth.authStateFlow()`.
+ * Used on the main thread only.
+ */
+private class FakeAuthStateSource {
+    var currentUser: String? = null
+        private set
+    var registrations = 0
+        private set
+    private val listeners = mutableListOf<(String?) -> Unit>()
+    val activeListeners: Int get() = listeners.size
+
+    fun setUser(user: String?) {
+        currentUser = user
+        for (listener in listeners.toList()) listener(user)
+    }
+
+    fun authStateFlow(): Flow<String?> = callbackFlow {
+        val listener: (String?) -> Unit = { trySend(it) }
+        registrations++
+        listeners.add(listener)
+        listener(currentUser)
+        awaitClose { listeners.remove(listener) }
+    }
+}
+
+/** Frozen pre-optimization AppRootNavigation pattern: a fresh flow on every composition. */
+@Composable
+private fun FrozenAuthUserCollector(source: FakeAuthStateSource, sink: (String?) -> Unit) {
+    val currentUser by source.authStateFlow().collectAsStateWithLifecycle(initialValue = source.currentUser)
+    UserSink(currentUser, sink)
+}
+
+/** The optimized AppRootNavigation pattern: the flow is remembered per auth instance. */
+@Composable
+private fun RememberedAuthUserCollector(source: FakeAuthStateSource, sink: (String?) -> Unit) {
+    val authUserFlow = remember(source) { source.authStateFlow() }
+    val currentUser by authUserFlow.collectAsStateWithLifecycle(initialValue = source.currentUser)
+    UserSink(currentUser, sink)
+}
+
+@Composable
+private fun UserSink(user: String?, sink: (String?) -> Unit) {
+    SideEffect { sink(user) }
 }
 
 /** The optimized overlay block of AuthenticatedMainWorkbench. */

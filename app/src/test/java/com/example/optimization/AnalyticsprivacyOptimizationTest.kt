@@ -30,6 +30,7 @@ import androidx.compose.ui.unit.sp
 import androidx.test.core.app.ApplicationProvider
 import com.example.R
 import com.example.data.model.CalibrationProfile
+import com.example.data.model.DwellSpeedPreset
 import com.example.data.model.FixationClusterPoint
 import com.example.data.model.SectionDwellSummary
 import com.example.data.model.SectionPassageItem
@@ -38,6 +39,7 @@ import com.example.ui.screens.AttentionAnalyticsScreen
 import com.example.ui.screens.CloudPrivacyScreen
 import com.example.ui.screens.ClusterLabelLayouts
 import com.example.ui.screens.buildFixationHeatmapFrame
+import com.example.ui.screens.formatSensitivityLabel
 import com.example.ui.screens.formatSessionSummaryLine
 import com.example.ui.screens.formatZoneSummary
 import com.example.ui.viewmodel.AttentionSessionLiveState
@@ -51,6 +53,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.util.Locale
+import kotlin.math.roundToInt
 import kotlin.random.Random
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -85,6 +88,17 @@ private fun referenceFormatProfileErrorLine(profile: CalibrationProfile): String
     profile.meanErrorMm,
     profile.maxErrorPct
 )
+
+private fun referenceFormatSensitivityLabel(multiplier: Float): String =
+    String.format(Locale.US, "%.2f× (%d dp)", multiplier, (14f * multiplier).roundToInt())
+
+/** Text, or the exception text for inputs (NaN) where both versions throw from roundToInt. */
+private inline fun outcome(block: () -> String): String =
+    try {
+        block()
+    } catch (e: IllegalArgumentException) {
+        "threw ${e::class.java.name}: ${e.message}"
+    }
 
 /** The replay subtitle exactly as the header Text built it inline. */
 private fun referenceReplaySubtitle(replay: TrackingSession): String =
@@ -183,6 +197,33 @@ class AnalyticsprivacyOptimizationTest {
                 bottomZonePercentage = if (i % 9 == 0) intEdges.random(random) else random.nextInt(-5, 101)
             )
             assertEquals(session.toString(), referenceFormatSessionSummaryLine(session), formatSessionSummaryLine(session))
+        }
+    }
+
+    @Test
+    fun `sensitivity label template matches the single String_format reference`() {
+        val edges = floatArrayOf(
+            0f, -0f, 0.6f, 0.65f, 0.85f, 1f, 1.005f, 1.015f, 1.025f, 1.25f, 1.55f, 2f, 0.035714287f, 0.10714286f,
+            -1.55f, -0.035714287f, 1e-8f, 153391.69f, Float.MIN_VALUE, Float.MAX_VALUE, -Float.MAX_VALUE,
+            Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY, Float.NaN
+        )
+        for (m in edges) {
+            assertEquals("$m", outcome { referenceFormatSensitivityLabel(m) }, outcome { formatSensitivityLabel(m) })
+        }
+        // Every position of the 0.6..2.0 slider with 13 steps, computed the way the slider snaps.
+        for (step in 0..14) {
+            val m = 0.6f + step * (1.4f / 14f)
+            assertEquals("step $step", referenceFormatSensitivityLabel(m), formatSensitivityLabel(m))
+        }
+        val random = Random(1955)
+        repeat(100_000) { i ->
+            val m = when (i % 4) {
+                0 -> random.nextFloat() * 1.4f + 0.6f
+                1 -> Float.fromBits(random.nextInt())
+                2 -> (random.nextFloat() - 0.5f) * 400f
+                else -> random.nextInt(-1000, 1000) / 28f // multiplier * 14 lands on x.5 dp ties
+            }
+            assertEquals("$m", outcome { referenceFormatSensitivityLabel(m) }, outcome { formatSensitivityLabel(m) })
         }
     }
 
@@ -359,6 +400,57 @@ class AnalyticsprivacyComposeOptimizationTest {
     }
 
     @Test
+    fun `hit reports are unchanged when relayouts re-deliver equal section bounds`() {
+        var reticle by mutableStateOf(Offset.Zero)
+        var sectionSummaries by mutableStateOf(summaries(10, 90))
+        var state by mutableStateOf(AttentionSessionLiveState(isRecording = true, activeSectionId = "sec_1"))
+        val hits = mutableListOf<String?>()
+        val passagePoints = mutableListOf<Offset?>()
+        composeRule.setContent {
+            AttentionAnalyticsScreen(
+                attentionState = state,
+                reticleRootPosition = { reticle },
+                passageSections = sections,
+                sectionSummaries = sectionSummaries,
+                onUpdateLayoutHitSection = { hits += it },
+                onUpdatePassageGazePoint = { passagePoints += it },
+                onStartRecording = {},
+                onStopAndSaveRecording = {}
+            )
+        }
+        val alpha = composeRule.onNodeWithText("Alpha heading").fetchSemanticsNode().boundsInRoot.center
+        val beta = composeRule.onNodeWithText("Beta heading").fetchSemanticsNode().boundsInRoot.center
+        composeRule.runOnIdle { reticle = alpha }
+        composeRule.waitForIdle()
+        assertEquals("sec_1", hits.last())
+        val hitsBefore = hits.size
+        val pointsBefore = passagePoints.size
+
+        // Recorded frames: labels change width and every section is laid out and positioned again at equal bounds.
+        repeat(20) { frame ->
+            composeRule.runOnIdle {
+                sectionSummaries = summaries(10 + frame, 90 - frame)
+                // Header text is kept fixed so the passage itself does not move; labels stay two digits wide.
+                state = state.copy(
+                    topZoneMs = frame * 33L,
+                    activeSectionId = if (frame % 2 == 0) "sec_1" else "sec_2"
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        // Same reticle, same bounds: the hit-test flow emitted nothing new, before and after the write guard.
+        assertEquals(hitsBefore, hits.size)
+        assertEquals(pointsBefore, passagePoints.size)
+
+        composeRule.runOnIdle { reticle = beta }
+        composeRule.waitForIdle()
+        assertEquals("sec_2", hits.last())
+        composeRule.runOnIdle { reticle = alpha }
+        composeRule.waitForIdle()
+        assertEquals("sec_1", hits.last())
+    }
+
+    @Test
     fun `heatmap node is present exactly while clusters are`() {
         var clusters by mutableStateOf(emptyList<FixationClusterPoint>())
         composeRule.setContent {
@@ -405,6 +497,11 @@ class AnalyticsprivacyComposeOptimizationTest {
         composeRule.onAllNodesWithText("1000 ms").assertCountEquals(2)
         composeRule.onNodeWithText("1.00× (14 dp)").assertExists()
         composeRule.onNodeWithText(optedOut).assertExists()
+        // Chip labels and tags now come from per-ordinal tables built once.
+        DwellSpeedPreset.entries.forEach { preset ->
+            composeRule.onNodeWithTag("speed_preset_chip_${preset.name.lowercase()}")
+                .assert(hasText(preset.title.take(12)))
+        }
 
         repeat(20) { frame ->
             composeRule.runOnIdle { hud = hud.copy(normX = frame / 20f, analyzerFps = 30 + frame) }
@@ -414,6 +511,8 @@ class AnalyticsprivacyComposeOptimizationTest {
 
         composeRule.runOnIdle { hud = hud.copy(dwellTriggerMs = 1400L) }
         composeRule.onAllNodesWithText("1400 ms").assertCountEquals(2)
+        // The remembered sensitivity label is keyed on the multiplier only.
+        composeRule.onNodeWithText("1.00× (14 dp)").assertExists()
         composeRule.runOnIdle { hud = hud.copy(dwellSensitivityRadiusMultiplier = 1.55f) }
         composeRule.onNodeWithText("1.55× (22 dp)").assertExists()
         composeRule.runOnIdle { hud = hud.copy(cloudSyncEnabled = true) }

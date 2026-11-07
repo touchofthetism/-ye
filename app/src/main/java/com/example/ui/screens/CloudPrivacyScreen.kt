@@ -67,6 +67,12 @@ import kotlin.math.roundToLong
 // Shapes reused by every card and every list row.
 private val CardShape = RoundedCornerShape(16.dp)
 private val ListRowShape = RoundedCornerShape(12.dp)
+private val AccountPanelShape = RoundedCornerShape(10.dp)
+
+// Speed preset chip labels and test tags by ordinal. The dwell card recomposes on every slider step; these were
+// rebuilt (take / lowercase / concat) for every chip on each of those recompositions.
+private val PresetChipLabels: List<String> = DwellSpeedPreset.entries.map { it.title.take(12) }
+private val PresetChipTags: List<String> = DwellSpeedPreset.entries.map { "speed_preset_chip_${it.name.lowercase()}" }
 
 /** Irreversible actions on this screen; each one runs only after the user confirms it in a dialog. */
 private sealed interface PendingDestructiveAction {
@@ -79,9 +85,12 @@ private sealed interface PendingDestructiveAction {
 /** Slider ticks come back as e.g. 1899.9999f; round instead of truncating so 1900 ms stays 1900 ms. */
 internal fun sliderValueToDwellMs(value: Float): Long = value.roundToLong()
 
-/** Same rounding as DwellTriggerSettingsDialog so both screens show the same margin for one setting. */
+/**
+ * Same rounding as DwellTriggerSettingsDialog so both screens show the same margin for one setting. Only `%.2f`
+ * needs a Formatter; Locale.US `%d` is plain `Int.toString()`.
+ */
 internal fun formatSensitivityLabel(multiplier: Float): String =
-    String.format(Locale.US, "%.2f× (%d dp)", multiplier, (14f * multiplier).roundToInt())
+    "${String.format(Locale.US, "%.2f", multiplier)}× (${(14f * multiplier).roundToInt()} dp)"
 
 /**
  * Saved error is held-out validation error only when the wizard ran the 4-point validation
@@ -283,6 +292,11 @@ private fun DwellSettingsCard(
     onChangeDwellSensitivityMultiplier: (Float) -> Unit,
     onSelectDwellPreset: (DwellSpeedPreset) -> Unit
 ) {
+    // Shown twice; and dragging the duration slider must not re-run the sensitivity Formatter.
+    val dwellLabel = "$dwellTriggerMs ms"
+    val sensitivityLabel = remember(dwellSensitivityRadiusMultiplier) {
+        formatSensitivityLabel(dwellSensitivityRadiusMultiplier)
+    }
     // Dwell Trigger & Eye-Tracking Speed Settings Menu Card
     Card(
         modifier = Modifier
@@ -316,7 +330,7 @@ private fun DwellSettingsCard(
                     )
                 }
                 Text(
-                    text = "$dwellTriggerMs ms",
+                    text = dwellLabel,
                     style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary
@@ -341,12 +355,12 @@ private fun DwellSettingsCard(
                         onClick = { onSelectDwellPreset(preset) },
                         label = {
                             Text(
-                                text = preset.title.take(12),
+                                text = PresetChipLabels[preset.ordinal],
                                 style = MaterialTheme.typography.labelSmall,
                                 fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
                             )
                         },
-                        modifier = Modifier.testTag("speed_preset_chip_${preset.name.lowercase()}")
+                        modifier = Modifier.testTag(PresetChipTags[preset.ordinal])
                     )
                 }
             }
@@ -363,7 +377,7 @@ private fun DwellSettingsCard(
                         fontWeight = FontWeight.SemiBold
                     )
                     Text(
-                        text = "$dwellTriggerMs ms",
+                        text = dwellLabel,
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.primary,
                         fontWeight = FontWeight.Bold
@@ -392,7 +406,7 @@ private fun DwellSettingsCard(
                         fontWeight = FontWeight.SemiBold
                     )
                     Text(
-                        text = formatSensitivityLabel(dwellSensitivityRadiusMultiplier),
+                        text = sensitivityLabel,
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.secondary,
                         fontWeight = FontWeight.Bold
@@ -487,7 +501,7 @@ private fun PrivacySettingsCard(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(10.dp))
+                    .clip(AccountPanelShape)
                     .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
                     .padding(10.dp),
                 verticalArrangement = Arrangement.spacedBy(3.dp)

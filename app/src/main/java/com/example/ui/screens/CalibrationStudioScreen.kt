@@ -401,27 +401,61 @@ private fun LiveFeatureTelemetryCard(hudState: State<LiveGazeHudState>) {
     }
 }
 
+/**
+ * Reads the per-frame HUD and hands each line only the primitives it prints. The feature vector itself
+ * differs on every frame (its timestamp does), so a line keyed on it would re-format on every frame; keyed
+ * on its own fields, a line skips its String.format whenever what it shows is unchanged (e.g. the
+ * constant gx..roll and eye placeholders of no-face frames).
+ */
 @Composable
 private fun LiveFeatureTelemetryLinesForHud(hudState: State<LiveGazeHudState>) {
     val hud = hudState.value
-    LiveFeatureTelemetryLines(feature = hud.rawFeature, tierLabel = hud.resolutionTier.shortLabel)
+    val f = hud.rawFeature
+    RawFeatureVectorLine(gx = f.gx, gy = f.gy, yaw = f.yaw, pitch = f.pitch, roll = f.roll)
+    Spacer(modifier = Modifier.height(4.dp))
+    EyeTelemetryLine(
+        faceDetected = f.faceDetected,
+        leftEyeConfidence = f.leftEyeConfidence,
+        rightEyeConfidence = f.rightEyeConfidence,
+        eyeDistancePx = f.eyeDistancePx,
+        combinedEyeOpenProb = f.combinedEyeOpenProb,
+        ambientLuma = f.ambientLuma,
+        isLowLightDegraded = f.isLowLightDegraded,
+        tierLabel = hud.resolutionTier.shortLabel
+    )
 }
 
-/** Skips (no formatting) on HUD updates that leave the raw feature and tier unchanged. */
 @Composable
-private fun LiveFeatureTelemetryLines(feature: GazeFeatureVector, tierLabel: String) {
+private fun RawFeatureVectorLine(gx: Double, gy: Double, yaw: Double, pitch: Double, roll: Double) {
     Text(
-        text = String.format(
-            Locale.US,
-            "f_raw = [1.0, gx=%.3f, gy=%.3f, yaw=%.1f°, pitch=%.1f°, roll=%.1f°]",
-            feature.gx, feature.gy, feature.yaw, feature.pitch, feature.roll
-        ),
+        text = formatRawFeatureVectorLine(gx, gy, yaw, pitch, roll),
         style = MaterialTheme.typography.labelMedium,
         color = MaterialTheme.colorScheme.onSurface
     )
-    Spacer(modifier = Modifier.height(4.dp))
+}
+
+@Composable
+private fun EyeTelemetryLine(
+    faceDetected: Boolean,
+    leftEyeConfidence: Float,
+    rightEyeConfidence: Float,
+    eyeDistancePx: Double,
+    combinedEyeOpenProb: Float,
+    ambientLuma: Int,
+    isLowLightDegraded: Boolean,
+    tierLabel: String
+) {
     Text(
-        text = formatEyeTelemetryLine(feature, tierLabel),
+        text = formatEyeTelemetryLine(
+            faceDetected = faceDetected,
+            leftEyeConfidence = leftEyeConfidence,
+            rightEyeConfidence = rightEyeConfidence,
+            eyeDistancePx = eyeDistancePx,
+            combinedEyeOpenProb = combinedEyeOpenProb,
+            ambientLuma = ambientLuma,
+            isLowLightDegraded = isLowLightDegraded,
+            tierLabel = tierLabel
+        ),
         style = MaterialTheme.typography.labelSmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier.testTag("calibration_eye_telemetry_text")
@@ -997,27 +1031,57 @@ internal val fitTargetSummaryCoordLabels: List<String> by lazy {
  * Eye telemetry line. On a no-face frame the engine reports 0 confidence / 0 eye-open and the default
  * inter-ocular distance: those are placeholders, not measurements, so they read "--".
  */
-internal fun formatEyeTelemetryLine(f: GazeFeatureVector, tierLabel: String): String {
-    val lowLightSuffix = if (f.isLowLightDegraded) " (LOW-LIGHT DEGRADED)" else ""
-    if (!f.faceDetected) {
+internal fun formatEyeTelemetryLine(f: GazeFeatureVector, tierLabel: String): String =
+    formatEyeTelemetryLine(
+        faceDetected = f.faceDetected,
+        leftEyeConfidence = f.leftEyeConfidence,
+        rightEyeConfidence = f.rightEyeConfidence,
+        eyeDistancePx = f.eyeDistancePx,
+        combinedEyeOpenProb = f.combinedEyeOpenProb,
+        ambientLuma = f.ambientLuma,
+        isLowLightDegraded = f.isLowLightDegraded,
+        tierLabel = tierLabel
+    )
+
+/** [formatEyeTelemetryLine] from the individual fields it prints (lets the composable skip on them). */
+internal fun formatEyeTelemetryLine(
+    faceDetected: Boolean,
+    leftEyeConfidence: Float,
+    rightEyeConfidence: Float,
+    eyeDistancePx: Double,
+    combinedEyeOpenProb: Float,
+    ambientLuma: Int,
+    isLowLightDegraded: Boolean,
+    tierLabel: String
+): String {
+    val lowLightSuffix = if (isLowLightDegraded) " (LOW-LIGHT DEGRADED)" else ""
+    if (!faceDetected) {
         // Only the tier and luma are real here. A template prints an Int exactly as Locale.US "%d" does.
         return "Eye Confidence: Left $NOT_DETECTED_TEXT • Right $NOT_DETECTED_TEXT | IOD: $NOT_DETECTED_TEXT | " +
-            "Eye Open: $NOT_DETECTED_TEXT | Tier: $tierLabel | Luma: ${f.ambientLuma}/255$lowLightSuffix"
+            "Eye Open: $NOT_DETECTED_TEXT | Tier: $tierLabel | Luma: $ambientLuma/255$lowLightSuffix"
     }
     // One Formatter pass per frame instead of five (four sub-formats spliced in with %s): every
     // specifier formats independently, so the text is identical.
     return String.format(
         Locale.US,
         "Eye Confidence: Left %.0f%% • Right %.0f%% | IOD: %.1f px | Eye Open: %.2f | Tier: %s | Luma: %d/255%s",
-        f.leftEyeConfidence * 100f,
-        f.rightEyeConfidence * 100f,
-        f.eyeDistancePx,
-        f.combinedEyeOpenProb,
+        leftEyeConfidence * 100f,
+        rightEyeConfidence * 100f,
+        eyeDistancePx,
+        combinedEyeOpenProb,
         tierLabel,
-        f.ambientLuma,
+        ambientLuma,
         lowLightSuffix
     )
 }
+
+/** "f_raw = [1.0, gx=..., gy=..., yaw=...°, pitch=...°, roll=...°]" line of the live telemetry card. */
+internal fun formatRawFeatureVectorLine(gx: Double, gy: Double, yaw: Double, pitch: Double, roll: Double): String =
+    String.format(
+        Locale.US,
+        "f_raw = [1.0, gx=%.3f, gy=%.3f, yaw=%.1f°, pitch=%.1f°, roll=%.1f°]",
+        gx, gy, yaw, pitch, roll
+    )
 
 /**
  * Sample-counter line of the wizard header. Samples are only taken on face-detected frames, so without
@@ -1162,9 +1226,10 @@ private fun CalibrationValidationSummaryCard(
 }
 
 /**
- * Everything in the summary card above the profile-name field. A NaN metric always counts as changed
- * (the runtime compares Doubles with IEEE ==), so on that path the body may still re-run per keystroke;
- * its costly text (coordinate rows, matrix) is precomputed or remembered, so that re-run formats nothing.
+ * Everything in the summary card above the profile-name field. A NaN (unmeasured) metric can count as
+ * changed on every call (Double parameters are compared with ==), so on that path the body may still
+ * re-run per keystroke; its costly text (coordinate rows, matrix) is precomputed or remembered, and a
+ * NaN metric formats nothing, so that re-run calls no String.format.
  */
 @Composable
 private fun CalibrationSummaryReport(

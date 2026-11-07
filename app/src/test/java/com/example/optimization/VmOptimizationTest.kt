@@ -186,8 +186,19 @@ class VmOptimizationTest {
         else -> 16L + rng.nextInt(485)
     }
 
-    /** Random point with age and intensity clustered around the 4.8 s / 0.08 cut-offs. */
-    private fun randomTrailPoint(rng: Random, nowMs: Long, decay: Float): LiveGazeTrailPoint {
+    /**
+     * Random point with age and intensity clustered around the 4.8 s / 0.08 cut-offs, or, when [healthy], one
+     * that surely survives the decay (so full 32-node trails, and the drop-oldest path, are generated too).
+     */
+    private fun randomTrailPoint(rng: Random, nowMs: Long, decay: Float, healthy: Boolean = false): LiveGazeTrailPoint {
+        if (healthy) {
+            return LiveGazeTrailPoint(
+                normX = 0.02f + rng.nextFloat() * 0.96f,
+                normY = 0.02f + rng.nextFloat() * 0.96f,
+                intensity = 0.2f + rng.nextFloat() * 0.8f,
+                timestampMs = nowMs - rng.nextLong(0L, 4_000L)
+            )
+        }
         val age = when (rng.nextInt(4)) {
             0 -> 4_790L + rng.nextInt(21)
             1 -> -50L + rng.nextInt(100)
@@ -245,7 +256,10 @@ class VmOptimizationTest {
                 2 -> 33 + rng.nextInt(8)
                 else -> rng.nextInt(33)
             }
-            val prev = List(size) { randomTrailPoint(rng, nowMs, decay) }
+            // A third of the trails survive the decay whole (with ~63% per-node survival a random 32-node
+            // trail is never still full, so the drop-oldest path needs these)
+            val healthy = rng.nextInt(3) == 0
+            val prev = List(size) { randomTrailPoint(rng, nowMs, decay, healthy) }
             val base = if (prev.isEmpty()) null else prev[if (rng.nextBoolean()) prev.lastIndex else rng.nextInt(prev.size)]
             val (nx, ny) = candidateNear(rng, base)
             val faceDetected = rng.nextInt(6) != 0
@@ -253,7 +267,8 @@ class VmOptimizationTest {
             val actual = advanceLiveGazeTrail(prev, nx, ny, faceDetected, nowMs, dt)
             assertEquals("iter $iter (size $size, dt $dt, face $faceDetected)", expected, actual)
             if (faceDetected && expected.isNotEmpty() && expected.last().intensity != 0.34f) merges++
-            if (faceDetected && size >= 32 && expected.size == 32) drops++
+            // A node appended to a full trail whose 32 newest nodes all survived: the oldest one was dropped
+            if (healthy && faceDetected && size >= 32 && expected.size == 32 && expected.last().intensity == 0.34f) drops++
         }
         assertTrue("merge path exercised: $merges", merges > 1_000)
         assertTrue("full-trail path exercised: $drops", drops > 1_000)
@@ -984,5 +999,108 @@ class VmOptimizationTest {
         assertTrue(coverage, stepDowns > 0 && stepUps > 0 && extendedRests > 0)
         assertTrue(coverage, naturals > 0 && commands > 0 && brows > 0)
         assertTrue(coverage, perfFrames > 0 && nudgeFrames > 0 && driftFrames > 0 && trailFrames > 0)
+    }
+
+    // =============================================================================================
+    // 6. Per-frame projection and screen filters through reused scratch arrays (projectGazeInto /
+    //    filterInto) instead of the Pair-returning calls the frozen pipeline above still uses
+    // =============================================================================================
+
+    private fun randomFeature(rng: Random): GazeFeatureVector {
+        fun wide(scale: Double) = when (rng.nextInt(40)) {
+            0 -> Double.NaN
+            1 -> if (rng.nextBoolean()) Double.POSITIVE_INFINITY else Double.NEGATIVE_INFINITY
+            2 -> (rng.nextDouble() - 0.5) * scale * 40.0 // far outside the standardization clamp
+            else -> (rng.nextDouble() - 0.5) * scale
+        }
+        return GazeFeatureVector(
+            gx = wide(0.8),
+            gy = wide(0.6),
+            yaw = wide(30.0),
+            pitch = wide(24.0),
+            roll = wide(20.0),
+            eyeDistancePx = if (rng.nextInt(20) == 0) rng.nextDouble() * 20.0 else 60.0 + rng.nextDouble() * 180.0,
+            faceDetected = true,
+            timestampMs = rng.nextLong(1L, 10_000_000L)
+        )
+    }
+
+    @Test
+    fun `scratch-array projection is bit-identical to projectGaze`() {
+        val rng = Random(5_150)
+        val out = FloatArray(2)
+        repeat(40_000) { iter ->
+            val matrix: List<Double> = when (rng.nextInt(8)) {
+                0 -> DEFAULT_AFFINE_MATRIX_2X6
+                1 -> List(rng.nextInt(12)) { rng.nextDouble(-1.0, 1.0) } // wrong size: default fallback
+                else -> List(12) { rng.nextDouble(-1.5, 1.5) }
+            }
+            val baseline = when (rng.nextInt(6)) {
+                0 -> rng.nextDouble() * 40.0 // below the 30 px floor
+                1 -> 148.0
+                else -> 60.0 + rng.nextDouble() * 180.0
+            }
+            val feature = randomFeature(rng)
+            val (refX, refY) = GazeCalibrationMath.projectGaze(feature, matrix, baseline)
+            val written = GazeCalibrationMath.projectGazeInto(feature, matrix, baseline, out)
+            assertSame(out, written)
+            assertEquals("iter $iter x", refX.toBits(), out[0].toBits())
+            assertEquals("iter $iter y", refY.toBits(), out[1].toBits())
+        }
+    }
+
+    @Test
+    fun `scratch-array screen filters match the Pair-returning filters step for step`() {
+        val rng = Random(31_337)
+        repeat(200) { chain ->
+            val refEuro = OneEuroFilter2D(minCutoff = 0.90, beta = 1.2, dCutoff = 1.0)
+            val refKalman = GazeKalmanFilter2D(processNoiseQ = 1.0, measurementNoiseR = 1e-2)
+            val optEuro = OneEuroFilter2D(minCutoff = 0.90, beta = 1.2, dCutoff = 1.0)
+            val optKalman = GazeKalmanFilter2D(processNoiseQ = 1.0, measurementNoiseR = 1e-2)
+            // One scratch array shared by both filters, as in the view model
+            val scratch = DoubleArray(2)
+            var t = 1_000_000L + rng.nextInt(1_000)
+            var x = 0.5
+            var y = 0.5
+            var useKalman = rng.nextBoolean()
+            repeat(600) { step ->
+                t += when (rng.nextInt(80)) {
+                    0 -> 0L // repeated timestamp
+                    1 -> -rng.nextLong(1L, 200L) // timestamp going backwards
+                    2 -> 600L + rng.nextLong(0L, 3_000L) // stale gap
+                    else -> 14L + rng.nextLong(0L, 140L)
+                }
+                when (rng.nextInt(15)) {
+                    0 -> { x = 0.02 + rng.nextDouble() * 0.96; y = 0.02 + rng.nextDouble() * 0.96 } // saccade
+                    else -> {
+                        x = (x + (rng.nextDouble() - 0.5) * 0.02).coerceIn(0.02, 0.98)
+                        y = (y + (rng.nextDouble() - 0.5) * 0.02).coerceIn(0.02, 0.98)
+                    }
+                }
+                when (rng.nextInt(120)) {
+                    // Mode switch: the view model resets both filters (resetScreenFilters)
+                    0 -> {
+                        useKalman = !useKalman
+                        refEuro.reset(); refKalman.reset(); optEuro.reset(); optKalman.reset()
+                    }
+                    // Mode switch without a reset (filter state must stay independent of the shared scratch)
+                    1 -> useKalman = !useKalman
+                }
+                val where = "chain $chain step $step (kalman=$useKalman)"
+                if (useKalman) {
+                    val (ex, ey) = refKalman.filter(x, y, t)
+                    val written = optKalman.filterInto(x, y, t, scratch)
+                    assertSame(scratch, written)
+                    assertEquals("$where x", ex.toBits(), scratch[0].toBits())
+                    assertEquals("$where y", ey.toBits(), scratch[1].toBits())
+                } else {
+                    val (ex, ey) = refEuro.filter(x, y, t)
+                    val written = optEuro.filterInto(x, y, t, scratch)
+                    assertSame(scratch, written)
+                    assertEquals("$where x", ex.toBits(), scratch[0].toBits())
+                    assertEquals("$where y", ey.toBits(), scratch[1].toBits())
+                }
+            }
+        }
     }
 }
