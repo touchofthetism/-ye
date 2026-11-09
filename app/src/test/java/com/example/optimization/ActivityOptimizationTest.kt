@@ -125,7 +125,7 @@ class ActivityOptimizationTest {
             .associate { it.getAttribute("name") to it.textContent }
         assertEquals(FROZEN_USED_STRINGS, strings)
 
-        val mainDir = sourceFile("src/main/AndroidManifest.xml").parentFile
+        val mainDir = checkNotNull(sourceFile("src/main/AndroidManifest.xml").parentFile)
         val sources = mainDir.walkTopDown()
             .filter { it.isFile && (it.extension == "kt" || it.extension == "java" || it.extension == "xml") }
             .toList()

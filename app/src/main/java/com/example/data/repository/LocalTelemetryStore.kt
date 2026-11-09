@@ -1,6 +1,8 @@
 package com.example.data.repository
 
 import android.content.Context
+import android.content.SharedPreferences
+import com.example.data.model.AacActionTile
 import com.example.data.model.CalibrationProfile
 import com.example.data.model.DEFAULT_AFFINE_MATRIX_2X6
 import com.example.data.model.DwellSpeedPreset
@@ -13,6 +15,7 @@ import com.google.firebase.Timestamp
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Date
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * On-device persistent local store (SharedPreferences + JSON) ensuring that when a user disables
@@ -25,6 +28,11 @@ import java.util.Date
  *
  * The local vault is bounded: it keeps the [MAX_LOCAL_PROFILES] most recent calibration profiles and the
  * [MAX_LOCAL_SESSIONS] most recent sessions, and saving beyond that evicts the oldest entry.
+ *
+ * The profile and session lists are kept parsed in memory next to the exact string they were parsed from
+ * (or written as), and each write encodes only the entries that changed. The stored JSON is the same as
+ * re-encoding the whole list would produce; a cached list is used only while the stored string still
+ * equals the one it came from, so writes made anywhere else just cause a fresh parse.
  */
 class LocalTelemetryStore(context: Context) {
 
@@ -32,6 +40,12 @@ class LocalTelemetryStore(context: Context) {
         VAULT_PREFS_NAME,
         Context.MODE_PRIVATE
     )
+
+    /** Parsed profile lists by preference key; see [VaultListSnapshot]. */
+    private val profileSnapshots = ConcurrentHashMap<String, VaultListSnapshot<CalibrationProfile>>()
+
+    /** Parsed session lists by preference key; see [VaultListSnapshot]. */
+    private val sessionSnapshots = ConcurrentHashMap<String, VaultListSnapshot<TrackingSession>>()
 
     /**
      * Cloud-sync consent of [userId]. Consent is per account: a device-wide flag would let the next account
@@ -74,17 +88,31 @@ class LocalTelemetryStore(context: Context) {
 
     /** Records [profileId] as [userId]'s chosen active profile; null or blank clears it. */
     fun setActiveProfileId(userId: String, profileId: String?) {
-        val key = "${KEY_ACTIVE_PROFILE_ID_PREFIX}_$userId"
         val editor = prefs.edit()
-        if (profileId.isNullOrBlank()) editor.remove(key) else editor.putString(key, profileId)
+        putActiveProfileId(editor, userId, profileId)
         editor.apply()
     }
 
+    /** [setActiveProfileId]'s change, added to [editor] so it lands in the same commit as a list write. */
+    private fun putActiveProfileId(editor: SharedPreferences.Editor, userId: String, profileId: String?) {
+        val key = "${KEY_ACTIVE_PROFILE_ID_PREFIX}_$userId"
+        if (profileId.isNullOrBlank()) editor.remove(key) else editor.putString(key, profileId)
+    }
+
     fun loadLocalProfiles(userId: String): List<CalibrationProfile> {
-        val raw = prefs.getString("${KEY_PROFILES_PREFIX}_$userId", null) ?: return emptyList()
-        return try {
+        val snapshot = readProfiles(userId) ?: return emptyList()
+        return ArrayList(snapshot.items)
+    }
+
+    private fun readProfiles(userId: String): VaultListSnapshot<CalibrationProfile>? =
+        readSnapshot("${KEY_PROFILES_PREFIX}_$userId", profileSnapshots) { raw -> parseProfiles(raw, userId) }
+
+    /** Reads a stored profile list the way [loadLocalProfiles] always has. */
+    private fun parseProfiles(raw: String, userId: String): VaultListSnapshot<CalibrationProfile> {
+        var clockDependent = false
+        val items: List<CalibrationProfile> = try {
             val arr = JSONArray(raw)
-            val list = mutableListOf<CalibrationProfile>()
+            val list = ArrayList<CalibrationProfile>(arr.length())
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
                 val coeffsArr = obj.optJSONArray("matrixCoeffs")
@@ -93,8 +121,7 @@ class LocalTelemetryStore(context: Context) {
                 } else {
                     DEFAULT_AFFINE_MATRIX_2X6
                 }
-                val tsMillis = obj.optLong("createdAtMs", System.currentTimeMillis())
-                val ts = Timestamp(Date(tsMillis))
+                val ts = Timestamp(Date(createdAtMsOrNow(obj) { clockDependent = true }))
                 list.add(
                     CalibrationProfile(
                         id = obj.optString("id", "local_cal_$i"),
@@ -113,7 +140,7 @@ class LocalTelemetryStore(context: Context) {
                         // Entries written before these keys existed read back unvalidated and upright.
                         heldOutValidated = obj.optBoolean("heldOutValidated", false),
                         calibrationPosture = obj.optString("calibrationPosture", GazePostureProfile.UPRIGHT.name)
-                            .takeIf { raw -> GazePostureProfile.entries.any { it.name == raw } }
+                            .takeIf { isKnownPosture(it) }
                             ?: GazePostureProfile.UPRIGHT.name,
                         createdAt = ts,
                         updatedAt = ts
@@ -124,6 +151,7 @@ class LocalTelemetryStore(context: Context) {
         } catch (_: Exception) {
             emptyList()
         }
+        return VaultListSnapshot(raw, items, arrayOfNulls(items.size), reusable = !clockDependent)
     }
 
     /**
@@ -133,17 +161,25 @@ class LocalTelemetryStore(context: Context) {
      * Keeps at most [MAX_LOCAL_PROFILES] entries; the oldest is evicted beyond that.
      */
     fun saveLocalProfile(userId: String, profile: CalibrationProfile): CalibrationProfile {
-        val existing = loadLocalProfiles(userId).toMutableList()
-        val updated = existing.map { it.copy(isActive = false) }.toMutableList()
+        val snapshot = readProfiles(userId)
         val newEntry = profile.copy(
             id = profile.id.ifBlank { "local_cal_${System.currentTimeMillis()}" },
             userId = userId,
             isActive = true
         )
-        updated.removeAll { it.id == newEntry.id }
-        updated.add(0, newEntry)
-        writeProfiles(userId, updated.take(MAX_LOCAL_PROFILES))
-        setActiveProfileId(userId, newEntry.id)
+        // newEntry first, then the earlier entries (all inactive) without newEntry's id, capped.
+        val draft = ListDraft<CalibrationProfile>(MAX_LOCAL_PROFILES)
+        draft.add(newEntry, null)
+        if (snapshot != null) {
+            val items = snapshot.items
+            for (i in items.indices) {
+                if (draft.size >= MAX_LOCAL_PROFILES) break
+                val p = items[i]
+                if (p.id == newEntry.id) continue
+                if (p.isActive) draft.add(p.copy(isActive = false), null) else draft.add(p, snapshot.itemJson[i])
+            }
+        }
+        commitProfiles(userId, draft) { putActiveProfileId(it, userId, newEntry.id) }
         return newEntry
     }
 
@@ -152,58 +188,118 @@ class LocalTelemetryStore(context: Context) {
      * it is a cloud-only id with no local entry.
      */
     fun setActiveLocalProfile(userId: String, profileId: String): List<CalibrationProfile> {
-        val updated = loadLocalProfiles(userId).map {
-            it.copy(isActive = it.id == profileId)
+        val snapshot = readProfiles(userId)
+        val draft = ListDraft<CalibrationProfile>(snapshot?.items?.size ?: 0)
+        if (snapshot != null) {
+            val items = snapshot.items
+            for (i in items.indices) {
+                val p = items[i]
+                val active = p.id == profileId
+                if (p.isActive == active) draft.add(p, snapshot.itemJson[i]) else draft.add(p.copy(isActive = active), null)
+            }
         }
-        writeProfiles(userId, updated)
-        setActiveProfileId(userId, profileId)
-        return updated
+        commitProfiles(userId, draft) { putActiveProfileId(it, userId, profileId) }
+        return draft.items
     }
 
     fun deleteLocalProfile(userId: String, profileId: String): List<CalibrationProfile> {
-        val updated = loadLocalProfiles(userId).filterNot { it.id == profileId }
-        writeProfiles(userId, updated)
-        if (getActiveProfileId(userId) == profileId) setActiveProfileId(userId, null)
-        return updated
+        val snapshot = readProfiles(userId)
+        val draft = ListDraft<CalibrationProfile>(snapshot?.items?.size ?: 0)
+        if (snapshot != null) {
+            val items = snapshot.items
+            for (i in items.indices) if (items[i].id != profileId) draft.add(items[i], snapshot.itemJson[i])
+        }
+        val clearActive = getActiveProfileId(userId) == profileId
+        commitProfiles(userId, draft) { if (clearActive) putActiveProfileId(it, userId, null) }
+        return draft.items
     }
 
-    private fun writeProfiles(userId: String, profiles: List<CalibrationProfile>) {
-        val arr = JSONArray()
-        for (p in profiles) {
-            val obj = JSONObject().apply {
-                put("id", p.id)
-                put("userId", userId)
-                put("name", p.name)
-                put("deviceModel", p.deviceModel)
-                put("matrixCoeffs", JSONArray(p.matrixCoeffs))
-                put("baselineEyeDistancePx", p.baselineEyeDistancePx)
-                put("meanErrorMm", p.meanErrorMm)
-                put("meanErrorPct", p.meanErrorPct)
-                put("maxErrorPct", p.maxErrorPct)
-                put("closeBlinkThreshold", p.closeBlinkThreshold)
-                put("openBlinkThreshold", p.openBlinkThreshold)
-                put("intentionalBlinkMinMs", p.intentionalBlinkMinMs)
-                put("isActive", p.isActive)
-                put("heldOutValidated", p.heldOutValidated)
-                put("calibrationPosture", p.calibrationPosture)
-                put("createdAtMs", p.createdAt?.toDate()?.time ?: System.currentTimeMillis())
-            }
-            arr.put(obj)
+    private fun commitProfiles(
+        userId: String,
+        draft: ListDraft<CalibrationProfile>,
+        alsoEdit: (SharedPreferences.Editor) -> Unit
+    ) = commitList("${KEY_PROFILES_PREFIX}_$userId", profileSnapshots, draft, { encodeProfile(it, userId) }, alsoEdit)
+
+    /** One stored profile entry, with the keys in their stored order. */
+    private fun encodeProfile(p: CalibrationProfile, userId: String): EncodedEntry<CalibrationProfile> {
+        val createdAtMs = p.createdAt?.toDate()?.time ?: System.currentTimeMillis()
+        val json: String? = JSONObject().apply {
+            put("id", p.id)
+            put("userId", userId)
+            put("name", p.name)
+            put("deviceModel", p.deviceModel)
+            put("matrixCoeffs", JSONArray(p.matrixCoeffs))
+            put("baselineEyeDistancePx", p.baselineEyeDistancePx)
+            put("meanErrorMm", p.meanErrorMm)
+            put("meanErrorPct", p.meanErrorPct)
+            put("maxErrorPct", p.maxErrorPct)
+            put("closeBlinkThreshold", p.closeBlinkThreshold)
+            put("openBlinkThreshold", p.openBlinkThreshold)
+            put("intentionalBlinkMinMs", p.intentionalBlinkMinMs)
+            put("isActive", p.isActive)
+            put("heldOutValidated", p.heldOutValidated)
+            put("calibrationPosture", p.calibrationPosture)
+            put("createdAtMs", createdAtMs)
+        }.toString()
+        val readBack = profileReadBack(p, userId, createdAtMs)
+        // Reading back swaps a coefficient list of another length for the default matrix and an unknown posture
+        // for UPRIGHT; then the read-back value encodes differently and is re-encoded on the next write.
+        val readBackJson = if (
+            readBack != null && p.matrixCoeffs.size == 12 && readBack.calibrationPosture == p.calibrationPosture
+        ) json else null
+        return EncodedEntry(json, readBack, readBackJson)
+    }
+
+    /**
+     * What [parseProfiles] returns for [p] encoded with [createdAtMs], or null when that is not certain
+     * without parsing (a null where Kotlin types promise none, -0.0 or a non-finite number).
+     */
+    private fun profileReadBack(p: CalibrationProfile, userId: String, createdAtMs: Long): CalibrationProfile? {
+        if (isNull(p.id) || isNull(p.name) || isNull(p.deviceModel) || isNull(p.calibrationPosture)) return null
+        val coeffs: Any? = p.matrixCoeffs
+        if (coeffs !is List<*>) return null
+        for (c in coeffs) if (c !is Double || !c.isExactInJson()) return null
+        if (!p.baselineEyeDistancePx.isExactInJson() || !p.meanErrorMm.isExactInJson() ||
+            !p.meanErrorPct.isExactInJson() || !p.maxErrorPct.isExactInJson() ||
+            !p.closeBlinkThreshold.isExactInJson() || !p.openBlinkThreshold.isExactInJson()
+        ) return null
+        return try {
+            val ts = Timestamp(Date(createdAtMs))
+            p.copy(
+                userId = userId,
+                matrixCoeffs = if (coeffs.size == 12) ArrayList(p.matrixCoeffs) else DEFAULT_AFFINE_MATRIX_2X6,
+                calibrationPosture = if (isKnownPosture(p.calibrationPosture)) {
+                    p.calibrationPosture
+                } else {
+                    GazePostureProfile.UPRIGHT.name
+                },
+                createdAt = ts,
+                updatedAt = ts
+            )
+        } catch (_: IllegalArgumentException) {
+            null // A time Timestamp rejects: parsing it fails as well, so leave that to the next read.
         }
-        prefs.edit().putString("${KEY_PROFILES_PREFIX}_$userId", arr.toString()).apply()
     }
 
     fun loadLocalSessions(userId: String): List<TrackingSession> {
-        val raw = prefs.getString("${KEY_SESSIONS_PREFIX}_$userId", null) ?: return emptyList()
-        return try {
+        val snapshot = readSessions(userId) ?: return emptyList()
+        return ArrayList(snapshot.items)
+    }
+
+    private fun readSessions(userId: String): VaultListSnapshot<TrackingSession>? =
+        readSnapshot("${KEY_SESSIONS_PREFIX}_$userId", sessionSnapshots) { raw -> parseSessions(raw, userId) }
+
+    /** Reads a stored session list the way [loadLocalSessions] always has. */
+    private fun parseSessions(raw: String, userId: String): VaultListSnapshot<TrackingSession> {
+        var clockDependent = false
+        val items: List<TrackingSession> = try {
             val arr = JSONArray(raw)
-            val list = mutableListOf<TrackingSession>()
+            val list = ArrayList<TrackingSession>(arr.length())
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
                 val secArr = obj.optJSONArray("sectionLoads") ?: JSONArray()
                 val cluArr = obj.optJSONArray("clusterPoints") ?: JSONArray()
-                val tsMillis = obj.optLong("createdAtMs", System.currentTimeMillis())
-                val ts = Timestamp(Date(tsMillis))
+                val ts = Timestamp(Date(createdAtMsOrNow(obj) { clockDependent = true }))
                 list.add(
                     TrackingSession(
                         id = obj.optString("id", "local_sess_$i"),
@@ -231,6 +327,7 @@ class LocalTelemetryStore(context: Context) {
         } catch (_: Exception) {
             emptyList()
         }
+        return VaultListSnapshot(raw, items, arrayOfNulls(items.size), reusable = !clockDependent)
     }
 
     /**
@@ -240,21 +337,34 @@ class LocalTelemetryStore(context: Context) {
      * Keeps at most [MAX_LOCAL_SESSIONS] entries; the oldest is evicted beyond that.
      */
     fun saveLocalSession(userId: String, session: TrackingSession): TrackingSession {
-        val existing = loadLocalSessions(userId).toMutableList()
+        val snapshot = readSessions(userId)
         val entry = session.copy(
             id = session.id.ifBlank { "local_sess_${System.currentTimeMillis()}" },
             userId = userId
         )
-        existing.removeAll { it.id == entry.id }
-        existing.add(0, entry)
-        writeSessions(userId, existing.take(MAX_LOCAL_SESSIONS))
+        // entry first, then the earlier entries without entry's id, capped.
+        val draft = ListDraft<TrackingSession>(MAX_LOCAL_SESSIONS)
+        draft.add(entry, null)
+        if (snapshot != null) {
+            val items = snapshot.items
+            for (i in items.indices) {
+                if (draft.size >= MAX_LOCAL_SESSIONS) break
+                if (items[i].id != entry.id) draft.add(items[i], snapshot.itemJson[i])
+            }
+        }
+        commitSessions(userId, draft)
         return entry
     }
 
     fun deleteLocalSession(userId: String, sessionId: String): List<TrackingSession> {
-        val updated = loadLocalSessions(userId).filterNot { it.id == sessionId }
-        writeSessions(userId, updated)
-        return updated
+        val snapshot = readSessions(userId)
+        val draft = ListDraft<TrackingSession>(snapshot?.items?.size ?: 0)
+        if (snapshot != null) {
+            val items = snapshot.items
+            for (i in items.indices) if (items[i].id != sessionId) draft.add(items[i], snapshot.itemJson[i])
+        }
+        commitSessions(userId, draft)
+        return draft.items
     }
 
     /**
@@ -263,13 +373,17 @@ class LocalTelemetryStore(context: Context) {
      * (which include brow ratios measured from the user's face).
      */
     fun clearAllLocalData(userId: String) {
+        val profilesKey = "${KEY_PROFILES_PREFIX}_$userId"
+        val sessionsKey = "${KEY_SESSIONS_PREFIX}_$userId"
         prefs.edit()
-            .remove("${KEY_PROFILES_PREFIX}_$userId")
-            .remove("${KEY_SESSIONS_PREFIX}_$userId")
+            .remove(profilesKey)
+            .remove(sessionsKey)
             .remove("${KEY_AAC_TILES_PREFIX}_$userId")
             .remove("${KEY_ACTIVE_PROFILE_ID_PREFIX}_$userId")
             .remove("${KEY_INTERACTION_SETTINGS_PREFIX}_$userId")
             .apply()
+        profileSnapshots.remove(profilesKey)
+        sessionSnapshots.remove(sessionsKey)
     }
 
     /**
@@ -306,14 +420,10 @@ class LocalTelemetryStore(context: Context) {
                     "dwellSensitivityRadiusMultiplier",
                     defaults.dwellSensitivityRadiusMultiplier
                 ),
-                activeDwellPreset = DwellSpeedPreset.entries
-                    .firstOrNull { it.name == obj.optString("activeDwellPreset") } ?: defaults.activeDwellPreset,
-                triggerMode = GazeTriggerMode.entries
-                    .firstOrNull { it.name == obj.optString("triggerMode") } ?: defaults.triggerMode,
-                filterMode = GazeFilterMode.entries
-                    .firstOrNull { it.name == obj.optString("filterMode") } ?: defaults.filterMode,
-                activePosture = GazePostureProfile.entries
-                    .firstOrNull { it.name == obj.optString("activePosture") } ?: defaults.activePosture,
+                activeDwellPreset = obj.optEnum("activeDwellPreset", DwellSpeedPreset.entries, defaults.activeDwellPreset),
+                triggerMode = obj.optEnum("triggerMode", GazeTriggerMode.entries, defaults.triggerMode),
+                filterMode = obj.optEnum("filterMode", GazeFilterMode.entries, defaults.filterMode),
+                activePosture = obj.optEnum("activePosture", GazePostureProfile.entries, defaults.activePosture),
                 neutralBrowRatio = obj.finiteFloat("neutralBrowRatio", defaults.neutralBrowRatio),
                 raisedBrowRatio = obj.finiteFloat("raisedBrowRatio", defaults.raisedBrowRatio)
             )
@@ -329,37 +439,64 @@ class LocalTelemetryStore(context: Context) {
     private fun JSONObject.finiteFloat(key: String, fallback: Float): Float =
         optDouble(key, Double.NaN).takeIf { it.isFinite() }?.toFloat() ?: fallback
 
-    private fun writeSessions(userId: String, sessions: List<TrackingSession>) {
-        val arr = JSONArray()
-        for (s in sessions) {
-            val obj = JSONObject().apply {
-                put("id", s.id)
-                put("userId", userId)
-                put("title", s.title)
-                put("deviceModel", s.deviceModel)
-                put("contentType", s.contentType)
-                put("durationSeconds", s.durationSeconds)
-                put("naturalBlinkCount", s.naturalBlinkCount)
-                put("intentionalBlinkCount", s.intentionalBlinkCount)
-                put("blinksPerMinute", s.blinksPerMinute)
-                put("effectiveWordsPerMinute", s.effectiveWordsPerMinute)
-                put("fixationClusterCount", s.fixationClusterCount)
-                put("topZonePercentage", s.topZonePercentage)
-                put("middleZonePercentage", s.middleZonePercentage)
-                put("bottomZonePercentage", s.bottomZonePercentage)
-                put("sectionLoads", JSONArray(s.sectionLoads))
-                put("clusterPoints", JSONArray(s.clusterPoints))
-                put("createdAtMs", s.createdAt?.toDate()?.time ?: System.currentTimeMillis())
-            }
-            arr.put(obj)
+    /** The entry of [entries] named by [key]'s string value (looked up once), else [fallback]. */
+    private fun <E : Enum<E>> JSONObject.optEnum(key: String, entries: List<E>, fallback: E): E {
+        val name = optString(key)
+        return entries.firstOrNull { it.name == name } ?: fallback
+    }
+
+    private fun commitSessions(userId: String, draft: ListDraft<TrackingSession>) =
+        commitList("${KEY_SESSIONS_PREFIX}_$userId", sessionSnapshots, draft, { encodeSession(it, userId) }, {})
+
+    /** One stored session entry, with the keys in their stored order. */
+    private fun encodeSession(s: TrackingSession, userId: String): EncodedEntry<TrackingSession> {
+        val createdAtMs = s.createdAt?.toDate()?.time ?: System.currentTimeMillis()
+        val json: String? = JSONObject().apply {
+            put("id", s.id)
+            put("userId", userId)
+            put("title", s.title)
+            put("deviceModel", s.deviceModel)
+            put("contentType", s.contentType)
+            put("durationSeconds", s.durationSeconds)
+            put("naturalBlinkCount", s.naturalBlinkCount)
+            put("intentionalBlinkCount", s.intentionalBlinkCount)
+            put("blinksPerMinute", s.blinksPerMinute)
+            put("effectiveWordsPerMinute", s.effectiveWordsPerMinute)
+            put("fixationClusterCount", s.fixationClusterCount)
+            put("topZonePercentage", s.topZonePercentage)
+            put("middleZonePercentage", s.middleZonePercentage)
+            put("bottomZonePercentage", s.bottomZonePercentage)
+            put("sectionLoads", JSONArray(s.sectionLoads))
+            put("clusterPoints", JSONArray(s.clusterPoints))
+            put("createdAtMs", createdAtMs)
+        }.toString()
+        val readBack = sessionReadBack(s, userId, createdAtMs)
+        return EncodedEntry(json, readBack, if (readBack != null) json else null)
+    }
+
+    /** What [parseSessions] returns for [s] encoded with [createdAtMs], or null when that is not certain. */
+    private fun sessionReadBack(s: TrackingSession, userId: String, createdAtMs: Long): TrackingSession? {
+        if (isNull(s.id) || isNull(s.title) || isNull(s.deviceModel) || isNull(s.contentType)) return null
+        if (!isStringList(s.sectionLoads) || !isStringList(s.clusterPoints)) return null
+        if (!s.blinksPerMinute.isExactInJson()) return null
+        return try {
+            val ts = Timestamp(Date(createdAtMs))
+            s.copy(
+                userId = userId,
+                sectionLoads = ArrayList(s.sectionLoads),
+                clusterPoints = ArrayList(s.clusterPoints),
+                createdAt = ts,
+                updatedAt = ts
+            )
+        } catch (_: IllegalArgumentException) {
+            null
         }
-        prefs.edit().putString("${KEY_SESSIONS_PREFIX}_$userId", arr.toString()).apply()
     }
 
     fun loadCustomAacTiles(
         userId: String,
-        defaultTiles: List<com.example.data.model.AacActionTile>
-    ): List<com.example.data.model.AacActionTile> {
+        defaultTiles: List<AacActionTile>
+    ): List<AacActionTile> {
         val raw = prefs.getString("${KEY_AAC_TILES_PREFIX}_$userId", null) ?: return defaultTiles
         return try {
             val arr = JSONArray(raw)
@@ -384,7 +521,7 @@ class LocalTelemetryStore(context: Context) {
 
     fun saveCustomAacTiles(
         userId: String,
-        tiles: List<com.example.data.model.AacActionTile>
+        tiles: List<AacActionTile>
     ) {
         val arr = JSONArray()
         for (t in tiles) {
@@ -397,6 +534,102 @@ class LocalTelemetryStore(context: Context) {
         }
         prefs.edit().putString("${KEY_AAC_TILES_PREFIX}_$userId", arr.toString()).apply()
     }
+
+    /**
+     * The snapshot of the list stored under [key], parsing the stored string only when it is not the one the
+     * cached snapshot came from. Null when nothing is stored under [key].
+     */
+    private inline fun <T> readSnapshot(
+        key: String,
+        snapshots: ConcurrentHashMap<String, VaultListSnapshot<T>>,
+        parse: (raw: String) -> VaultListSnapshot<T>
+    ): VaultListSnapshot<T>? {
+        val raw = prefs.getString(key, null) ?: return null
+        val cached = snapshots[key]
+        if (cached != null && cached.raw == raw) return cached
+        val parsed = parse(raw)
+        if (parsed.reusable) snapshots[key] = parsed else snapshots.remove(key)
+        return parsed
+    }
+
+    /**
+     * Stores [draft] under [key] as one JSON array, together with [alsoEdit]'s changes in the same commit.
+     * Entries with a known text are reused as is; the others are encoded with [encode]. The array text is
+     * what JSONArray.toString() gives for those objects: null when one of them cannot be encoded (a
+     * non-finite coefficient), which removes [key] as it always has. An exception from [encode] (a
+     * non-finite top-level number) propagates before anything is written.
+     */
+    private fun <T> commitList(
+        key: String,
+        snapshots: ConcurrentHashMap<String, VaultListSnapshot<T>>,
+        draft: ListDraft<T>,
+        encode: (T) -> EncodedEntry<T>,
+        alsoEdit: (SharedPreferences.Editor) -> Unit
+    ) {
+        val n = draft.size
+        val json = arrayOfNulls<String>(n)
+        val readBack = ArrayList<T>(n)
+        val readBackJson = arrayOfNulls<String>(n)
+        var complete = true
+        var predictable = true
+        for (i in 0 until n) {
+            val item = draft.items[i]
+            val known = draft.json[i]
+            if (known != null) {
+                // Unchanged since it was read: it encodes to [known] and reads back as itself.
+                json[i] = known
+                readBack.add(item)
+                readBackJson[i] = known
+                continue
+            }
+            val entry = encode(item)
+            val text = entry.json
+            if (text == null) complete = false else json[i] = text
+            val back = entry.readBack
+            if (back == null) {
+                predictable = false
+            } else {
+                readBack.add(back)
+                readBackJson[i] = entry.readBackJson
+            }
+        }
+        val raw = if (complete) joinJsonArray(json) else null
+        val editor = prefs.edit().putString(key, raw)
+        alsoEdit(editor)
+        editor.apply()
+        if (raw != null && predictable) snapshots[key] = VaultListSnapshot(raw, readBack, readBackJson) else snapshots.remove(key)
+    }
+
+    /**
+     * A list key's content as last read or written: [raw] is the exact stored string and [items] what
+     * parsing it returns. [itemJson] holds, per item, the JSON text encoding that item produces (null where
+     * not known, so that item is encoded again). [reusable] is false when parsing used the clock (an entry
+     * without "createdAtMs" reads back with the current time), so such a list is parsed on every read.
+     */
+    private class VaultListSnapshot<T>(
+        val raw: String,
+        val items: List<T>,
+        val itemJson: Array<String?>,
+        val reusable: Boolean = true
+    )
+
+    /** A list being rebuilt for a write; entries kept unchanged from a snapshot carry their known JSON text. */
+    private class ListDraft<T>(capacity: Int) {
+        val items = ArrayList<T>(capacity)
+        val json = ArrayList<String?>(capacity)
+        val size: Int get() = items.size
+
+        fun add(item: T, knownJson: String?) {
+            items.add(item)
+            json.add(knownJson)
+        }
+    }
+
+    /**
+     * One encoded entry: its JSON text ([json], null when JSONObject.toString() fails), the value parsing it
+     * yields ([readBack], null when not certain) and the JSON text encoding [readBack] produces.
+     */
+    private class EncodedEntry<T>(val json: String?, val readBack: T?, val readBackJson: String?)
 
     companion object {
         /** SharedPreferences file holding the vault; excluded from backup by name in res/xml. */
@@ -416,3 +649,39 @@ class LocalTelemetryStore(context: Context) {
         private const val KEY_INTERACTION_SETTINGS_PREFIX = "local_interaction_settings"
     }
 }
+
+/** (-0.0).toRawBits(): org.json writes -0.0 as "-0", which reads back as +0.0. */
+private const val NEGATIVE_ZERO_BITS = Long.MIN_VALUE
+
+/** The text JSONArray.toString() produces for objects whose own toString() texts are [entries]. */
+private fun joinJsonArray(entries: Array<String?>): String {
+    var length = entries.size + 2
+    for (e in entries) length += e?.length ?: 0
+    val sb = StringBuilder(length).append('[')
+    for (i in entries.indices) {
+        if (i > 0) sb.append(',')
+        sb.append(entries[i])
+    }
+    return sb.append(']').toString()
+}
+
+/**
+ * The entry's "createdAtMs" as optLong("createdAtMs", now) reads it. Reading with two different
+ * fallbacks tells a stored value from a substituted one; [onClock] runs when the clock is used.
+ */
+private inline fun createdAtMsOrNow(obj: JSONObject, onClock: () -> Unit): Long {
+    val stored = obj.optLong("createdAtMs", 0L)
+    if (stored == obj.optLong("createdAtMs", 1L)) return stored
+    onClock()
+    return System.currentTimeMillis()
+}
+
+private fun isKnownPosture(name: String): Boolean = GazePostureProfile.entries.any { it.name == name }
+
+/** True for a null that reached a non-null Kotlin type through reflection (Firestore's mapper). */
+private fun isNull(value: Any?): Boolean = value == null
+
+private fun isStringList(value: Any?): Boolean = value is List<*> && value.all { it is String }
+
+/** Whether org.json writes this number so that it reads back with the same bits. */
+private fun Double.isExactInJson(): Boolean = isFinite() && toRawBits() != NEGATIVE_ZERO_BITS
