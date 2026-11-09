@@ -234,7 +234,8 @@ class VmEnrollmentTest {
         val baseline = vm.enrollmentBaseline.value
         assertNotNull("COMPLETE publishes the baseline", baseline)
         baseline!!
-        assertEquals(baseline, state.result)
+        // The published baseline is the engine's result (the ViewModel only fills in a blank device model)
+        assertEquals(baseline.copy(deviceModel = ""), state.result!!.copy(deviceModel = ""))
         assertEquals("the baseline is saved to the on-device vault", baseline, store.loadEnrollmentBaseline(user))
 
         // Derived numbers: open 0.92 / closed 0.08 -> close 0.374 / open 0.626; two ~130 ms natural blinks

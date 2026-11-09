@@ -63,6 +63,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -96,8 +97,11 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.example.data.repository.EyeTrackingRepository
 import com.example.data.repository.LocalTelemetryStore
+import com.example.domain.EnrollmentScanState
+import com.example.ui.components.EnrollmentScanOverlay
 import com.example.ui.components.OpticalDiagnosticsBar
 import com.example.ui.components.RegionConfidenceReticleOverlay
+import com.example.ui.components.isEnrollmentScanPhaseActive
 import com.example.ui.screens.AttentionAnalyticsScreen
 import com.example.ui.screens.AuthScreen
 import com.example.ui.screens.CalibrationStudioScreen
@@ -373,6 +377,15 @@ fun AuthenticatedMainWorkbench(
     val showCalibrationTargets by remember(calibrationStateHolder) {
         derivedStateOf { isCalibrationTargetStep(calibrationStateHolder.value.step) }
     }
+    // The enrollment scan state changes on every scanned frame; the baseline only when a scan completes
+    // or is cleared. Both are read only inside ReadInOwnScope or the tab-0 lambda (which already follows
+    // the per-frame HUD).
+    val enrollmentStateHolder = viewModel.enrollmentState.collectAsStateWithLifecycle()
+    val enrollmentBaselineHolder = viewModel.enrollmentBaseline.collectAsStateWithLifecycle()
+    // Flips only when a scan starts or ends, not on every scanned frame.
+    val showEnrollmentOverlay by remember(enrollmentStateHolder) {
+        derivedStateOf { isEnrollmentScanPhaseActive(enrollmentStateHolder.value.phase) }
+    }
     val aacTiles by viewModel.aacTilesState.collectAsStateWithLifecycle()
     val profilesState by viewModel.calibrationProfilesState.collectAsStateWithLifecycle()
     val sessionsState by viewModel.trackingSessionsState.collectAsStateWithLifecycle()
@@ -571,7 +584,11 @@ fun AuthenticatedMainWorkbench(
                                 },
                                 onCaptureManualSamples = {
                                     viewModel.captureManualSamplesForCurrentTarget()
-                                }
+                                },
+                                enrollmentState = enrollmentStateHolder.value,
+                                enrollmentBaseline = enrollmentBaselineHolder.value,
+                                onStartEnrollment = { viewModel.startEnrollmentScan() },
+                                onClearEnrollment = { viewModel.clearEnrollmentBaseline() }
                             )
                         }
                         1 -> ReadInOwnScope(reticleRootPositionState) { reticleRootPosition ->
@@ -680,6 +697,17 @@ fun AuthenticatedMainWorkbench(
                 }
             }
 
+            // Enrollment scan guidance in the same root frame (its fixation dot is the screen centre the
+            // scan asks the person to look at), under the reticle so the gaze cursor stays visible.
+            // Leaving tab 0 removes the host, which cancels a scan still in progress.
+            if (selectedTab == 0 && showEnrollmentOverlay) {
+                EnrollmentScanOverlayHost(
+                    enrollmentState = enrollmentStateHolder,
+                    onCancel = { viewModel.cancelEnrollmentScan() },
+                    onSkipBrow = { viewModel.skipEnrollmentBrowStep() }
+                )
+            }
+
             // Live 120Hz Region-Level Confidence Circle Reticle Overlay reporting root coordinates
             ReadInOwnScope(hudStateHolder) { hudState ->
                 RegionConfidenceReticleOverlay(
@@ -699,6 +727,40 @@ fun AuthenticatedMainWorkbench(
 @Composable
 internal fun <T> ReadInOwnScope(state: State<T>, content: @Composable (T) -> Unit) {
     content(state.value)
+}
+
+/**
+ * Hosts [EnrollmentScanOverlay] over the root content Box while a scan is active. The per-frame scan
+ * state is read in its own scope, so a scanned frame recomposes the overlay, not the workbench.
+ *
+ * Leaving composition (tab switch, workbench teardown) while the scan is still in an active phase
+ * cancels it through [onCancel]: the person can no longer see the guidance, so every later frame would be
+ * measured under instructions nobody is following. The phase is read from the holder at dispose time, so
+ * the normal removal of the host once the scan COMPLETEs or FAILs cancels nothing.
+ */
+@Composable
+internal fun EnrollmentScanOverlayHost(
+    enrollmentState: State<EnrollmentScanState>,
+    onCancel: () -> Unit,
+    onSkipBrow: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val latestOnCancel by rememberUpdatedState(onCancel)
+    DisposableEffect(enrollmentState) {
+        onDispose {
+            if (isEnrollmentScanPhaseActive(enrollmentState.value.phase)) {
+                latestOnCancel()
+            }
+        }
+    }
+    ReadInOwnScope(enrollmentState) { state ->
+        EnrollmentScanOverlay(
+            state = state,
+            onCancel = onCancel,
+            onSkipBrow = onSkipBrow,
+            modifier = modifier.fillMaxSize()
+        )
+    }
 }
 
 /**

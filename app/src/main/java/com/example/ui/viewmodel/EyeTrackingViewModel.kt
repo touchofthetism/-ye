@@ -1602,8 +1602,11 @@ class EyeTrackingViewModel(
 
     /** Banner with the measured levels and the detector settings now in force (Locale.US numbers). */
     private fun buildEnrollmentCompleteBanner(baseline: EnrollmentBaseline): String {
-        val raisedLabel = baseline.raisedBrowRatio?.let { String.format(Locale.US, "%.3f", browDetector.raisedBrowRatio) }
-            ?: "not measured (brow step skipped)"
+        val raisedLabel = if (baseline.raisedBrowRatio != null) {
+            String.format(Locale.US, "%.3f", browDetector.raisedBrowRatio)
+        } else {
+            "not measured (brow step skipped)"
+        }
         val warningsSuffix = if (baseline.warnings.isEmpty()) {
             ""
         } else {
