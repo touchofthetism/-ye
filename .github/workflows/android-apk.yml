@@ -106,13 +106,22 @@ jobs:
           cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/AEye-Pixel10ProXL-debug.apk
           ls -lh app/build/outputs/apk/debug/AEye-Pixel10ProXL-debug.apk
 
+      # The upload is a convenience, not the gate: the build and both test suites above are. GitHub's
+      # per-account artifact storage quota can refuse the upload, and that must not report a green
+      # build as failed. 7-day retention keeps the quota from filling with stale APKs.
       - name: Upload Installable APK Artifact
+        id: upload_apk
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: AEye-Pixel10ProXL-APK
           path: app/build/outputs/apk/debug/AEye-Pixel10ProXL-debug.apk
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 7
+
+      - name: Report APK upload outcome
+        if: steps.upload_apk.outcome != 'success'
+        run: echo "::warning::APK artifact upload failed (usually the account's artifact storage quota). Build and tests passed; the APK is in app/build/outputs/apk/debug on the runner only."
 
       - name: Check release preconditions
         id: release
