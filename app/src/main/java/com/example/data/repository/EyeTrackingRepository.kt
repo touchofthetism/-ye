@@ -1,21 +1,43 @@
 package com.example.data.repository
 
 import android.content.Context
+import android.util.Log
 import com.example.R
 import com.example.data.model.CalibrationProfile
 import com.example.data.model.DEFAULT_AFFINE_MATRIX_2X6
 import com.example.data.model.TrackingSession
+import com.example.data.model.calibrationPostureProfile
+import com.google.android.gms.tasks.Task
 import com.google.firebase.Firebase
 import com.google.firebase.auth.auth
+import com.google.firebase.firestore.CollectionReference
+import com.google.firebase.firestore.DocumentReference
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.QuerySnapshot
+import com.google.firebase.firestore.Source
 import com.google.firebase.firestore.snapshots
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withTimeoutOrNull
+
+/**
+ * Thrown by [EyeTrackingRepository.eraseAllUserCloudTelemetry] when the erase stopped part way or
+ * the server did not confirm it in time. [deletedCount] documents were confirmed deleted out of
+ * [totalCount] found on the server.
+ */
+class CloudEraseIncompleteException(
+    val deletedCount: Int,
+    val totalCount: Int,
+    message: String,
+    cause: Throwable? = null
+) : Exception(message, cause)
 
 class EyeTrackingRepository(
     private val db: FirebaseFirestore,
@@ -37,41 +59,50 @@ class EyeTrackingRepository(
             ?: throw IllegalStateException("User must be signed in with Google before writing to Firestore.")
     }
 
+    /** Signed-in state of this repository's own auth instance, for error logs (never the identity). */
+    private fun signedInOrNull(): Boolean? = try {
+        auth.currentUser != null
+    } catch (e: Exception) {
+        null
+    }
+
+    private fun reportError(e: Exception, operationType: OperationType, path: String) {
+        handleFirestoreError(e, operationType, path, signedInOrNull())
+    }
+
+    /** Error-log path under the signed-in user ("unauthenticated" when signed out); the uid is redacted when logged. */
+    private fun currentUserPath(suffix: String = ""): String =
+        "users/${auth.currentUser?.uid ?: "unauthenticated"}$suffix"
+
+    private fun calibrationsOf(uid: String): CollectionReference =
+        db.collection("users").document(uid).collection("calibrations")
+
+    private fun sessionsOf(uid: String): CollectionReference =
+        db.collection("users").document(uid).collection("sessions")
+
     fun observeCalibrationProfiles(userId: String): Flow<List<CalibrationProfile>> {
         val path = "users/$userId/calibrations"
-        return db.collection("users").document(userId).collection("calibrations")
+        return calibrationsOf(userId)
             .whereEqualTo("userId", userId)
             .snapshots()
-            .map { snapshot ->
-                snapshot.toObjects(
-                    CalibrationProfile::class.java,
-                    DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
-                )
-            }
-            .catch { error ->
-                if (error is Exception) {
-                    handleFirestoreError(error, OperationType.LIST, path)
-                }
-                throw error
-            }
+            .map { snapshot -> snapshot.toObjectsSkippingUnreadable(CalibrationProfile::class.java, path) }
+            .catch { error -> throw surfaceListenerError(error, path) }
+            // Reflection mapping of the whole collection runs on every change; keep it off the main thread.
+            .flowOn(Dispatchers.Default)
     }
 
     suspend fun getCalibrationProfiles(userId: String): Result<List<CalibrationProfile>> {
         val path = "users/$userId/calibrations"
         return try {
-            val snapshot = db.collection("users").document(userId).collection("calibrations")
+            val snapshot = calibrationsOf(userId)
                 .whereEqualTo("userId", userId)
                 .get()
                 .await()
-            val profiles = snapshot.toObjects(
-                CalibrationProfile::class.java,
-                DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
-            )
-            Result.success(profiles)
+            Result.success(snapshot.toObjectsSkippingUnreadable(CalibrationProfile::class.java, path))
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.LIST, path)
+            reportError(e, OperationType.LIST, path)
             Result.failure(e)
         }
     }
@@ -79,8 +110,7 @@ class EyeTrackingRepository(
     suspend fun getCalibrationProfileById(targetUserId: String, profileId: String): Result<CalibrationProfile?> {
         val path = "users/$targetUserId/calibrations/$profileId"
         return try {
-            val doc = db.collection("users").document(targetUserId)
-                .collection("calibrations").document(profileId)
+            val doc = calibrationsOf(targetUserId).document(profileId)
                 .get()
                 .await()
             Result.success(
@@ -92,16 +122,24 @@ class EyeTrackingRepository(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.GET, path)
+            reportError(e, OperationType.GET, path)
             Result.failure(e)
         }
     }
 
+    /**
+     * Creates the profile. When it is active, the same atomic batch deactivates every other active
+     * cloud profile, so exactly one cloud profile is active afterwards.
+     */
     suspend fun createCalibrationProfile(profile: CalibrationProfile): Result<String> {
         return try {
             val uid = requireUserId()
-            val colRef = db.collection("users").document(uid).collection("calibrations")
+            val colRef = calibrationsOf(uid)
             val docRef = if (profile.id.isNotBlank()) colRef.document(profile.id) else colRef.document()
+            val closeBlinkThreshold = profile.closeBlinkThreshold.coerceIn(0.05, 0.80)
+            // The re-open threshold must sit above the close threshold (Schmitt-trigger hysteresis).
+            val openBlinkThreshold = profile.openBlinkThreshold.coerceIn(0.15, 0.98)
+                .coerceAtLeast(closeBlinkThreshold + MIN_BLINK_HYSTERESIS_GAP)
             val payload = mapOf(
                 "userId" to uid,
                 "name" to profile.name.take(80).ifBlank { "Calibration Profile" },
@@ -111,79 +149,114 @@ class EyeTrackingRepository(
                 "meanErrorMm" to profile.meanErrorMm.coerceIn(0.0, 500.0),
                 "meanErrorPct" to profile.meanErrorPct.coerceIn(0.0, 100.0),
                 "maxErrorPct" to profile.maxErrorPct.coerceIn(0.0, 100.0),
-                "closeBlinkThreshold" to profile.closeBlinkThreshold.coerceIn(0.05, 0.80),
-                "openBlinkThreshold" to profile.openBlinkThreshold.coerceIn(0.15, 0.98),
-                "intentionalBlinkMinMs" to profile.intentionalBlinkMinMs.coerceIn(150L, 2000L),
+                "closeBlinkThreshold" to closeBlinkThreshold,
+                "openBlinkThreshold" to openBlinkThreshold,
+                "intentionalBlinkMinMs" to profile.intentionalBlinkMinMs.coerceIn(150L, MAX_INTENTIONAL_BLINK_MIN_MS),
                 "isActive" to profile.isActive,
+                // Read back by toObject; records saved without these keys read as not validated / UPRIGHT.
+                "heldOutValidated" to profile.heldOutValidated,
+                "calibrationPosture" to profile.calibrationPostureProfile().name,
                 "createdAt" to FieldValue.serverTimestamp(),
                 "updatedAt" to FieldValue.serverTimestamp()
             )
-            docRef.set(payload).await()
+            val othersToDeactivate = if (profile.isActive) otherActiveProfileRefs(uid, keepId = docRef.id) else emptyList()
+            val batch = db.batch()
+            batch.set(docRef, payload)
+            othersToDeactivate.forEach { batch.update(it, activeStateFields(false)) }
+            batch.commit().await()
             Result.success(docRef.id)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.CREATE, "users/${auth.currentUser?.uid ?: "unauthenticated"}/calibrations")
+            reportError(e, OperationType.CREATE, currentUserPath("/calibrations"))
             Result.failure(e)
         }
     }
 
-    suspend fun updateCalibrationActiveState(profileId: String, isActive: Boolean): Result<Unit> {
+    /**
+     * Sets the profile's active flag. Activation is exclusive: the same atomic batch deactivates
+     * every other active cloud profile, so the user's choice is not overridden by a newer profile
+     * that is still marked active.
+     */
+    suspend fun updateCalibrationActiveState(profileId: String, isActive: Boolean): Result<Unit> =
+        commitActiveState(profileId, isActive, alsoDeactivateIds = emptySet())
+
+    /**
+     * Activates [activeId] and deactivates [otherIds] in one atomic batch, together with any other
+     * profile the listing still shows as active. Ids whose documents no longer exist are skipped,
+     * because one update of a missing document would fail the whole batch.
+     */
+    suspend fun setActiveCalibrationProfile(activeId: String, otherIds: Collection<String>): Result<Unit> =
+        commitActiveState(activeId, isActive = true, alsoDeactivateIds = otherIds.toSet())
+
+    private suspend fun commitActiveState(profileId: String, isActive: Boolean, alsoDeactivateIds: Set<String>): Result<Unit> {
         return try {
             val uid = requireUserId()
-            val docRef = db.collection("users").document(uid).collection("calibrations").document(profileId)
-            docRef.update(
-                mapOf(
-                    "isActive" to isActive,
-                    "updatedAt" to FieldValue.serverTimestamp()
-                )
-            ).await()
+            val docRef = calibrationsOf(uid).document(profileId)
+            val othersToDeactivate = if (isActive) otherActiveProfileRefs(uid, keepId = profileId, alsoDeactivateIds) else emptyList()
+            val batch = db.batch()
+            batch.update(docRef, activeStateFields(isActive))
+            othersToDeactivate.forEach { batch.update(it, activeStateFields(false)) }
+            batch.commit().await()
             Result.success(Unit)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.UPDATE, "users/${auth.currentUser?.uid ?: "unauthenticated"}/calibrations/$profileId")
+            reportError(e, OperationType.UPDATE, currentUserPath("/calibrations/$profileId"))
             Result.failure(e)
         }
     }
 
+    /** Existing documents only: the listing is the source of the refs, so stale ids are dropped. */
+    private suspend fun otherActiveProfileRefs(
+        uid: String,
+        keepId: String,
+        alsoDeactivateIds: Set<String> = emptySet()
+    ): List<DocumentReference> =
+        calibrationsOf(uid)
+            .whereEqualTo("userId", uid)
+            .get()
+            .await()
+            .documents
+            .filter { it.id != keepId && (it.get("isActive") == true || it.id in alsoDeactivateIds) }
+            .map { it.reference }
+
+    /**
+     * Shared read-only maps, so a batch that deactivates N profiles allocates none: WriteBatch.update
+     * parses the map during the call and FieldValue.serverTimestamp() is a singleton sentinel.
+     */
+    private fun activeStateFields(isActive: Boolean): Map<String, Any> =
+        if (isActive) ACTIVATE_FIELDS else DEACTIVATE_FIELDS
+
     suspend fun deleteCalibrationProfile(profileId: String): Result<Unit> {
         return try {
             val uid = requireUserId()
-            val docRef = db.collection("users").document(uid).collection("calibrations").document(profileId)
+            val docRef = calibrationsOf(uid).document(profileId)
             docRef.delete().await()
             Result.success(Unit)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.DELETE, "users/${auth.currentUser?.uid ?: "unauthenticated"}/calibrations/$profileId")
+            reportError(e, OperationType.DELETE, currentUserPath("/calibrations/$profileId"))
             Result.failure(e)
         }
     }
 
     fun observeTrackingSessions(userId: String): Flow<List<TrackingSession>> {
         val path = "users/$userId/sessions"
-        return db.collection("users").document(userId).collection("sessions")
+        return sessionsOf(userId)
             .whereEqualTo("userId", userId)
             .snapshots()
-            .map { snapshot ->
-                snapshot.toObjects(
-                    TrackingSession::class.java,
-                    DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
-                )
-            }
-            .catch { error ->
-                if (error is Exception) {
-                    handleFirestoreError(error, OperationType.LIST, path)
-                }
-                throw error
-            }
+            .map { snapshot -> snapshot.toObjectsSkippingUnreadable(TrackingSession::class.java, path) }
+            .catch { error -> throw surfaceListenerError(error, path) }
+            // Reflection mapping of the whole collection runs on every change; keep it off the main thread.
+            .flowOn(Dispatchers.Default)
     }
 
     suspend fun createTrackingSession(session: TrackingSession): Result<String> {
         return try {
             val uid = requireUserId()
-            val colRef = db.collection("users").document(uid).collection("sessions")
+            val colRef = sessionsOf(uid)
             val docRef = if (session.id.isNotBlank()) colRef.document(session.id) else colRef.document()
             val payload = mapOf(
                 "userId" to uid,
@@ -209,7 +282,7 @@ class EyeTrackingRepository(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.CREATE, "users/${auth.currentUser?.uid ?: "unauthenticated"}/sessions")
+            reportError(e, OperationType.CREATE, currentUserPath("/sessions"))
             Result.failure(e)
         }
     }
@@ -217,43 +290,127 @@ class EyeTrackingRepository(
     suspend fun deleteTrackingSession(sessionId: String): Result<Unit> {
         return try {
             val uid = requireUserId()
-            val docRef = db.collection("users").document(uid).collection("sessions").document(sessionId)
+            val docRef = sessionsOf(uid).document(sessionId)
             docRef.delete().await()
             Result.success(Unit)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.DELETE, "users/${auth.currentUser?.uid ?: "unauthenticated"}/sessions/$sessionId")
+            reportError(e, OperationType.DELETE, currentUserPath("/sessions/$sessionId"))
             Result.failure(e)
         }
     }
 
+    /**
+     * Deletes every calibration and session document of the signed-in user and returns how many
+     * deletions the server confirmed.
+     *
+     * The documents are listed from the server, never the offline cache, so an offline erase fails
+     * fast (UNAVAILABLE) instead of deleting only cached documents and reporting success, or waiting
+     * forever for acknowledgements. Both listings are in flight together (one round trip, not two);
+     * the calibrations listing is awaited first, so its failure is still the one reported when both
+     * fail. Deletes go out in batches of at most [MAX_BATCH_WRITES]. A batch the server does not
+     * confirm within [ERASE_BATCH_TIMEOUT_MS], or a failure after some batches were committed, is
+     * reported as [CloudEraseIncompleteException] with the confirmed count.
+     */
     suspend fun eraseAllUserCloudTelemetry(): Result<Int> {
         var deletedCount = 0
+        var totalCount = 0
         return try {
             val uid = requireUserId()
-            val calSnap = db.collection("users").document(uid).collection("calibrations")
-                .whereEqualTo("userId", uid)
-                .get()
-                .await()
-            for (doc in calSnap.documents) {
-                doc.reference.delete().await()
-                deletedCount++
-            }
-            val sessSnap = db.collection("users").document(uid).collection("sessions")
-                .whereEqualTo("userId", uid)
-                .get()
-                .await()
-            for (doc in sessSnap.documents) {
-                doc.reference.delete().await()
-                deletedCount++
+            val calibrationListing = ownedDocumentsFromServer(calibrationsOf(uid), uid)
+            val sessionListing = ownedDocumentsFromServer(sessionsOf(uid), uid)
+            val refs = calibrationListing.await().documentRefs() + sessionListing.await().documentRefs()
+            totalCount = refs.size
+            for (chunk in refs.chunked(MAX_BATCH_WRITES)) {
+                val batch = db.batch()
+                chunk.forEach { batch.delete(it) }
+                val confirmed = withTimeoutOrNull(ERASE_BATCH_TIMEOUT_MS) {
+                    batch.commit().await()
+                    true
+                }
+                if (confirmed == null) {
+                    throw CloudEraseIncompleteException(
+                        deletedCount,
+                        totalCount,
+                        "Firestore did not confirm the deletion in time ($deletedCount of $totalCount document(s) " +
+                            "confirmed). Queued deletes may still complete when the connection returns."
+                    )
+                }
+                deletedCount += chunk.size
             }
             Result.success(deletedCount)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.DELETE, "users/${auth.currentUser?.uid ?: "unauthenticated"}")
-            Result.failure(e)
+            reportError(e, OperationType.DELETE, currentUserPath())
+            val failure = if (e !is CloudEraseIncompleteException && deletedCount > 0) {
+                CloudEraseIncompleteException(
+                    deletedCount,
+                    totalCount,
+                    "Deleted $deletedCount of $totalCount Firestore document(s) before an error: ${e.localizedMessage}",
+                    e
+                )
+            } else {
+                e
+            }
+            Result.failure(failure)
         }
+    }
+
+    /** Starts a server-only listing of [uid]'s documents in [collection]; the request is sent on this call. */
+    private fun ownedDocumentsFromServer(collection: CollectionReference, uid: String): Task<QuerySnapshot> =
+        collection
+            .whereEqualTo("userId", uid)
+            .get(Source.SERVER)
+
+    private fun QuerySnapshot.documentRefs(): List<DocumentReference> = documents.map { it.reference }
+
+    /**
+     * Maps each document on its own, so one document the mapper cannot read (for example a list
+     * element of the wrong type written by another client) is skipped instead of failing the
+     * whole list or listener.
+     */
+    private fun <T : Any> QuerySnapshot.toObjectsSkippingUnreadable(type: Class<T>, path: String): List<T> {
+        val mapped = ArrayList<T>(size())
+        for (doc in documents) {
+            try {
+                doc.toObject(type, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)?.let { mapped.add(it) }
+            } catch (e: RuntimeException) {
+                Log.w(TAG, "Skipping unreadable document ${doc.id} in ${redactUserIdSegments(path)}: ${e.message}")
+            }
+        }
+        return mapped
+    }
+
+    /**
+     * Query.snapshots() reports a listener failure by cancelling its producer with the
+     * FirebaseFirestoreException as the cause. Log it and hand callers that exception, so they see
+     * its code (PERMISSION_DENIED, UNAVAILABLE, ...) instead of "Error getting Query snapshot".
+     */
+    private fun surfaceListenerError(error: Throwable, path: String): Throwable {
+        val firestoreError = error.findFirestoreException()
+        if (firestoreError == null && error is CancellationException) return error
+        val surfaced = firestoreError ?: error
+        if (surfaced is Exception) {
+            reportError(surfaced, OperationType.LIST, path)
+        }
+        return surfaced
+    }
+
+    private companion object {
+        const val TAG = "EyeTrackingRepository"
+        /** Firestore's limit on writes per batch. */
+        const val MAX_BATCH_WRITES = 500
+        const val ERASE_BATCH_TIMEOUT_MS = 20_000L
+        /** Must match firestore.rules: closeBlinkThreshold + 0.05 <= openBlinkThreshold. */
+        const val MIN_BLINK_HYSTERESIS_GAP = 0.05
+        /**
+         * BlinkHysteresisDetector classifies command blinks as intentionalBlinkMinMs..800 ms; 700 ms keeps
+         * that window non-empty and matches the ViewModel's blink-timing setter and firestore.rules.
+         */
+        const val MAX_INTENTIONAL_BLINK_MIN_MS = 700L
+        val ACTIVATE_FIELDS: Map<String, Any> = mapOf("isActive" to true, "updatedAt" to FieldValue.serverTimestamp())
+        val DEACTIVATE_FIELDS: Map<String, Any> = mapOf("isActive" to false, "updatedAt" to FieldValue.serverTimestamp())
     }
 }

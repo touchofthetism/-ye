@@ -39,12 +39,16 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -52,13 +56,87 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.data.model.AacActionTile
 import com.example.data.model.GazeTriggerMode
+import com.example.domain.GazeCalibrationMath
+import com.example.ui.components.DWELL_DURATION_SLIDER_RANGE_MS
 import com.example.ui.viewmodel.LiveGazeHudState
+import java.util.Locale
+import kotlin.math.roundToLong
 
+/** Focus hysteresis around the focused tile before the user's sensitivity multiplier, in dp. */
+private val FOCUS_HYSTERESIS_BASE_DP = 14.dp
+
+/**
+ * Grid decision (§3.5 locked product decision), shared with the calibration summary's recommended
+ * layout through [GazeCalibrationMath.qualifiesFor3x3Grid]: the 3x3 deck (9 tiles) only when both
+ * error metrics were actually measured (non-null) and are within the 3x3 thresholds; otherwise the
+ * protective 2x2 large-region deck (4 tiles). Null means "not validated" (e.g. the default matrix).
+ */
+internal fun shouldUseValidated3x3Grid(meanErrorPct: Float?, maxQuadrantErrorPct: Float?): Boolean =
+    meanErrorPct != null && maxQuadrantErrorPct != null &&
+        GazeCalibrationMath.qualifiesFor3x3Grid(meanErrorPct.toDouble(), maxQuadrantErrorPct.toDouble())
+
+/**
+ * Gaze hit test for the deck. Keeps the current tile while the reticle stays within [hysteresisPx]
+ * of its bounds, otherwise returns the visible tile under the reticle (or null). Only ids in
+ * [visibleTileIds] can win, so bounds of tiles that left the grid are never hit-testable.
+ */
+internal fun resolveFocusedDeckTile(
+    reticleRootPosition: Offset,
+    tileBounds: Map<String, Rect>,
+    visibleTileIds: Set<String>,
+    currentFocusedId: String?,
+    hysteresisPx: Float
+): String? {
+    val currentRect = currentFocusedId?.takeIf { it in visibleTileIds }?.let { tileBounds[it] }
+    val stillInCurrent = currentRect != null &&
+        reticleRootPosition.x >= (currentRect.left - hysteresisPx) &&
+        reticleRootPosition.x <= (currentRect.right + hysteresisPx) &&
+        reticleRootPosition.y >= (currentRect.top - hysteresisPx) &&
+        reticleRootPosition.y <= (currentRect.bottom + hysteresisPx)
+    if (stillInCurrent) {
+        // Maintain focus on currently fixated tile
+        return currentFocusedId
+    }
+    return tileBounds.entries.firstOrNull { (id, rect) ->
+        id in visibleTileIds && rect.contains(reticleRootPosition)
+    }?.key
+}
+
+/**
+ * Centres of the visible, laid-out tiles normalized to [gazeFrameRootBounds]: the root content Box
+ * that hosts the reticle overlay, i.e. the frame gaze normX/normY are normalized to. These are the
+ * ViewModel's reference for background drift correction. Empty while that frame is unknown (zero
+ * size); tiles with empty (fully clipped) bounds or outside [visibleTileIds] are left out.
+ */
+internal fun tileCentersInGazeFrame(
+    tileBounds: Map<String, Rect>,
+    visibleTileIds: Set<String>,
+    gazeFrameRootBounds: Rect
+): Map<String, Pair<Float, Float>> {
+    if (gazeFrameRootBounds.width <= 0f || gazeFrameRootBounds.height <= 0f) return emptyMap()
+    val centers = HashMap<String, Pair<Float, Float>>(tileBounds.size)
+    for ((id, rect) in tileBounds) {
+        if (id !in visibleTileIds || rect.width <= 0f || rect.height <= 0f) continue
+        val center = rect.center
+        centers[id] = ((center.x - gazeFrameRootBounds.left) / gazeFrameRootBounds.width) to
+            ((center.y - gazeFrameRootBounds.top) / gazeFrameRootBounds.height)
+    }
+    return centers
+}
+
+/**
+ * [gazeFrameRootBounds] is the root-coordinate bounds of the Box that hosts the reticle overlay (the
+ * frame gaze normX/normY are normalized to); with it, [onUpdateTileCentersNorm] receives the visible
+ * tiles' centres in that frame whenever tile bounds, the visible tile set or the frame change, and an
+ * empty map when the deck leaves composition. With the default [Rect.Zero] only empty maps are sent.
+ */
 @Composable
 fun GazeControlDeckScreen(
     hudState: LiveGazeHudState,
@@ -75,7 +153,54 @@ fun GazeControlDeckScreen(
     onEditTilePhrase: (String, String, String) -> Unit = { _, _, _ -> },
     onSelectPosture: (com.example.data.model.GazePostureProfile) -> Unit = {},
     onSelectFilterMode: (com.example.data.model.GazeFilterMode) -> Unit = {},
-    onRunBenchmark: () -> Unit = {}
+    onRunBenchmark: () -> Unit = {},
+    gazeFrameRootBounds: Rect = Rect.Zero,
+    onUpdateTileCentersNorm: (Map<String, Pair<Float, Float>>) -> Unit = {}
+) {
+    // The reticle position changes up to every display frame. Only the hit-test coroutine reads it
+    // (through this State), so a move recomposes just this wrapper: the deck body skips and the
+    // hit-test effect is not relaunched.
+    val latestReticleRootPosition = rememberUpdatedState(reticleRootPosition)
+    GazeControlDeckContent(
+        hudState = hudState,
+        reticleRootPosition = latestReticleRootPosition,
+        tiles = tiles,
+        onUpdateFocusedTile = onUpdateFocusedTile,
+        onManualTileClick = onManualTileClick,
+        onChangeDwellDurationMs = onChangeDwellDurationMs,
+        onChangeDwellSensitivityMultiplier = onChangeDwellSensitivityMultiplier,
+        onSelectDwellPreset = onSelectDwellPreset,
+        onChangeTriggerMode = onChangeTriggerMode,
+        onCalibrateNeutralBrow = onCalibrateNeutralBrow,
+        onCalibrateRaisedBrow = onCalibrateRaisedBrow,
+        onEditTilePhrase = onEditTilePhrase,
+        onSelectPosture = onSelectPosture,
+        onSelectFilterMode = onSelectFilterMode,
+        onRunBenchmark = onRunBenchmark,
+        gazeFrameRootBounds = gazeFrameRootBounds,
+        onUpdateTileCentersNorm = onUpdateTileCentersNorm
+    )
+}
+
+@Composable
+private fun GazeControlDeckContent(
+    hudState: LiveGazeHudState,
+    reticleRootPosition: State<Offset>,
+    tiles: List<AacActionTile>,
+    onUpdateFocusedTile: (String?) -> Unit,
+    onManualTileClick: (String) -> Unit,
+    onChangeDwellDurationMs: (Long) -> Unit,
+    onChangeDwellSensitivityMultiplier: (Float) -> Unit,
+    onSelectDwellPreset: (com.example.data.model.DwellSpeedPreset) -> Unit,
+    onChangeTriggerMode: (GazeTriggerMode) -> Unit,
+    onCalibrateNeutralBrow: () -> Unit,
+    onCalibrateRaisedBrow: () -> Unit,
+    onEditTilePhrase: (String, String, String) -> Unit,
+    onSelectPosture: (com.example.data.model.GazePostureProfile) -> Unit,
+    onSelectFilterMode: (com.example.data.model.GazeFilterMode) -> Unit,
+    onRunBenchmark: () -> Unit,
+    gazeFrameRootBounds: Rect,
+    onUpdateTileCentersNorm: (Map<String, Pair<Float, Float>>) -> Unit
 ) {
     val tileBoundsMap = remember { mutableStateMapOf<String, Rect>() }
     var editingTile by remember { mutableStateOf<AacActionTile?>(null) }
@@ -83,40 +208,68 @@ fun GazeControlDeckScreen(
     var editPhraseText by remember { mutableStateOf("") }
     var showDwellSettingsDialog by remember { mutableStateOf(false) }
 
-    // Hit-test using the exact root-window pixel coordinate of the rendered confidence reticle
-    // with 14dp focus hysteresis expansion to prevent jitter/flicker at tile boundaries
-    LaunchedEffect(reticleRootPosition, tileBoundsMap.size) {
-        if (reticleRootPosition != Offset.Zero) {
-            val currentFocusedId = hudState.focusedTileId
-            val currentRect = currentFocusedId?.let { tileBoundsMap[it] }
+    val measuredMeanErrorPct: Float? = hudState.activeErrorRadiusPct
+    val measuredMaxQuadrantErrorPct: Float? = hudState.activeMaxQuadrantErrorPct
+    val isAccuracyValidated = measuredMeanErrorPct != null && measuredMaxQuadrantErrorPct != null
+    val use3x3Grid = shouldUseValidated3x3Grid(measuredMeanErrorPct, measuredMaxQuadrantErrorPct)
+    val columnCount = if (use3x3Grid) 3 else 2
+    val visibleTiles = remember(tiles, use3x3Grid) { tiles.take(if (use3x3Grid) 9 else 4) }
+    val visibleTileIds = remember(visibleTiles) { visibleTiles.mapTo(HashSet()) { it.id } }
 
-            // Dynamic focus hysteresis scaled by user sensitivity multiplier (default 14dp ~ 38.5px)
-            val baseHysteresisPx = 14f * 2.75f
-            val hysteresisPx = baseHysteresisPx * hudState.dwellSensitivityRadiusMultiplier
-            val stillInCurrent = currentRect != null &&
-                reticleRootPosition.x >= (currentRect.left - hysteresisPx) &&
-                reticleRootPosition.x <= (currentRect.right + hysteresisPx) &&
-                reticleRootPosition.y >= (currentRect.top - hysteresisPx) &&
-                reticleRootPosition.y <= (currentRect.bottom + hysteresisPx)
+    // Gaze input is suspended while a dialog covers the deck: the user is reading or typing there,
+    // and the tiles underneath must not dwell, blink- or brow-fire.
+    val gazeInputSuspended = showDwellSettingsDialog || editingTile != null
 
-            if (stillInCurrent) {
-                // Maintain focus on currently fixated tile
-                onUpdateFocusedTile(currentFocusedId)
-            } else {
-                val hitEntry = tileBoundsMap.entries.firstOrNull { (_, rect) ->
-                    rect.contains(reticleRootPosition)
-                }
-                onUpdateFocusedTile(hitEntry?.key)
-            }
-        }
+    // 14 dp focus hysteresis (scaled by the user's sensitivity multiplier) in this device's pixels,
+    // the same unit as the reticle position and the tile bounds.
+    val focusHysteresisPx = with(LocalDensity.current) { FOCUS_HYSTERESIS_BASE_DP.toPx() } *
+        hudState.dwellSensitivityRadiusMultiplier
+
+    val latestOnUpdateFocusedTile by rememberUpdatedState(onUpdateFocusedTile)
+    val latestFocusedTileId by rememberUpdatedState(hudState.focusedTileId)
+    val latestVisibleTileIds by rememberUpdatedState(visibleTileIds)
+    val latestFocusHysteresisPx by rememberUpdatedState(focusHysteresisPx)
+    val latestOnUpdateTileCentersNorm by rememberUpdatedState(onUpdateTileCentersNorm)
+
+    // Drift-correction reference: the visible tiles' centres in the gaze frame, re-sent whenever a
+    // tile's bounds, the visible tile set or the frame change (snapshotFlow skips equal maps).
+    LaunchedEffect(gazeFrameRootBounds) {
+        snapshotFlow { tileCentersInGazeFrame(tileBoundsMap.toMap(), latestVisibleTileIds, gazeFrameRootBounds) }
+            .collect { latestOnUpdateTileCentersNorm(it) }
     }
 
-    // Validation chooses the grid (§3.5 locked product decision):
-    // If mean error <= 12.0% and worst-quadrant error <= 16.5% -> 3x3 Grid (9 tiles);
-    // otherwise -> 2x2 Protective Large-Region Grid (4 tiles).
-    val use3x3Grid = hudState.activeErrorRadiusPct <= 12.0f && hudState.activeMaxQuadrantErrorPct <= 16.5f
-    val columnCount = if (use3x3Grid) 3 else 2
-    val visibleTiles = if (use3x3Grid) tiles.take(9) else tiles.take(4)
+    // Hit-test using the exact root-window pixel coordinate of the rendered confidence reticle,
+    // re-run whenever the reticle moves or a tile's bounds change, with focus hysteresis expansion
+    // to prevent jitter/flicker at tile boundaries.
+    LaunchedEffect(gazeInputSuspended) {
+        if (gazeInputSuspended) {
+            latestOnUpdateFocusedTile(null)
+            return@LaunchedEffect
+        }
+        snapshotFlow { reticleRootPosition.value to tileBoundsMap.toMap() }
+            .collect { (position, bounds) ->
+                if (position != Offset.Zero) {
+                    latestOnUpdateFocusedTile(
+                        resolveFocusedDeckTile(
+                            reticleRootPosition = position,
+                            tileBounds = bounds,
+                            visibleTileIds = latestVisibleTileIds,
+                            currentFocusedId = latestFocusedTileId,
+                            hysteresisPx = latestFocusHysteresisPx
+                        )
+                    )
+                }
+            }
+    }
+
+    // Leaving the deck (tab switch, back) must clear the hovered tile, or dwell, command blink and
+    // brow raise keep firing (and speaking) it on other tabs. Its tile centres go stale with it.
+    DisposableEffect(Unit) {
+        onDispose {
+            latestOnUpdateFocusedTile(null)
+            latestOnUpdateTileCentersNorm(emptyMap())
+        }
+    }
 
     if (showDwellSettingsDialog) {
         com.example.ui.components.DwellTriggerSettingsDialog(
@@ -133,6 +286,10 @@ fun GazeControlDeckScreen(
 
     if (editingTile != null) {
         val currentTile = editingTile!!
+        // The ViewModel ignores an edit with a blank label or phrase, so Save is only offered when
+        // both are filled; otherwise the dialog would close as if saved and drop the whole edit.
+        val isTitleBlank = editTitleText.isBlank()
+        val isPhraseBlank = editPhraseText.isBlank()
         AlertDialog(
             onDismissRequest = { editingTile = null },
             title = { Text("Customize AAC Tile") },
@@ -143,13 +300,25 @@ fun GazeControlDeckScreen(
                         onValueChange = { editTitleText = it },
                         label = { Text("Tile Label") },
                         singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
+                        isError = isTitleBlank,
+                        supportingText = if (isTitleBlank) {
+                            { Text("A tile label is required") }
+                        } else null,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("edit_tile_title_field")
                     )
                     OutlinedTextField(
                         value = editPhraseText,
                         onValueChange = { editPhraseText = it },
                         label = { Text("Spoken TTS Phrase") },
-                        modifier = Modifier.fillMaxWidth()
+                        isError = isPhraseBlank,
+                        supportingText = if (isPhraseBlank) {
+                            { Text("A spoken phrase is required") }
+                        } else null,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("edit_tile_phrase_field")
                     )
                 }
             },
@@ -158,7 +327,9 @@ fun GazeControlDeckScreen(
                     onClick = {
                         onEditTilePhrase(currentTile.id, editTitleText, editPhraseText)
                         editingTile = null
-                    }
+                    },
+                    enabled = !isTitleBlank && !isPhraseBlank,
+                    modifier = Modifier.testTag("save_tile_edit_button")
                 ) {
                     Text("Save")
                 }
@@ -188,7 +359,10 @@ fun GazeControlDeckScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        modifier = Modifier.weight(1f),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.VolumeUp,
                             contentDescription = "TTS Output",
@@ -197,9 +371,13 @@ fun GazeControlDeckScreen(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = if (use3x3Grid) "3×3 Validated Deck" else "2×2 Protective Region Deck",
+                            // Same label as the calibration summary's recommended layout; "Validated"
+                            // only when measured metrics unlocked the 3x3 deck.
+                            text = GazeCalibrationMath.gridLayoutLabel(use3x3Grid) +
+                                (if (isAccuracyValidated) "" else " • not yet validated"),
                             style = MaterialTheme.typography.titleMedium,
-                            color = MaterialTheme.colorScheme.onSurface
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.testTag("deck_layout_title")
                         )
                     }
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -224,10 +402,15 @@ fun GazeControlDeckScreen(
 
                 Spacer(modifier = Modifier.height(4.dp))
 
+                // Fixed two-line height: a longer or shorter phrase must not reflow the card and
+                // shift the tile grid under a fixating gaze.
                 Text(
                     text = hudState.lastTriggeredSpeech,
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.secondary,
+                    minLines = 2,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.testTag("aac_speech_output_text")
                 )
 
@@ -264,7 +447,7 @@ fun GazeControlDeckScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "Brow Ratio: ${String.format("%.3f", hudState.rawFeature.browToEyeRatio)} (N:${String.format("%.2f", hudState.neutralBrowRatio)}→R:${String.format("%.2f", hudState.raisedBrowRatio)})",
+                        text = "Brow Ratio: ${String.format(Locale.US, "%.3f", hudState.rawFeature.browToEyeRatio)} (N:${String.format(Locale.US, "%.2f", hudState.neutralBrowRatio)}→R:${String.format(Locale.US, "%.2f", hudState.raisedBrowRatio)})",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.weight(1f)
@@ -296,13 +479,16 @@ fun GazeControlDeckScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(modifier = Modifier.width(8.dp))
+                    // Same range as the settings dialog, so every preset (650 ms .. 1900 ms) is shown
+                    // and settable here; rounding keeps float slider values from truncating 1 ms low.
                     Slider(
                         value = hudState.dwellTriggerMs.toFloat(),
-                        onValueChange = { onChangeDwellDurationMs(it.toLong()) },
-                        valueRange = 800f..1800f,
+                        onValueChange = { onChangeDwellDurationMs(it.roundToLong()) },
+                        valueRange = DWELL_DURATION_SLIDER_RANGE_MS,
                         modifier = Modifier
                             .weight(1f)
                             .height(26.dp)
+                            .testTag("deck_dwell_duration_slider")
                     )
                 }
             }
@@ -320,6 +506,11 @@ fun GazeControlDeckScreen(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             items(visibleTiles, key = { it.id }) { tile ->
+                // A tile that leaves the grid (3x3 -> 2x2 switch, scrolled out) drops its bounds,
+                // so the hit test never focuses or dwell-fires a tile that is not on screen.
+                DisposableEffect(tile.id) {
+                    onDispose { tileBoundsMap.remove(tile.id) }
+                }
                 val isFocused = hudState.focusedTileId == tile.id
                 val borderColor = if (isFocused) {
                     MaterialTheme.colorScheme.primary

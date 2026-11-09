@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?><!--
-   Sample backup rules file; uncomment and customize as necessary.
+   Auto Backup rules (android:fullBackupContent) for devices running API 30 and lower.
+   Devices running API 31+ use data_extraction_rules.xml instead.
    See https://developer.android.com/guide/topics/data/autobackup
-   for details.
-   Note: This file is ignored for devices older than API 31
-   See https://developer.android.com/about/versions/12/backup-restore
+
+   The on-device telemetry vault (calibration matrices, blink thresholds, session telemetry,
+   custom AAC phrases) is promised to stay on this device, so it is never backed up.
+   The Firestore offline cache is excluded too; it re-syncs from the server after sign-in.
 -->
 <full-backup-content>
-    <!--
-   <include domain="sharedpref" path="."/>
-   <exclude domain="sharedpref" path="device.xml"/>
--->
+    <exclude domain="sharedpref" path="oculagaze_local_vault.xml" />
+    <exclude domain="database" path="." />
 </full-backup-content>

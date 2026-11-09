@@ -2,7 +2,7 @@
   "entities": {
     "CalibrationProfile": {
       "title": "CalibrationProfile",
-      "description": "Device-tagged 5-point + 4-point validated eye-tracking affine regression profile owned by an authenticated user.",
+      "description": "Device-tagged eye-tracking regression profile from the 5-point fit (optionally checked on 4 held-out points) owned by an authenticated user. heldOutValidated records whether held-out validation ran; records saved before that field existed omit it and are treated as not held-out validated.",
       "type": "object",
       "properties": {
         "userId": {
@@ -11,57 +11,91 @@
         },
         "name": {
           "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
           "description": "User-facing profile name (1 to 80 chars)."
         },
         "deviceModel": {
           "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
           "description": "Android Build.MODEL identifier for camera geometry matching (1 to 80 chars)."
         },
         "matrixCoeffs": {
           "type": "array",
-          "description": "12-element flattened 2x6 regularized least-squares regression matrix mapping standardized [1, gx, gy, yaw, pitch, roll+distance] to normalized screen (x, y)."
+          "items": {
+            "type": "number"
+          },
+          "minItems": 12,
+          "maxItems": 12,
+          "description": "Exactly 12 numbers: flattened 2x6 regularized least-squares regression matrix mapping standardized [1, gx, gy, yaw, pitch, roll+distance] to normalized screen (x, y). Every element must be a number."
         },
         "baselineEyeDistancePx": {
           "type": "number",
+          "minimum": 0,
+          "maximum": 5000,
           "description": "Reference inter-ocular pixel distance measured during calibration."
         },
         "meanErrorMm": {
           "type": "number",
-          "description": "Held-out 4-point validation approximate mean Euclidean error in millimeters."
+          "minimum": 0,
+          "maximum": 500,
+          "description": "Approximate mean Euclidean error in millimeters reported by the calibration wizard: held-out 4-point validation error when validation ran, otherwise the in-sample residual of the 5-point fit (optimistic, not a validation result)."
         },
         "meanErrorPct": {
           "type": "number",
-          "description": "Held-out 4-point validation mean Euclidean error as percentage of screen."
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Mean Euclidean error as percentage of screen: held-out 4-point validation error when validation ran, otherwise the in-sample residual of the 5-point fit (optimistic, not a validation result)."
         },
         "maxErrorPct": {
           "type": "number",
-          "description": "Held-out 4-point validation worst-quadrant error as percentage of screen."
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Worst-point error as percentage of screen: worst held-out quadrant when validation ran, otherwise the worst 5-point fit target (in-sample, not a validation result)."
         },
         "closeBlinkThreshold": {
           "type": "number",
-          "description": "Lower Schmitt-trigger eye-open probability threshold for blink start."
+          "minimum": 0.05,
+          "maximum": 0.8,
+          "description": "Lower Schmitt-trigger eye-open probability threshold for blink start. Must be at least 0.05 below openBlinkThreshold."
         },
         "openBlinkThreshold": {
           "type": "number",
-          "description": "Upper Schmitt-trigger eye-open probability threshold for blink end."
+          "minimum": 0.15,
+          "maximum": 0.98,
+          "description": "Upper Schmitt-trigger eye-open probability threshold for blink end. Must be >= closeBlinkThreshold + 0.05."
         },
         "intentionalBlinkMinMs": {
           "type": "integer",
-          "description": "Minimum eye closure duration in milliseconds for an intentional command blink (default 350 ms; natural blink is 80-349 ms)."
+          "minimum": 150,
+          "maximum": 700,
+          "description": "Minimum eye closure duration in milliseconds for an intentional command blink (default 350 ms). Command blinks are intentionalBlinkMinMs to 800 ms, natural blinks 80 ms to intentionalBlinkMinMs - 1, so the value must stay below 800 ms; the rules cap it at 700 ms."
         },
         "isActive": {
           "type": "boolean",
-          "description": "Whether this profile is currently active."
+          "description": "Whether this profile is the active one. Activation is exclusive: the client deactivates every other profile in the same batched write."
+        },
+        "heldOutValidated": {
+          "type": "boolean",
+          "description": "Optional. True only when the error metrics come from the 4 held-out validation targets; false (or absent, in records saved before the field existed) means they are the in-sample fit residual. Set on create only; the rules reject changing it later."
+        },
+        "calibrationPosture": {
+          "type": "string",
+          "enum": ["UPRIGHT", "RECLINING", "LYING_DOWN"],
+          "description": "Optional. GazePostureProfile the fit was recorded in (absent reads as UPRIGHT). Set on create only; the rules reject changing it later."
         },
         "createdAt": {
           "type": "string",
           "format": "date-time",
-          "description": "Server creation timestamp via FieldValue.serverTimestamp()."
+          "x-firestore-type": "timestamp",
+          "description": "Firestore Timestamp value (not a string field), written as FieldValue.serverTimestamp(); the rules require createdAt == request.time on create and an unchanged value on update."
         },
         "updatedAt": {
           "type": "string",
           "format": "date-time",
-          "description": "Server update timestamp via FieldValue.serverTimestamp()."
+          "x-firestore-type": "timestamp",
+          "description": "Firestore Timestamp value (not a string field), written as FieldValue.serverTimestamp(); the rules require updatedAt == request.time on every create and update."
         }
       },
       "required": [
@@ -79,7 +113,8 @@
         "isActive",
         "createdAt",
         "updatedAt"
-      ]
+      ],
+      "additionalProperties": false
     },
     "TrackingSession": {
       "title": "TrackingSession",
@@ -92,10 +127,14 @@
         },
         "title": {
           "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
           "description": "Title of the reading passage or control deck session (1 to 120 chars)."
         },
         "deviceModel": {
           "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
           "description": "Android Build.MODEL identifier (1 to 80 chars)."
         },
         "contentType": {
@@ -108,57 +147,87 @@
         },
         "durationSeconds": {
           "type": "integer",
+          "minimum": 1,
+          "maximum": 86400,
           "description": "Active tracking duration in seconds."
         },
         "naturalBlinkCount": {
           "type": "integer",
-          "description": "Count of natural involuntary blinks (80-349 ms)."
+          "minimum": 0,
+          "maximum": 100000,
+          "description": "Count of natural involuntary blinks (80 ms to intentionalBlinkMinMs - 1; default 80-349 ms)."
         },
         "intentionalBlinkCount": {
           "type": "integer",
-          "description": "Count of intentional command blinks (350-900 ms)."
+          "minimum": 0,
+          "maximum": 100000,
+          "description": "Count of intentional command blinks (intentionalBlinkMinMs to 800 ms; default 350-800 ms). Longer closures are rests, not commands."
         },
         "blinksPerMinute": {
           "type": "number",
+          "minimum": 0,
+          "maximum": 300,
           "description": "Natural blink rate per minute."
         },
         "effectiveWordsPerMinute": {
           "type": "integer",
-          "description": "Passage word count divided by active reading time in minutes."
+          "minimum": 0,
+          "maximum": 2000,
+          "description": "Client-side reading-speed estimate in words per minute derived from session timing and section dwell, not from word-level gaze tracking. 0 means no estimate."
         },
         "fixationClusterCount": {
           "type": "integer",
+          "minimum": 0,
+          "maximum": 5000,
           "description": "Count of dispersion-grouped coarse fixation centroids."
         },
         "topZonePercentage": {
           "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
           "description": "Percentage of active gaze time in top screen third (0-100)."
         },
         "middleZonePercentage": {
           "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
           "description": "Percentage of active gaze time in middle screen third (0-100)."
         },
         "bottomZonePercentage": {
           "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
           "description": "Percentage of active gaze time in bottom screen third (0-100)."
         },
         "sectionLoads": {
           "type": "array",
-          "description": "Bounded list (max 12) of section dwell summary strings (e.g. 'sec_1:Intro:42')."
+          "items": {
+            "type": "string",
+            "maxLength": 120
+          },
+          "maxItems": 12,
+          "description": "Bounded list (max 12) of section dwell summary strings (e.g. 'sec_1:Intro:42'). Every element must be a string of at most 120 chars and must not contain U+001F."
         },
         "clusterPoints": {
           "type": "array",
-          "description": "Bounded list (max 40) of coarse fixation cluster strings encoded as 'x,y,dwellMs'."
+          "items": {
+            "type": "string",
+            "maxLength": 80
+          },
+          "maxItems": 40,
+          "description": "Bounded list (max 40) of coarse fixation cluster strings encoded as 'x,y,dwellMs'. Every element must be a string of at most 80 chars and must not contain U+001F."
         },
         "createdAt": {
           "type": "string",
           "format": "date-time",
-          "description": "Server creation timestamp via FieldValue.serverTimestamp()."
+          "x-firestore-type": "timestamp",
+          "description": "Firestore Timestamp value (not a string field), written as FieldValue.serverTimestamp(); the rules require createdAt == request.time on create and an unchanged value on update."
         },
         "updatedAt": {
           "type": "string",
           "format": "date-time",
-          "description": "Server update timestamp via FieldValue.serverTimestamp()."
+          "x-firestore-type": "timestamp",
+          "description": "Firestore Timestamp value (not a string field), written as FieldValue.serverTimestamp(); the rules require updatedAt == request.time on every create and update."
         }
       },
       "required": [
@@ -179,7 +248,8 @@
         "clusterPoints",
         "createdAt",
         "updatedAt"
-      ]
+      ],
+      "additionalProperties": false
     }
   },
   "firestore": {
@@ -187,7 +257,7 @@
       "schema": {
         "$ref": "#/entities/CalibrationProfile"
       },
-      "description": "User-scoped calibration profiles containing standardized 2x6 regression matrices and held-out validation metrics (mean and worst-quadrant)."
+      "description": "User-scoped calibration profiles containing standardized 2x6 regression matrices and the wizard's error metrics (held-out when validation ran, otherwise in-sample fit residuals; heldOutValidated says which, and an absent value means not validated)."
     },
     "/users/{userId}/sessions/{sessionId}": {
       "schema": {

@@ -137,7 +137,9 @@ class EyeTrackingRepositoryRuleTest : FirestoreEmulatorTestBase() {
 
     @Test
     fun eraseAllUserCloudTelemetry_authenticatedOwner_deletesAllCalibrationsAndSessions() = runBlocking {
-        val aliceUid = signInTestUser(ALICE_EMAIL)
+        // A fresh account: the other tests leave alice's documents behind, and the emulator keeps them
+        // between runs, so the exact deleted count is only meaningful for an account nobody else writes to.
+        val aliceUid = signInTestUser("erase_${UUID.randomUUID().toString().take(8)}@oculagaze.test")
         val repository = EyeTrackingRepository(firestore, auth)
         val profileId = "cal_${UUID.randomUUID().toString().replace("-", "").take(12)}"
         val sessionId = "sess_${UUID.randomUUID().toString().replace("-", "").take(12)}"
@@ -170,6 +172,10 @@ class EyeTrackingRepositoryRuleTest : FirestoreEmulatorTestBase() {
             repository.getCalibrationProfiles(aliceUid).getOrThrow()
         }
         assertTrue("Expected all Firestore calibration profiles to be deleted", remainingProfiles.isEmpty())
+        val remainingSessions = withTimeout(FLOW_TIMEOUT_MS) {
+            repository.observeTrackingSessions(aliceUid).first()
+        }
+        assertTrue("Expected all Firestore tracking sessions to be deleted", remainingSessions.isEmpty())
     }
 
     private companion object {

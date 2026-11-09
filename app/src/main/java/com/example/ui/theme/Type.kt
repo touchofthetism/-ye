@@ -8,22 +8,19 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import com.example.R
 
+// Each bundled .ttf is a single static Regular (400) face with no wght axis. Declare it only at its real
+// weight: Compose synthesizes bold only when the matched Font's declared weight is below 600, so labelling
+// the Regular file as Bold/SemiBold made every bold style render at regular weight.
 val SpaceGroteskFamily = FontFamily(
-    Font(R.font.space_grotesk, FontWeight.Normal),
-    Font(R.font.space_grotesk, FontWeight.Medium),
-    Font(R.font.space_grotesk, FontWeight.Bold)
+    Font(R.font.space_grotesk, FontWeight.Normal)
 )
 
 val PlusJakartaSansFamily = FontFamily(
-    Font(R.font.plus_jakarta_sans, FontWeight.Normal),
-    Font(R.font.plus_jakarta_sans, FontWeight.Medium),
-    Font(R.font.plus_jakarta_sans, FontWeight.SemiBold)
+    Font(R.font.plus_jakarta_sans, FontWeight.Normal)
 )
 
 val JetBrainsMonoFamily = FontFamily(
-    Font(R.font.jetbrains_mono, FontWeight.Normal),
-    Font(R.font.jetbrains_mono, FontWeight.Medium),
-    Font(R.font.jetbrains_mono, FontWeight.Bold)
+    Font(R.font.jetbrains_mono, FontWeight.Normal)
 )
 
 val Typography = Typography(

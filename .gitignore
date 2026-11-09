@@ -16,5 +16,11 @@
 local.properties
 .env
 debug.keystore
+# Signing material (the release config defaults to ${rootDir}/my-upload-key.jks); CI restores keys from secrets.
+*.jks
+*.keystore
+*.keystore.base64
+# Firebase emulator / rules-test tooling installed locally
+node_modules/
 
 *-debug.log

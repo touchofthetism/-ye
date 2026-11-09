@@ -45,9 +45,51 @@ import androidx.compose.ui.unit.dp
 import com.example.data.model.DwellSpeedPreset
 import com.example.data.model.GazeFilterMode
 import com.example.data.model.GazePostureProfile
+import com.example.domain.BenchmarkScorecard
+import com.example.domain.ReplayScenario
 import com.example.ui.viewmodel.LiveGazeHudState
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.roundToInt
+import kotlin.math.roundToLong
+
+/** Dwell duration slider range shared by every dwell slider, so all presets (650..1900 ms) fit. */
+val DWELL_DURATION_SLIDER_RANGE_MS: ClosedFloatingPointRange<Float> = 400f..2200f
+
+/** Replay categories that have a pass criterion; the others are replayed without one. */
+private val GATED_BENCHMARK_CATEGORIES = setOf("MIDAS_TOUCH", "COMMAND")
+
+/**
+ * One-line summary of the last synthetic replay run, built only from values the run produced:
+ * the pass/fail verdict, how many gated scenarios passed, the false-trigger counts (the per-minute
+ * rate is the report's Midas-touch rate, so it is shown next to the Midas-touch count it belongs to),
+ * the measured post-feature processing latency and the forward-model projection check. It is a JVM
+ * replay of synthetic feature traces, not an on-device camera, latency, accuracy or thermal
+ * measurement, and says so.
+ */
+fun formatBenchmarkSummaryLine(report: BenchmarkScorecard): String {
+    val gated = report.scenarioResults.filter { it.scenario.category in GATED_BENCHMARK_CATEGORIES }
+    val ungatedCount = report.scenarioResults.size - gated.size
+    val falseTriggers = report.scenarioResults.sumOf { it.falseActivations }
+    val verdict = if (report.allScenariosPassed) "PASS" else "FAILURES DETECTED"
+    return String.format(
+        Locale.US,
+        "Latest synthetic replay: %s • %d/%d gated scenarios passed, %d replayed without pass criteria • " +
+            "%d false triggers (%d in Midas-touch scenarios, %.1f/min) • " +
+            "post-feature JVM processing median %.3f ms (excl. camera + face detection) • " +
+            "synthetic projection check %.1f px (%.2f°), not measured gaze accuracy.",
+        verdict,
+        gated.count { it.passed },
+        gated.size,
+        ungatedCount,
+        falseTriggers,
+        report.midasFalseActivationCount,
+        report.falseActivationsPerMinute,
+        report.latencyMedianMs,
+        report.meanAccuracyPx,
+        report.meanAccuracyDeg
+    )
+}
 
 @Composable
 fun DwellTriggerSettingsDialog(
@@ -200,8 +242,11 @@ fun DwellTriggerSettingsDialog(
                         }
 
                         DwellSpeedPreset.entries.forEach { preset ->
+                            // A preset is only "selected" while both of its values are in effect;
+                            // a hand-edited duration or boundary tolerance is no longer that preset.
                             val isSelected = hudState.activeDwellPreset == preset &&
-                                hudState.dwellTriggerMs == preset.durationMs
+                                hudState.dwellTriggerMs == preset.durationMs &&
+                                abs(hudState.dwellSensitivityRadiusMultiplier - preset.radiusToleranceMultiplier) < 0.01f
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -277,10 +322,12 @@ fun DwellTriggerSettingsDialog(
                         )
                     }
 
+                    // Tick values come back from the slider as float lerps (e.g. 1899.9999f for the
+                    // 1900 ms tick), so round instead of truncating.
                     Slider(
                         value = hudState.dwellTriggerMs.toFloat(),
-                        onValueChange = { onChangeDurationMs(it.toLong()) },
-                        valueRange = 400f..2200f,
+                        onValueChange = { onChangeDurationMs(it.roundToLong()) },
+                        valueRange = DWELL_DURATION_SLIDER_RANGE_MS,
                         steps = 17,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -339,7 +386,7 @@ fun DwellTriggerSettingsDialog(
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = "Pixel 10 Pro XL Stress Benchmark",
+                                text = "Synthetic Replay Self-Test",
                                 style = MaterialTheme.typography.labelMedium,
                                 fontWeight = FontWeight.Bold,
                                 color = MaterialTheme.colorScheme.onPrimaryContainer
@@ -347,7 +394,7 @@ fun DwellTriggerSettingsDialog(
                         }
 
                         Text(
-                            text = "Executes the 25-scenario replay harness across dim light, glasses glare, rapid blinks, continuous speech, and thermal endurance.",
+                            text = "Replays ${ReplayScenario.entries.size} synthetic feature traces (dim light, glasses glare, rapid blinks, continuous speech, a long-session stream) through the filters, gaze projection and blink/brow detectors. Not an on-device camera, latency or thermal measurement.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -377,10 +424,11 @@ fun DwellTriggerSettingsDialog(
                         val report = hudState.lastBenchmarkReport
                         if (report != null) {
                             Text(
-                                text = "Latest: Latency ${String.format("%.1f", report.latencyMedianMs)}ms • Accuracy ${String.format("%.1f", report.meanAccuracyPx)}px (${String.format("%.2f", report.meanAccuracyDeg)}°) • 0 false blinks.",
+                                text = formatBenchmarkSummaryLine(report),
                                 style = MaterialTheme.typography.labelSmall,
                                 fontWeight = FontWeight.SemiBold,
-                                color = MaterialTheme.colorScheme.primary
+                                color = if (report.allScenariosPassed) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                                modifier = Modifier.testTag("benchmark_summary_text")
                             )
                         }
                     }

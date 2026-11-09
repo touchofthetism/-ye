@@ -1,19 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?><!--
-   Sample data extraction rules file; uncomment and customize as necessary.
+   Backup and device-transfer rules for devices running API 31+.
    See https://developer.android.com/about/versions/12/backup-restore#xml-changes
-   for details.
+
+   The on-device telemetry vault (calibration matrices, blink thresholds, session telemetry,
+   custom AAC phrases) is promised to stay on this device, so it is excluded from both cloud
+   backup and device-to-device transfer. A calibration is also specific to this device's camera
+   and screen geometry. The Firestore offline cache re-syncs from the server after sign-in.
 -->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <exclude domain="sharedpref" path="oculagaze_local_vault.xml" />
+        <exclude domain="database" path="." />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <exclude domain="sharedpref" path="oculagaze_local_vault.xml" />
+        <exclude domain="database" path="." />
     </device-transfer>
-    -->
 </data-extraction-rules>
