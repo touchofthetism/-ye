@@ -313,3 +313,51 @@ data class InteractionSettings(
     val neutralBrowRatio: Float = 0.34f,
     val raisedBrowRatio: Float = 0.42f
 )
+
+/**
+ * The derived result of one face & eye enrollment scan (domain EnrollmentScanEngine), kept per account in
+ * the on-device vault (LocalTelemetryStore.saveEnrollmentBaseline) so the personalized blink and brow
+ * thresholds survive restarts.
+ *
+ * Derived numbers only: eyelid-openness levels, blink timings, brow ratios and the thresholds computed from
+ * them. No image, frame or landmark data is ever part of it. It is stored on this device only and is never
+ * synced to Firestore or any other remote store; wiping the vault (LocalTelemetryStore.clearAllLocalData)
+ * removes it.
+ *
+ * - openEyeLevel / closedEyeLevel: median [GazeFeatureVector.combinedEyeOpenProb] with the eyes open
+ *   (blink frames excluded) and held closed; leftOpenLevel / rightOpenLevel: the per-eye open medians.
+ * - baselineEyeDistancePx: median [GazeFeatureVector.eyeDistancePx] during the scan, in the same reference
+ *   pixels as [CalibrationProfile.baselineEyeDistancePx].
+ * - neutralBrowRatio / raisedBrowRatio: median [GazeFeatureVector.browToEyeRatio] at rest and the 75th
+ *   percentile while raised; raisedBrowRatio is null when the brow step was skipped or timed out.
+ * - naturalBlinkCount / naturalBlinkMedianMs / naturalBlinkP95Ms: natural blinks seen during the eyes-open
+ *   step and their durations.
+ * - closeBlinkThreshold / openBlinkThreshold / intentionalBlinkMinMs: the personalized detector settings
+ *   derived from the levels above (or the app defaults when the measured range was too small, see
+ *   [warnings]). The store returns them as saved; callers apply their own setter ranges when restoring them.
+ * - meanAmbientLuma / meanEyeConfidence / frameCount: conditions the scan ran under.
+ * - warnings: EnrollmentWarning names raised during the scan (LOW_LIGHT, GLARE, SINGLE_EYE,
+ *   FEW_NATURAL_BLINKS, EYE_RANGE_SMALL_DEFAULTS_USED, BROW_SKIPPED).
+ */
+data class EnrollmentBaseline(
+    val version: Int = 1,
+    val capturedAtMs: Long = 0L,
+    val deviceModel: String = "",
+    val openEyeLevel: Float,
+    val closedEyeLevel: Float,
+    val leftOpenLevel: Float,
+    val rightOpenLevel: Float,
+    val baselineEyeDistancePx: Double,
+    val neutralBrowRatio: Float,
+    val raisedBrowRatio: Float?,
+    val naturalBlinkCount: Int,
+    val naturalBlinkMedianMs: Long,
+    val naturalBlinkP95Ms: Long,
+    val closeBlinkThreshold: Float,
+    val openBlinkThreshold: Float,
+    val intentionalBlinkMinMs: Long,
+    val meanAmbientLuma: Int,
+    val meanEyeConfidence: Float,
+    val frameCount: Int,
+    val warnings: List<String> = emptyList()
+)
