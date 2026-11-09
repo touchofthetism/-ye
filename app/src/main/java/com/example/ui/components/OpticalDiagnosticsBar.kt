@@ -12,6 +12,8 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -182,7 +184,9 @@ fun OpticalDiagnosticsBar(
                                 ),
                                 style = MaterialTheme.typography.labelMedium,
                                 fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onSurface
+                                color = MaterialTheme.colorScheme.onSurface,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                             Text(
                                 text = "${hudState.resolutionTier.targetWidth}×${hudState.resolutionTier.targetHeight}",
@@ -232,7 +236,12 @@ fun OpticalDiagnosticsBar(
 
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    // The chips must never starve the status text: cap them to the trailing portion of the
+                    // header and scroll horizontally when the font scale or screen width is small.
+                    modifier = Modifier
+                        .weight(1.1f, fill = false)
+                        .horizontalScroll(rememberScrollState())
                 ) {
                     FilterChip(
                         selected = expandCameraPreview,
