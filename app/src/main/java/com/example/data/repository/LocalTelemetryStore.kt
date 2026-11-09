@@ -2,6 +2,7 @@ package com.example.data.repository
 
 import android.content.Context
 import android.content.SharedPreferences
+import androidx.core.content.edit
 import com.example.data.model.AacActionTile
 import com.example.data.model.CalibrationProfile
 import com.example.data.model.DEFAULT_AFFINE_MATRIX_2X6
@@ -468,7 +469,7 @@ class LocalTelemetryStore(context: Context) {
             put("frameCount", baseline.frameCount)
             put("warnings", JSONArray(baseline.warnings))
         }
-        prefs.edit().putString("${KEY_ENROLLMENT_BASELINE_PREFIX}_$userId", obj.toString()).apply()
+        prefs.edit { putString("${KEY_ENROLLMENT_BASELINE_PREFIX}_$userId", obj.toString()) }
     }
 
     /**
@@ -516,7 +517,7 @@ class LocalTelemetryStore(context: Context) {
 
     /** Removes [userId]'s enrollment baseline; the detectors then fall back to their defaults. */
     fun clearEnrollmentBaseline(userId: String) {
-        prefs.edit().remove("${KEY_ENROLLMENT_BASELINE_PREFIX}_$userId").apply()
+        prefs.edit { remove("${KEY_ENROLLMENT_BASELINE_PREFIX}_$userId") }
     }
 
     private fun JSONObject.putIfFinite(key: String, value: Float) {

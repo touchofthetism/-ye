@@ -565,6 +565,40 @@ class VmEnrollmentTest {
     }
 
     @Test
+    fun `deleting the active profile falls back to the enrolled blink settings, not the app defaults`() {
+        val store = LocalTelemetryStore(context)
+        val user = freshUser()
+        val seeded = seededBaseline() // close 0.30, minimum 400 ms
+        store.saveEnrollmentBaseline(user, seeded)
+        store.saveLocalProfile(
+            user,
+            CalibrationProfile(id = "local_cal_gone", userId = user, name = "Gone", intentionalBlinkMinMs = 500L)
+        )
+        val vm = newVm(user, store)
+        assertEquals("local_cal_gone", vm.liveHudState.value.activeProfileId)
+
+        vm.deleteCalibrationProfile("local_cal_gone")
+        assertNull(vm.liveHudState.value.activeProfileId)
+        // The enrollment is still applied: layering is defaults < enrollment < profile
+        assertEquals(seeded, vm.enrollmentBaseline.value)
+        assertEquals(seeded.capturedAtMs, vm.liveHudState.value.enrolledAtMs)
+        var t = openFrames(vm, 1_000_000L, 4)
+        // 396 ms closure: natural under the enrolled 400 ms minimum (a command blink at the default 350)
+        t = closure(vm, t, 370L, 0.10f)
+        var hud = vm.liveHudState.value
+        assertEquals(0, hud.intentionalBlinkCount)
+        assertEquals(1, hud.naturalBlinkCount)
+        // Enrolled close 0.30: a dip to 0.35 is not a closure (it is with the default 0.45)
+        t = closure(vm, t, 450L, 0.35f)
+        assertEquals(0, vm.liveHudState.value.intentionalBlinkCount)
+        // 462 ms closure to 0.10: a command blink under the enrolled 400 ms (natural under the profile's 500)
+        closure(vm, t, 440L, 0.10f)
+        hud = vm.liveHudState.value
+        assertEquals(1, hud.intentionalBlinkCount)
+        assertEquals(1, hud.naturalBlinkCount)
+    }
+
+    @Test
     fun `an active profile's stored blink settings are layered over the enrollment at launch`() {
         val store = LocalTelemetryStore(context)
         val user = freshUser()

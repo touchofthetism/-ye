@@ -1450,20 +1450,8 @@ class EyeTrackingViewModel(
      */
     fun clearEnrollmentBaseline() {
         localStore?.clearEnrollmentBaseline(currentUserId)
-        _enrollmentBaseline.value = null
-        if (!isEnrollmentScanActive()) {
-            // The last scan's summary or failure must not stay on screen as if it still applied
-            enrollmentEngine.reset()
-            _enrollmentState.value = EnrollmentScanState()
-        }
         val profile = appliedProfile
-        if (profile != null) {
-            applyProfileBlinkSettings(profile)
-        } else {
-            applyBlinkSettings(DEFAULT_CLOSE_BLINK_THRESHOLD, DEFAULT_OPEN_BLINK_THRESHOLD, DEFAULT_INTENTIONAL_BLINK_MIN_MS)
-        }
-        resetBrowDetectorToDefaults()
-        _liveHudState.update { it.copy(enrolledAtMs = null) }
+        forgetEnrollmentBaselineInMemory()
         persistInteractionSettings()
         _statusBannerMessage.value = if (profile != null) {
             "Enrollment cleared — brow detection back to the app defaults; blink settings of profile \"${profile.name}\" kept."
@@ -1589,12 +1577,23 @@ class EyeTrackingViewModel(
         }
     }
 
-    /** Drops the in-memory enrollment after the vault was wiped: brow defaults, no enrolled-at time. */
+    /**
+     * Drops the in-memory enrollment (after a clear or a vault wipe): the blink detector goes back to the
+     * applied profile's stored settings when a profile is active, else to the app defaults; the brow
+     * detector to the defaults; no enrolled-at time. A running scan is left alone (it saves a fresh
+     * baseline on completion), otherwise the last scan's summary or failure leaves the screen too.
+     */
     private fun forgetEnrollmentBaselineInMemory() {
         _enrollmentBaseline.value = null
         if (!isEnrollmentScanActive()) {
             enrollmentEngine.reset()
             _enrollmentState.value = EnrollmentScanState()
+        }
+        val profile = appliedProfile
+        if (profile != null) {
+            applyProfileBlinkSettings(profile)
+        } else {
+            applyBlinkSettings(DEFAULT_CLOSE_BLINK_THRESHOLD, DEFAULT_OPEN_BLINK_THRESHOLD, DEFAULT_INTENTIONAL_BLINK_MIN_MS)
         }
         resetBrowDetectorToDefaults()
         _liveHudState.update { it.copy(enrolledAtMs = null) }
@@ -2159,6 +2158,10 @@ class EyeTrackingViewModel(
         blinkDetector.closeThreshold = DEFAULT_CLOSE_BLINK_THRESHOLD
         blinkDetector.openThreshold = DEFAULT_OPEN_BLINK_THRESHOLD
         blinkDetector.intentionalMinMs = DEFAULT_INTENTIONAL_BLINK_MIN_MS
+        // Layering without a profile: the account's enrollment (when applied) still personalizes blinks
+        _enrollmentBaseline.value?.let {
+            applyBlinkSettings(it.closeBlinkThreshold, it.openBlinkThreshold, it.intentionalBlinkMinMs)
+        }
         recenterDeadlineMs = 0L
         recenterSamples.clear()
         resetScreenFilters()
