@@ -11,6 +11,7 @@ import com.example.data.model.BlinkClassificationEvent
 import com.example.data.model.BlinkType
 import com.example.data.model.CalibrationProfile
 import com.example.data.model.DEFAULT_AFFINE_MATRIX_2X6
+import com.example.data.model.EnrollmentBaseline
 import com.example.data.model.FixationClusterPoint
 import com.example.data.model.GazeFeatureVector
 import com.example.data.model.GazePostureProfile
@@ -24,6 +25,11 @@ import com.example.data.repository.EyeTrackingRepository
 import com.example.data.repository.LocalTelemetryStore
 import com.example.domain.BenchmarkScorecard
 import com.example.domain.BlinkHysteresisDetector
+import com.example.domain.EnrollmentFailure
+import com.example.domain.EnrollmentPhase
+import com.example.domain.EnrollmentScanEngine
+import com.example.domain.EnrollmentScanState
+import com.example.domain.EnrollmentWarning
 import com.example.domain.GazeCalibrationMath
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -134,7 +140,10 @@ data class LiveGazeHudState(
     val backgroundRecalibrationCount: Int = 0,
     val lastBenchmarkReport: com.example.domain.BenchmarkScorecard? = null,
     val isBenchmarkRunning: Boolean = false,
-    val lastTriggeredSpeech: String = "Fixate on any tile and raise brows (400ms), command-blink (350–800ms), or dwell to speak."
+    val lastTriggeredSpeech: String = "Fixate on any tile and raise brows (400ms), command-blink (350–800ms), or dwell to speak.",
+    // When this account's face & eye enrollment baseline was captured (EnrollmentBaseline.capturedAtMs);
+    // null while no enrollment is applied, so the blink/brow detectors run on the app defaults or a profile.
+    val enrolledAtMs: Long? = null
 )
 
 data class AttentionSessionLiveState(
@@ -312,6 +321,20 @@ class EyeTrackingViewModel(
         holdTargetMs = 400L
     )
 
+    // Face & eye enrollment scan (domain state machine) and the baseline it produced for this account.
+    // The baseline holds derived numbers only (no images) and lives in the on-device vault; it is never
+    // synced. While the engine is idle the per-frame pipeline does not touch it.
+    private val enrollmentEngine = EnrollmentScanEngine(
+        deviceModel = Build.MODEL?.takeIf { it.isNotBlank() } ?: "Pixel 10 Pro XL"
+    )
+    private val _enrollmentState = MutableStateFlow(EnrollmentScanState())
+    val enrollmentState: StateFlow<EnrollmentScanState> = _enrollmentState.asStateFlow()
+    private val _enrollmentBaseline = MutableStateFlow(localStore?.loadEnrollmentBaseline(currentUserId))
+    val enrollmentBaseline: StateFlow<EnrollmentBaseline?> = _enrollmentBaseline.asStateFlow()
+    // The profile currently applied to the engine (null = default matrix), so clearing the enrollment can
+    // put that profile's stored blink settings back instead of the app defaults.
+    private var appliedProfile: CalibrationProfile? = null
+
     // Speed-adaptive One Euro Filter and closed-form Kalman Filter for screen-space gaze reticle.
     // Screen coordinates are normalized [0,1] (saccades ~1-10 units/s), so beta must be of order 1 for the
     // 1€ cutoff to rise during saccades (beta 0.04 behaved as a fixed ~1 Hz low-pass, ~460 ms to 90%).
@@ -424,6 +447,10 @@ class EyeTrackingViewModel(
     )
 
     init {
+        // Layering at launch: the enrollment baseline personalizes the detectors first; the saved interaction
+        // settings (which mirror the enrolled brow ratios, or a later manual brow calibration) and then the
+        // active profile's stored blink settings are applied on top of it.
+        _enrollmentBaseline.value?.let { applyEnrollmentBaselineToDetectors(it) }
         restoreInteractionSettings()
         val localProfiles = _localProfilesFlow.value
         val localInitial = localProfiles.firstOrNull { it.id == selectedProfileId }
@@ -747,6 +774,9 @@ class EyeTrackingViewModel(
     ) {
         val now = feature.timestampMs
         val simulatedFrame = synthetic || feature.isSimulated || onEmulator
+        // While the enrollment scan runs, gaze may not activate tiles (the person is following the scan's
+        // instructions, not choosing a tile); the blink and brow counters keep working.
+        val enrollmentActive = isEnrollmentScanActive()
         lastFrameWallClockMs = System.currentTimeMillis()
         ensureFrameWatchdog()
         // Gap since the previous frame (-1 when unknown, e.g. first frame or after the stale-frame watchdog)
@@ -928,10 +958,14 @@ class EyeTrackingViewModel(
         if (browFired) {
             browCount++
             val holdMs = browDetector.holdTargetMs
-            blinkLabel = when (fireFocusedTileByGesture("Brow Raise", now)) {
-                GestureTriggerOutcome.FIRED -> "Brow-Raise Trigger ($holdMs ms hold) — tile triggered!"
-                GestureTriggerOutcome.SUPPRESSED_REPEAT -> "Brow raise ($holdMs ms hold) — repeat on the same tile suppressed"
-                GestureTriggerOutcome.NO_TILE -> "Brow raise ($holdMs ms hold) — no tile focused"
+            blinkLabel = if (enrollmentActive) {
+                "Brow raise ($holdMs ms hold) — ignored during the enrollment scan"
+            } else {
+                when (fireFocusedTileByGesture("Brow Raise", now)) {
+                    GestureTriggerOutcome.FIRED -> "Brow-Raise Trigger ($holdMs ms hold) — tile triggered!"
+                    GestureTriggerOutcome.SUPPRESSED_REPEAT -> "Brow raise ($holdMs ms hold) — repeat on the same tile suppressed"
+                    GestureTriggerOutcome.NO_TILE -> "Brow raise ($holdMs ms hold) — no tile focused"
+                }
             }
         }
 
@@ -950,10 +984,14 @@ class EyeTrackingViewModel(
                         if (_attentionState.value.isRecording) {
                             _attentionState.update { it.copy(sessionIntentionalBlinks = it.sessionIntentionalBlinks + 1) }
                         }
-                        blinkLabel = when (triggerFocusedTileByCommandBlink(now)) {
-                            GestureTriggerOutcome.FIRED -> "Command blink (${blinkEvent.durationMs} ms) — tile triggered!"
-                            GestureTriggerOutcome.SUPPRESSED_REPEAT -> "Command blink (${blinkEvent.durationMs} ms) — repeat on the same tile suppressed"
-                            GestureTriggerOutcome.NO_TILE -> "Command blink (${blinkEvent.durationMs} ms) — no tile focused"
+                        blinkLabel = if (enrollmentActive) {
+                            "Command blink (${blinkEvent.durationMs} ms) — ignored during the enrollment scan"
+                        } else {
+                            when (triggerFocusedTileByCommandBlink(now)) {
+                                GestureTriggerOutcome.FIRED -> "Command blink (${blinkEvent.durationMs} ms) — tile triggered!"
+                                GestureTriggerOutcome.SUPPRESSED_REPEAT -> "Command blink (${blinkEvent.durationMs} ms) — repeat on the same tile suppressed"
+                                GestureTriggerOutcome.NO_TILE -> "Command blink (${blinkEvent.durationMs} ms) — no tile focused"
+                            }
                         }
                     } else {
                         blinkLabel = "Command blink (${blinkEvent.durationMs} ms) — disabled in ${mode.label}"
@@ -983,7 +1021,8 @@ class EyeTrackingViewModel(
             (edgePinnedDurationMs - dtMs / 2).coerceAtLeast(0L)
         }
 
-        val dwellProgress = updateTileHoverDwell(now, dtMs, gazeValid, rawGapMs)
+        // During the scan the hover counts as not looked at: dwell pauses, then resets, and cannot fire
+        val dwellProgress = updateTileHoverDwell(now, dtMs, gazeValid && !enrollmentActive, rawGapMs)
         // Evaluated after dwell so a dwell-fired 'Recenter Gaze' reset is respected in the same frame
         val showNudge = edgePinnedDurationMs >= 4000L
         val updatedTrail = if (prev.overlayVisualMode == com.example.data.model.GazeOverlayVisualMode.RETICLE_ONLY) {
@@ -1019,6 +1058,9 @@ class EyeTrackingViewModel(
                 focusedTileDwellProgress = dwellProgress
             )
         }
+
+        // The enrollment scan sees every frame (a no-face frame pauses its collection); a no-op while idle
+        advanceEnrollmentIfActive(feature, now, simulatedFrame)
 
         if (feature.faceDetected) {
             // A ticker repeat of a stale simulator vector must not auto-fill the next calibration target
@@ -1360,6 +1402,245 @@ class EyeTrackingViewModel(
         blinkDetector.closeThreshold = clampedClose
     }
 
+    // --- Face & Eye Enrollment Scan (~15 s, personalizes blink and brow detection) ---
+
+    /**
+     * Starts the enrollment scan on the live front camera. Refused (with a banner, nothing else changes)
+     * while the simulator proxy or an emulator supplies the frames, since synthetic frames are not
+     * measurements, and while the calibration wizard is collecting targets (both own the fixation overlay).
+     */
+    fun startEnrollmentScan() {
+        if (_liveHudState.value.isSimulatorProxyEnabled || onEmulator) {
+            _statusBannerMessage.value = if (onEmulator) {
+                "Enrollment needs the live front camera — it is not available on an emulator (simulated frames are not measurements)."
+            } else {
+                "Enrollment needs the live front camera — turn the simulator proxy off and try again (simulated frames are not measurements)."
+            }
+            return
+        }
+        val step = _calibrationState.value.step
+        if (step == CalibrationFlowStep.FIT_5_POINTS || step == CalibrationFlowStep.VALIDATE_4_POINTS) {
+            _statusBannerMessage.value = "Finish or cancel the running calibration before starting the enrollment scan."
+            return
+        }
+        // Same clock as the frames that will drive the scan (camera frames carry wall-clock timestamps)
+        val now = if (lastFrameTimestampMs > 0L) lastFrameTimestampMs else System.currentTimeMillis()
+        _enrollmentState.value = enrollmentEngine.start(now)
+        _statusBannerMessage.value =
+            "Enrollment scan started — face the front camera and follow the on-screen guidance (about 15 seconds)."
+    }
+
+    /** Cancels a running scan (FAILED / CANCELLED); the detectors keep their current settings. */
+    fun cancelEnrollmentScan() {
+        abortEnrollmentScan("Enrollment scan cancelled — blink and brow detection are unchanged.")
+    }
+
+    /** In the brow step only: completes the scan without a raised-brow measurement (BROW_SKIPPED). */
+    fun skipEnrollmentBrowStep() {
+        if (enrollmentEngine.state.phase != EnrollmentPhase.BROW_RAISE) return
+        val next = enrollmentEngine.skipBrowStep()
+        _enrollmentState.value = next
+        handleEnrollmentTransition(next)
+    }
+
+    /**
+     * Forgets this account's enrollment: the baseline leaves the vault, the brow detector goes back to the
+     * app defaults, and the blink detector to the active profile's stored settings when a profile is
+     * applied, else to the app defaults. A running scan is left alone (it saves a fresh baseline on completion).
+     */
+    fun clearEnrollmentBaseline() {
+        localStore?.clearEnrollmentBaseline(currentUserId)
+        val profile = appliedProfile
+        forgetEnrollmentBaselineInMemory()
+        persistInteractionSettings()
+        _statusBannerMessage.value = if (profile != null) {
+            "Enrollment cleared — brow detection back to the app defaults; blink settings of profile \"${profile.name}\" kept."
+        } else {
+            "Enrollment cleared — blink and brow detection back to the app defaults."
+        }
+    }
+
+    private fun isEnrollmentScanActive(): Boolean {
+        val phase = enrollmentEngine.state.phase
+        return phase != EnrollmentPhase.IDLE && phase != EnrollmentPhase.COMPLETE && phase != EnrollmentPhase.FAILED
+    }
+
+    /** Cancels an active scan with [banner]; false (and no banner) when no scan is running. */
+    private fun abortEnrollmentScan(banner: String): Boolean {
+        if (!isEnrollmentScanActive()) return false
+        _enrollmentState.value = enrollmentEngine.cancel()
+        _statusBannerMessage.value = banner
+        return true
+    }
+
+    /**
+     * Feeds one frame (face or no-face) to the running scan. A no-op unless the engine is in an active
+     * phase, so the idle per-frame pipeline is unchanged. Frames synthesized by the simulator / emulator
+     * ticker reach the engine flagged as simulated even when the vector itself was not, so the scan fails
+     * (SIMULATED_FRAMES) instead of enrolling made-up measurements.
+     */
+    private fun advanceEnrollmentIfActive(feature: GazeFeatureVector, nowMs: Long, simulatedFrame: Boolean) {
+        if (!isEnrollmentScanActive()) return
+        val frame = if (simulatedFrame && !feature.isSimulated) feature.copy(isSimulated = true) else feature
+        val next = enrollmentEngine.onFrame(frame, nowMs)
+        _enrollmentState.value = next
+        handleEnrollmentTransition(next)
+    }
+
+    private fun handleEnrollmentTransition(next: EnrollmentScanState) {
+        when (next.phase) {
+            EnrollmentPhase.COMPLETE -> {
+                val result = next.result
+                if (result != null) {
+                    onEnrollmentCompleted(result)
+                } else {
+                    _statusBannerMessage.value = "Enrollment ended without a measurable result — nothing was changed."
+                }
+            }
+            EnrollmentPhase.FAILED -> onEnrollmentFailed(next.failure)
+            else -> Unit
+        }
+    }
+
+    /**
+     * COMPLETE: the derived numbers are saved to the on-device vault (never synced), published, and applied
+     * to the detectors through the same range-checked paths as a stored profile; the brow ratios are
+     * mirrored into the HUD and the saved interaction settings like a manual brow calibration.
+     */
+    private fun onEnrollmentCompleted(result: EnrollmentBaseline) {
+        val baseline = result.copy(
+            capturedAtMs = if (result.capturedAtMs > 0L) result.capturedAtMs else System.currentTimeMillis(),
+            deviceModel = result.deviceModel.ifBlank { Build.MODEL?.takeIf { it.isNotBlank() } ?: "Pixel 10 Pro XL" }
+        )
+        localStore?.saveEnrollmentBaseline(currentUserId, baseline)
+        _enrollmentBaseline.value = baseline
+        applyEnrollmentBaselineToDetectors(baseline)
+        persistInteractionSettings()
+        _statusBannerMessage.value = buildEnrollmentCompleteBanner(baseline)
+    }
+
+    /** FAILED: report why; the detectors keep whatever they had. */
+    private fun onEnrollmentFailed(failure: EnrollmentFailure?) {
+        _statusBannerMessage.value = when (failure) {
+            EnrollmentFailure.POSITIONING_TIMEOUT ->
+                "Enrollment failed: your face could not be positioned in time — centre it in the frame, in good light, and try again."
+            EnrollmentFailure.FACE_LOST ->
+                "Enrollment failed: the face was lost too often — keep facing the camera and hold still, then try again."
+            EnrollmentFailure.EYES_DID_NOT_CLOSE ->
+                "Enrollment failed: eye closure was not detected — close both eyes fully when asked and try again."
+            EnrollmentFailure.EYES_DID_NOT_REOPEN ->
+                "Enrollment failed: the eyes did not reopen in time — try again."
+            EnrollmentFailure.SIMULATED_FRAMES ->
+                "Enrollment refused: simulated frames are not measurements — it needs the live front camera."
+            EnrollmentFailure.CANCELLED ->
+                "Enrollment scan cancelled — blink and brow detection are unchanged."
+            null -> "Enrollment failed — blink and brow detection are unchanged."
+        }
+    }
+
+    /**
+     * Applies [baseline] to the detectors: the blink thresholds and command minimum through the same
+     * range-checked path as a stored profile ([applyBlinkSettings]); the brow ratios only when the measured
+     * neutral ratio is one a face can produce (same window as [restoreInteractionSettings]), with the
+     * measured raised ratio when it is a real raise above it, else max(current raised, neutral + separation).
+     * Mirrors the brow ratios and the capture time into the HUD.
+     */
+    private fun applyEnrollmentBaselineToDetectors(baseline: EnrollmentBaseline) {
+        applyBlinkSettings(baseline.closeBlinkThreshold, baseline.openBlinkThreshold, baseline.intentionalBlinkMinMs)
+        val neutral = baseline.neutralBrowRatio
+        val browValid = neutral.isFinite() && neutral in 0.20f..0.52f
+        if (browValid) {
+            val measuredRaised = baseline.raisedBrowRatio?.takeIf {
+                it.isFinite() && it in 0.24f..0.62f && it >= neutral + MIN_BROW_RAISE_SEPARATION
+            }
+            browDetector.neutralBrowRatio = neutral
+            browDetector.raisedBrowRatio = measuredRaised
+                ?: maxOf(browDetector.raisedBrowRatio, neutral + MIN_BROW_RAISE_SEPARATION)
+        }
+        _liveHudState.update {
+            it.copy(
+                neutralBrowRatio = if (browValid) browDetector.neutralBrowRatio else it.neutralBrowRatio,
+                raisedBrowRatio = if (browValid) browDetector.raisedBrowRatio else it.raisedBrowRatio,
+                enrolledAtMs = baseline.capturedAtMs
+            )
+        }
+    }
+
+    /** Brow detector back to the app defaults (0.34 / 0.42), mirrored into the HUD. */
+    private fun resetBrowDetectorToDefaults() {
+        val defaults = LiveGazeHudState()
+        browDetector.neutralBrowRatio = defaults.neutralBrowRatio
+        browDetector.raisedBrowRatio = defaults.raisedBrowRatio
+        browDetector.cancelPendingRaise()
+        _liveHudState.update {
+            it.copy(neutralBrowRatio = defaults.neutralBrowRatio, raisedBrowRatio = defaults.raisedBrowRatio)
+        }
+    }
+
+    /**
+     * Drops the in-memory enrollment (after a clear or a vault wipe): the blink detector goes back to the
+     * applied profile's stored settings when a profile is active, else to the app defaults; the brow
+     * detector to the defaults; no enrolled-at time. A running scan is left alone (it saves a fresh
+     * baseline on completion), otherwise the last scan's summary or failure leaves the screen too.
+     */
+    private fun forgetEnrollmentBaselineInMemory() {
+        _enrollmentBaseline.value = null
+        if (!isEnrollmentScanActive()) {
+            enrollmentEngine.reset()
+            _enrollmentState.value = EnrollmentScanState()
+        }
+        val profile = appliedProfile
+        if (profile != null) {
+            applyProfileBlinkSettings(profile)
+        } else {
+            applyBlinkSettings(DEFAULT_CLOSE_BLINK_THRESHOLD, DEFAULT_OPEN_BLINK_THRESHOLD, DEFAULT_INTENTIONAL_BLINK_MIN_MS)
+        }
+        resetBrowDetectorToDefaults()
+        _liveHudState.update { it.copy(enrolledAtMs = null) }
+    }
+
+    /** Banner with the measured levels and the detector settings now in force (Locale.US numbers). */
+    private fun buildEnrollmentCompleteBanner(baseline: EnrollmentBaseline): String {
+        val raisedLabel = if (baseline.raisedBrowRatio != null) {
+            String.format(Locale.US, "%.3f", browDetector.raisedBrowRatio)
+        } else {
+            "not measured (brow step skipped)"
+        }
+        val warningsSuffix = if (baseline.warnings.isEmpty()) {
+            ""
+        } else {
+            " Warnings: " + baseline.warnings.joinToString(", ") { enrollmentWarningLabel(it) } + "."
+        }
+        return String.format(
+            Locale.US,
+            "Enrollment complete: eyes open %.2f / closed %.2f → blink close < %.2f, re-open > %.2f, command blink ≥ %d ms; " +
+                "brow neutral %.3f → raised %s; %d natural blink(s), median %d ms, over %d frames.%s",
+            baseline.openEyeLevel,
+            baseline.closedEyeLevel,
+            blinkDetector.closeThreshold,
+            blinkDetector.openThreshold,
+            blinkDetector.intentionalMinMs,
+            browDetector.neutralBrowRatio,
+            raisedLabel,
+            baseline.naturalBlinkCount,
+            baseline.naturalBlinkMedianMs,
+            baseline.frameCount,
+            warningsSuffix
+        )
+    }
+
+    /** Plain words for a stored EnrollmentWarning name (unknown names are shown as saved). */
+    private fun enrollmentWarningLabel(name: String): String =
+        when (EnrollmentWarning.entries.firstOrNull { it.name == name }) {
+            EnrollmentWarning.LOW_LIGHT -> "low light"
+            EnrollmentWarning.GLARE -> "glare"
+            EnrollmentWarning.SINGLE_EYE -> "single-eye tracking"
+            EnrollmentWarning.FEW_NATURAL_BLINKS -> "fewer than 2 natural blinks seen (default command minimum)"
+            EnrollmentWarning.EYE_RANGE_SMALL_DEFAULTS_USED -> "small open/closed range (default blink thresholds used)"
+            EnrollmentWarning.BROW_SKIPPED -> "brow step skipped"
+            null -> name.lowercase(Locale.US).replace('_', ' ')
+        }
+
     // --- 5-Point Calibration + Optional 4-Point Held-Out Validation State Machine ---
 
     fun setIncludeHeldOutValidation(includeValidation: Boolean) {
@@ -1369,6 +1650,8 @@ class EyeTrackingViewModel(
     fun startCalibrationAndValidationWizard(
         includeValidation: Boolean = _calibrationState.value.includeHeldOutValidation
     ) {
+        // The scan and the wizard both own the full-screen fixation overlay; calibration takes over
+        abortEnrollmentScan("Enrollment scan cancelled: calibration started. Blink and brow detection are unchanged.")
         // Retry over an unsaved candidate fit: put the pre-wizard engine back first
         val snapshot = preWizardSnapshot
         if (snapshot == null) {
@@ -1797,6 +2080,7 @@ class EyeTrackingViewModel(
         calibrationPosture = meta?.calibrationPosture ?: profile.calibrationPostureProfile()
         appliedProfileKey = profileKey(profile)
         activeProfileId = profile.id
+        appliedProfile = profile
         recenterDeadlineMs = 0L
         recenterSamples.clear()
         // The previous mapping's smoothed state must not blend into the new one
@@ -1820,25 +2104,39 @@ class EyeTrackingViewModel(
     }
 
     /**
-     * Profiles can come from the cloud or from older clients, so their blink settings are checked before use:
-     * the thresholds only as a consistent Schmitt pair (re-open at least [MIN_BLINK_HYSTERESIS_GAP] above
-     * close), the command minimum only below the command maximum. Otherwise the engine defaults apply.
+     * Profiles can come from the cloud or from older clients, so their blink settings go through the
+     * range-checked [applyBlinkSettings] (the detector stores Float thresholds, so the stored Doubles are
+     * converted first).
      */
     private fun applyProfileBlinkSettings(profile: CalibrationProfile) {
-        val close = profile.closeBlinkThreshold
-        val open = profile.openBlinkThreshold
-        val thresholdsValid = close.isFinite() && open.isFinite() &&
-            close in MIN_CLOSE_BLINK_THRESHOLD..MAX_CLOSE_BLINK_THRESHOLD &&
-            open <= MAX_OPEN_BLINK_THRESHOLD &&
-            open >= close + MIN_BLINK_HYSTERESIS_GAP
+        applyBlinkSettings(
+            close = profile.closeBlinkThreshold.toFloat(),
+            open = profile.openBlinkThreshold.toFloat(),
+            minMs = profile.intentionalBlinkMinMs
+        )
+    }
+
+    /**
+     * Range-checked application of stored blink settings (a calibration profile's or the enrollment
+     * baseline's): the thresholds only as a consistent Schmitt pair (close within
+     * [MIN_CLOSE_BLINK_THRESHOLD, MAX_CLOSE_BLINK_THRESHOLD], re-open at most [MAX_OPEN_BLINK_THRESHOLD] and
+     * at least [MIN_BLINK_HYSTERESIS_GAP] above close), the command minimum only below the command maximum.
+     * Otherwise the engine defaults apply.
+     */
+    private fun applyBlinkSettings(close: Float, open: Float, minMs: Long) {
+        val closeD = close.toDouble()
+        val openD = open.toDouble()
+        val thresholdsValid = closeD.isFinite() && openD.isFinite() &&
+            closeD in MIN_CLOSE_BLINK_THRESHOLD..MAX_CLOSE_BLINK_THRESHOLD &&
+            openD <= MAX_OPEN_BLINK_THRESHOLD &&
+            openD >= closeD + MIN_BLINK_HYSTERESIS_GAP
         if (thresholdsValid) {
-            blinkDetector.closeThreshold = close.toFloat()
-            blinkDetector.openThreshold = open.toFloat()
+            blinkDetector.closeThreshold = close
+            blinkDetector.openThreshold = open
         } else {
             blinkDetector.closeThreshold = DEFAULT_CLOSE_BLINK_THRESHOLD
             blinkDetector.openThreshold = DEFAULT_OPEN_BLINK_THRESHOLD
         }
-        val minMs = profile.intentionalBlinkMinMs
         blinkDetector.intentionalMinMs = if (minMs < blinkDetector.maxCommandMs) {
             minMs.coerceIn(MIN_INTENTIONAL_BLINK_MS, MAX_INTENTIONAL_BLINK_MIN_MS)
         } else {
@@ -1850,6 +2148,7 @@ class EyeTrackingViewModel(
     private fun resetEngineToUncalibratedDefaults() {
         activeProfileId = null
         appliedProfileKey = null
+        appliedProfile = null
         selectedProfileId = null
         activeMatrix = DEFAULT_AFFINE_MATRIX_2X6
         calibratedMatrix = DEFAULT_AFFINE_MATRIX_2X6
@@ -1859,6 +2158,10 @@ class EyeTrackingViewModel(
         blinkDetector.closeThreshold = DEFAULT_CLOSE_BLINK_THRESHOLD
         blinkDetector.openThreshold = DEFAULT_OPEN_BLINK_THRESHOLD
         blinkDetector.intentionalMinMs = DEFAULT_INTENTIONAL_BLINK_MIN_MS
+        // Layering without a profile: the account's enrollment (when applied) still personalizes blinks
+        _enrollmentBaseline.value?.let {
+            applyBlinkSettings(it.closeBlinkThreshold, it.openBlinkThreshold, it.intentionalBlinkMinMs)
+        }
         recenterDeadlineMs = 0L
         recenterSamples.clear()
         resetScreenFilters()
@@ -2310,7 +2613,9 @@ class EyeTrackingViewModel(
             }
         }
         localStore?.clearAllLocalData(currentUserId)
-        // The vault wipe also removes custom AAC phrases, so the deck goes back to the defaults
+        // The vault wipe also removes the enrollment baseline and custom AAC phrases, so the brow detector
+        // and the deck go back to the defaults
+        forgetEnrollmentBaselineInMemory()
         _aacTilesState.value = defaultAacTiles
         _localProfilesFlow.value = emptyList()
         _localSessionsFlow.value = emptyList()

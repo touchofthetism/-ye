@@ -2,10 +2,12 @@ package com.example.data.repository
 
 import android.content.Context
 import android.content.SharedPreferences
+import androidx.core.content.edit
 import com.example.data.model.AacActionTile
 import com.example.data.model.CalibrationProfile
 import com.example.data.model.DEFAULT_AFFINE_MATRIX_2X6
 import com.example.data.model.DwellSpeedPreset
+import com.example.data.model.EnrollmentBaseline
 import com.example.data.model.GazeFilterMode
 import com.example.data.model.GazePostureProfile
 import com.example.data.model.GazeTriggerMode
@@ -13,6 +15,7 @@ import com.example.data.model.InteractionSettings
 import com.example.data.model.TrackingSession
 import com.google.firebase.Timestamp
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 import java.util.Date
 import java.util.concurrent.ConcurrentHashMap
@@ -28,6 +31,9 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * The local vault is bounded: it keeps the [MAX_LOCAL_PROFILES] most recent calibration profiles and the
  * [MAX_LOCAL_SESSIONS] most recent sessions, and saving beyond that evicts the oldest entry.
+ *
+ * Besides those lists it holds, per account, the interaction settings and the face & eye enrollment baseline
+ * ([saveEnrollmentBaseline]): derived numbers only, never images, and on-device only (no cloud copy).
  *
  * The profile and session lists are kept parsed in memory next to the exact string they were parsed from
  * (or written as), and each write encodes only the entries that changed. The stored JSON is the same as
@@ -369,8 +375,9 @@ class LocalTelemetryStore(context: Context) {
 
     /**
      * Wipes [userId]'s vault: calibration profiles, sessions, the recorded active profile id, the
-     * user-authored AAC phrase tiles (which can hold personal or medical text) and the interaction settings
-     * (which include brow ratios measured from the user's face).
+     * user-authored AAC phrase tiles (which can hold personal or medical text), the interaction settings
+     * (which include brow ratios measured from the user's face) and the enrollment baseline (eyelid, blink
+     * and brow measurements of the user's face).
      */
     fun clearAllLocalData(userId: String) {
         val profilesKey = "${KEY_PROFILES_PREFIX}_$userId"
@@ -381,6 +388,7 @@ class LocalTelemetryStore(context: Context) {
             .remove("${KEY_AAC_TILES_PREFIX}_$userId")
             .remove("${KEY_ACTIVE_PROFILE_ID_PREFIX}_$userId")
             .remove("${KEY_INTERACTION_SETTINGS_PREFIX}_$userId")
+            .remove("${KEY_ENROLLMENT_BASELINE_PREFIX}_$userId")
             .apply()
         profileSnapshots.remove(profilesKey)
         sessionSnapshots.remove(sessionsKey)
@@ -432,12 +440,105 @@ class LocalTelemetryStore(context: Context) {
         }
     }
 
+    /**
+     * Stores [userId]'s face & eye enrollment baseline as one JSON entry under
+     * `local_enrollment_baseline_<uid>`, replacing any earlier one. Derived numbers only (no images), kept in
+     * the on-device vault and never synced. Non-finite numbers are left out: a required one then makes the
+     * entry unreadable ([loadEnrollmentBaseline] returns null), a left-out raisedBrowRatio reads back null.
+     */
+    fun saveEnrollmentBaseline(userId: String, baseline: EnrollmentBaseline) {
+        val obj = JSONObject().apply {
+            put("version", baseline.version)
+            put("capturedAtMs", baseline.capturedAtMs)
+            put("deviceModel", baseline.deviceModel)
+            putIfFinite("openEyeLevel", baseline.openEyeLevel)
+            putIfFinite("closedEyeLevel", baseline.closedEyeLevel)
+            putIfFinite("leftOpenLevel", baseline.leftOpenLevel)
+            putIfFinite("rightOpenLevel", baseline.rightOpenLevel)
+            putIfFinite("baselineEyeDistancePx", baseline.baselineEyeDistancePx)
+            putIfFinite("neutralBrowRatio", baseline.neutralBrowRatio)
+            baseline.raisedBrowRatio?.let { putIfFinite("raisedBrowRatio", it) }
+            put("naturalBlinkCount", baseline.naturalBlinkCount)
+            put("naturalBlinkMedianMs", baseline.naturalBlinkMedianMs)
+            put("naturalBlinkP95Ms", baseline.naturalBlinkP95Ms)
+            putIfFinite("closeBlinkThreshold", baseline.closeBlinkThreshold)
+            putIfFinite("openBlinkThreshold", baseline.openBlinkThreshold)
+            put("intentionalBlinkMinMs", baseline.intentionalBlinkMinMs)
+            put("meanAmbientLuma", baseline.meanAmbientLuma)
+            putIfFinite("meanEyeConfidence", baseline.meanEyeConfidence)
+            put("frameCount", baseline.frameCount)
+            put("warnings", JSONArray(baseline.warnings))
+        }
+        prefs.edit { putString("${KEY_ENROLLMENT_BASELINE_PREFIX}_$userId", obj.toString()) }
+    }
+
+    /**
+     * [userId]'s saved enrollment baseline, or null when none was saved or the entry is unreadable: not JSON,
+     * or a field without a default in [EnrollmentBaseline] missing, non-numeric or non-finite. Fields with a
+     * default (version, capturedAtMs, deviceModel, warnings) read back as that default when missing, and a
+     * missing or non-finite raisedBrowRatio reads back null. Values are returned as saved, without range
+     * clamping; callers apply their own setter ranges when restoring them.
+     */
+    fun loadEnrollmentBaseline(userId: String): EnrollmentBaseline? {
+        val raw = prefs.getString("${KEY_ENROLLMENT_BASELINE_PREFIX}_$userId", null) ?: return null
+        return try {
+            val obj = JSONObject(raw)
+            val warningsArr = obj.optJSONArray("warnings")
+            EnrollmentBaseline(
+                version = obj.optInt("version", 1),
+                capturedAtMs = obj.optLong("capturedAtMs", 0L),
+                deviceModel = obj.optString("deviceModel", ""),
+                openEyeLevel = obj.requiredFiniteFloat("openEyeLevel"),
+                closedEyeLevel = obj.requiredFiniteFloat("closedEyeLevel"),
+                leftOpenLevel = obj.requiredFiniteFloat("leftOpenLevel"),
+                rightOpenLevel = obj.requiredFiniteFloat("rightOpenLevel"),
+                baselineEyeDistancePx = obj.requiredFiniteDouble("baselineEyeDistancePx"),
+                neutralBrowRatio = obj.requiredFiniteFloat("neutralBrowRatio"),
+                raisedBrowRatio = obj.optDouble("raisedBrowRatio", Double.NaN).takeIf { it.isFinite() }?.toFloat(),
+                naturalBlinkCount = obj.getInt("naturalBlinkCount"),
+                naturalBlinkMedianMs = obj.getLong("naturalBlinkMedianMs"),
+                naturalBlinkP95Ms = obj.getLong("naturalBlinkP95Ms"),
+                closeBlinkThreshold = obj.requiredFiniteFloat("closeBlinkThreshold"),
+                openBlinkThreshold = obj.requiredFiniteFloat("openBlinkThreshold"),
+                intentionalBlinkMinMs = obj.getLong("intentionalBlinkMinMs"),
+                meanAmbientLuma = obj.getInt("meanAmbientLuma"),
+                meanEyeConfidence = obj.requiredFiniteFloat("meanEyeConfidence"),
+                frameCount = obj.getInt("frameCount"),
+                warnings = if (warningsArr == null) {
+                    emptyList()
+                } else {
+                    List(warningsArr.length()) { idx -> warningsArr.optString(idx) }.filter { it.isNotBlank() }
+                }
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Removes [userId]'s enrollment baseline; the detectors then fall back to their defaults. */
+    fun clearEnrollmentBaseline(userId: String) {
+        prefs.edit { remove("${KEY_ENROLLMENT_BASELINE_PREFIX}_$userId") }
+    }
+
     private fun JSONObject.putIfFinite(key: String, value: Float) {
         if (value.isFinite()) put(key, value.toDouble())
     }
 
+    private fun JSONObject.putIfFinite(key: String, value: Double) {
+        if (value.isFinite()) put(key, value)
+    }
+
     private fun JSONObject.finiteFloat(key: String, fallback: Float): Float =
         optDouble(key, Double.NaN).takeIf { it.isFinite() }?.toFloat() ?: fallback
+
+    /** [key]'s number, which must be present and finite; otherwise a JSONException (the entry is unreadable). */
+    private fun JSONObject.requiredFiniteDouble(key: String): Double {
+        val value = getDouble(key)
+        if (!value.isFinite()) throw JSONException("Non-finite value for $key")
+        return value
+    }
+
+    private fun JSONObject.requiredFiniteFloat(key: String): Float = requiredFiniteDouble(key).toFloat()
 
     /** The entry of [entries] named by [key]'s string value (looked up once), else [fallback]. */
     private fun <E : Enum<E>> JSONObject.optEnum(key: String, entries: List<E>, fallback: E): E {
@@ -647,6 +748,12 @@ class LocalTelemetryStore(context: Context) {
         private const val KEY_AAC_TILES_PREFIX = "local_aac_tiles"
         private const val KEY_ACTIVE_PROFILE_ID_PREFIX = "local_active_profile_id"
         private const val KEY_INTERACTION_SETTINGS_PREFIX = "local_interaction_settings"
+
+        /**
+         * Per-user enrollment baseline, stored as `local_enrollment_baseline_<uid>`: the derived eyelid, blink
+         * and brow numbers of one enrollment scan (no images), on-device only, never synced.
+         */
+        private const val KEY_ENROLLMENT_BASELINE_PREFIX = "local_enrollment_baseline"
     }
 }
 

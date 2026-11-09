@@ -32,6 +32,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Face
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Save
@@ -70,8 +72,18 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.data.model.CalibrationTargetPoint
+import com.example.data.model.EnrollmentBaseline
 import com.example.data.model.GazeFeatureVector
+import com.example.domain.EnrollmentFailure
+import com.example.domain.EnrollmentPhase
+import com.example.domain.EnrollmentScanState
 import com.example.domain.GazeCalibrationMath
+import com.example.ui.components.enrollmentBaselineSummaryLines
+import com.example.ui.components.enrollmentCompleteSummary
+import com.example.ui.components.enrollmentFailureText
+import com.example.ui.components.enrollmentWarningLabelForName
+import com.example.ui.components.formatEnrollmentCapturedAt
+import com.example.ui.components.isEnrollmentScanPhaseActive
 import com.example.ui.viewmodel.CalibrationFlowStep
 import com.example.ui.viewmodel.CalibrationWizardState
 import com.example.ui.viewmodel.LiveGazeHudState
@@ -88,7 +100,11 @@ fun CalibrationStudioScreen(
     onSaveProfile: () -> Unit,
     onSnapSimulatorToCurrentTarget: (Float, Float) -> Unit,
     onToggleIncludeValidation: (Boolean) -> Unit = {},
-    onCaptureManualSamples: () -> Unit = {}
+    onCaptureManualSamples: () -> Unit = {},
+    enrollmentState: EnrollmentScanState = EnrollmentScanState(),
+    enrollmentBaseline: EnrollmentBaseline? = null,
+    onStartEnrollment: () -> Unit = {},
+    onClearEnrollment: () -> Unit = {}
 ) {
     // Leaving composition mid-wizard (tab switch, activity teardown) must end the run. Otherwise every
     // later camera frame is still recorded under a target that is no longer on screen, and the fit that
@@ -111,11 +127,19 @@ fun CalibrationStudioScreen(
 
     when (calibrationState.step) {
         CalibrationFlowStep.IDLE -> {
+            // Only the scan's phase and outcome reach the overview: a scanned frame changes neither, so the
+            // overview keeps skipping per frame while the scan runs (the overlay shows the live values).
             CalibrationIdleOverview(
                 includeHeldOutValidation = calibrationState.includeHeldOutValidation,
                 hudState = latestHudState,
                 onStartWizard = onStartWizard,
-                onToggleIncludeValidation = onToggleIncludeValidation
+                onToggleIncludeValidation = onToggleIncludeValidation,
+                enrollmentBaseline = enrollmentBaseline,
+                enrollmentPhase = enrollmentState.phase,
+                enrollmentResult = enrollmentState.result,
+                enrollmentFailure = enrollmentState.failure,
+                onStartEnrollment = onStartEnrollment,
+                onClearEnrollment = onClearEnrollment
             )
         }
         CalibrationFlowStep.FIT_5_POINTS,
@@ -144,7 +168,13 @@ private fun CalibrationIdleOverview(
     includeHeldOutValidation: Boolean,
     hudState: State<LiveGazeHudState>,
     onStartWizard: () -> Unit,
-    onToggleIncludeValidation: (Boolean) -> Unit
+    onToggleIncludeValidation: (Boolean) -> Unit,
+    enrollmentBaseline: EnrollmentBaseline? = null,
+    enrollmentPhase: EnrollmentPhase = EnrollmentPhase.IDLE,
+    enrollmentResult: EnrollmentBaseline? = null,
+    enrollmentFailure: EnrollmentFailure? = null,
+    onStartEnrollment: () -> Unit = {},
+    onClearEnrollment: () -> Unit = {}
 ) {
     Column(
         modifier = Modifier
@@ -153,6 +183,14 @@ private fun CalibrationIdleOverview(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
+        EnrollmentCard(
+            baseline = enrollmentBaseline,
+            scanPhase = enrollmentPhase,
+            scanResult = enrollmentResult,
+            scanFailure = enrollmentFailure,
+            onStartEnrollment = onStartEnrollment,
+            onClearEnrollment = onClearEnrollment
+        )
         CalibrationOverviewCardForHud(
             includeHeldOutValidation = includeHeldOutValidation,
             hudState = hudState,
@@ -376,6 +414,179 @@ private fun CalibrationOverviewCard(
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )
+            }
+        }
+    }
+}
+
+/**
+ * Face & eye enrollment card of the idle overview. Without a baseline it explains the ~15 s scan and
+ * offers to run it; with one it lists the measured numbers (never anything that was not measured) and
+ * offers a re-scan or a clear. The outcome of the scan that just ended (COMPLETE summary or FAILED reason)
+ * is shown until the next scan or a clear. The buttons are disabled while a scan is running: the overlay
+ * passes touches through, and a second start would restart the scan under the person's feet.
+ */
+@Composable
+private fun EnrollmentCard(
+    baseline: EnrollmentBaseline?,
+    scanPhase: EnrollmentPhase,
+    scanResult: EnrollmentBaseline?,
+    scanFailure: EnrollmentFailure?,
+    onStartEnrollment: () -> Unit,
+    onClearEnrollment: () -> Unit
+) {
+    val scanActive = isEnrollmentScanPhaseActive(scanPhase)
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("enrollment_card"),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Default.Face,
+                    contentDescription = ENROLLMENT_CARD_TITLE,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(24.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = ENROLLMENT_CARD_TITLE,
+                    style = MaterialTheme.typography.titleLarge,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+
+            val statusText = when {
+                scanActive -> "Scanning…"
+                baseline != null -> "Enrolled ${formatEnrollmentCapturedAt(baseline.capturedAtMs)}"
+                else -> ENROLLMENT_NOT_ENROLLED_TEXT
+            }
+            Text(
+                text = statusText,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = if (baseline != null) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.tertiary,
+                modifier = Modifier.testTag("enrollment_status_text")
+            )
+
+            // Outcome of the scan that just ended (the engine keeps it until the next start or a clear).
+            val outcomeText = when (scanPhase) {
+                EnrollmentPhase.COMPLETE -> (scanResult ?: baseline)?.let { enrollmentCompleteSummary(it) }
+                    ?: "Scan complete."
+                EnrollmentPhase.FAILED -> "Scan failed: ${enrollmentFailureText(scanFailure)}"
+                else -> null
+            }
+            if (outcomeText != null) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = outcomeText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (scanPhase == EnrollmentPhase.FAILED) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.secondary
+                    },
+                    modifier = Modifier.testTag("enrollment_outcome_text")
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+            if (baseline == null) {
+                Text(
+                    text = ENROLLMENT_EXPLANATION_TEXT,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.testTag("enrollment_explanation_text")
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                Button(
+                    onClick = onStartEnrollment,
+                    enabled = !scanActive,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp)
+                        .testTag("start_enrollment_button"),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Face,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(text = "Scan my face & eyes", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                }
+            } else {
+                // Formatted once per baseline, not on every recomposition of the overview.
+                val lines = remember(baseline) { enrollmentBaselineSummaryLines(baseline) }
+                for (line in lines) {
+                    Text(
+                        text = line,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 1.dp)
+                    )
+                }
+                if (baseline.warnings.isNotEmpty()) {
+                    val warningsText = remember(baseline) {
+                        "Warnings: " + baseline.warnings.joinToString(", ") { enrollmentWarningLabelForName(it) }
+                    }
+                    Text(
+                        text = warningsText,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.tertiary,
+                        modifier = Modifier
+                            .padding(vertical = 1.dp)
+                            .testTag("enrollment_warnings_text")
+                    )
+                }
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = ENROLLMENT_PRIVACY_TEXT,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Button(
+                        onClick = onStartEnrollment,
+                        enabled = !scanActive,
+                        modifier = Modifier
+                            .weight(1.3f)
+                            .heightIn(min = 48.dp)
+                            .testTag("rescan_enrollment_button"),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Re-scan")
+                    }
+                    OutlinedButton(
+                        onClick = onClearEnrollment,
+                        enabled = !scanActive,
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 48.dp)
+                            .testTag("clear_enrollment_button"),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Delete,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Clear", color = MaterialTheme.colorScheme.error)
+                    }
+                }
             }
         }
     }
@@ -998,6 +1209,13 @@ fun CalibrationTargetFullscreenOverlay(
     )
 }
 
+private const val ENROLLMENT_CARD_TITLE = "Face & Eye Enrollment"
+internal const val ENROLLMENT_NOT_ENROLLED_TEXT = "Not enrolled"
+internal const val ENROLLMENT_EXPLANATION_TEXT =
+    "A 15-second scan of your face and eyes personalizes blink and brow detection to you: how open your " +
+        "eyes are at rest and closed, how long your natural blinks last, and where your brows sit. Only " +
+        "those numbers are kept, on this device only. No images are stored, and nothing is synced."
+private const val ENROLLMENT_PRIVACY_TEXT = "Derived numbers only, stored on this device. No images, never synced."
 private const val NOT_CALIBRATED_TEXT = "Not calibrated"
 private const val NOT_MEASURED_TEXT = "Not measured"
 private const val NOT_VALIDATED_TEXT = "Not validated"
