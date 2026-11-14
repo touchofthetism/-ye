@@ -361,3 +361,14 @@ data class EnrollmentBaseline(
     val frameCount: Int,
     val warnings: List<String> = emptyList()
 )
+
+/**
+ * First-run progress of one account (docs/UI_DESIGN.md 1.2, 7.1). Stored locally per account; never synced.
+ * A null timestamp means "has not happened".
+ */
+data class SetupState(
+    val consentAcceptedAtMs: Long? = null,
+    val completedAtMs: Long? = null,
+    val skipped: Boolean = false,
+    val backupChosenAtMs: Long? = null
+)

@@ -92,7 +92,9 @@ data class CalibrationWizardState(
     val draftProfileName: String = "Pixel 10 Pro XL Desk",
     // True only when the validation* metrics come from the 4 held-out targets. In 5-point-only mode
     // they are the in-sample residual on the fit targets themselves and must not be shown as validated.
-    val metricsAreHeldOut: Boolean = false
+    val metricsAreHeldOut: Boolean = false,
+    // True when any sample of this wizard run came from simulated frames (UI_DESIGN.md 7.1).
+    val usedSimulatedFrames: Boolean = false
 )
 
 data class LiveGazeHudState(
@@ -143,7 +145,15 @@ data class LiveGazeHudState(
     val lastTriggeredSpeech: String = "Fixate on any tile and raise brows (400ms), command-blink (350–800ms), or dwell to speak.",
     // When this account's face & eye enrollment baseline was captured (EnrollmentBaseline.capturedAtMs);
     // null while no enrollment is applied, so the blink/brow detectors run on the app defaults or a profile.
-    val enrolledAtMs: Long? = null
+    val enrolledAtMs: Long? = null,
+    // Redesign contract (UI_DESIGN.md 7.1). One enum instead of four separate checks.
+    val gazeInputState: GazeInputState = GazeInputState.NO_FRAMES,
+    // True once the camera host reported that this phone has no front camera.
+    val hasNoFrontCamera: Boolean = false,
+    // The last fired tile, beside the legacy lastTriggeredSpeech string; null until a tile fires.
+    val lastSpoken: LastSpoken? = null,
+    // The live detector windows (natural blink, command blink, brow hold).
+    val selectionTimings: SelectionTimings = SelectionTimings()
 )
 
 data class AttentionSessionLiveState(
