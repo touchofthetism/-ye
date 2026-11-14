@@ -1,6 +1,6 @@
 # Æye redesign: one-page summary for the product owner
 
-Status: proposed design, waiting for your approval. Nothing has been built or changed in the app yet.
+Status: approved on 14 Nov 2026; the product owner handed the open decisions to engineering. Being built now.
 Full specification: `docs/UI_DESIGN.md` (section 10 is written for you; the rest is for the engineers).
 
 ## What changes
@@ -40,8 +40,8 @@ Full specification: `docs/UI_DESIGN.md` (section 10 is written for you; the rest
 
 Frame rate and camera resolution, the camera picture with face markings, eye, head and brightness numbers, the
 pointer's coordinates and heat trail, the simulator and its controls, the posture and filter choices, the built-in
-test run, account identifiers and storage paths, and the technical message log. Developer mode is opened from About
-by tapping the version line seven times and confirming.
+test run, account identifiers and storage paths, and the technical message log. Developer mode is, for now, a plain switch on the About
+page (on by default in test builds).
 
 ## What is removed, and why
 
@@ -57,18 +57,18 @@ by tapping the version line seven times and confirming.
 
 Nothing the app can do is lost. Every one of the 147 existing functions has a new place (section 6 of the spec).
 
-## Questions for you
+## Decisions taken (14 Nov 2026)
 
-1. **Reading needs a helper.** Read is opened from the Menu by touch, and a reading is started and stopped by
-   touch. A user cannot open it by gaze. Is that acceptable, or should the user be able to open Read by looking?
-2. **Wording.** The nine default tile phrases and the three reading texts are our proposals (spec 2.10 and 2.5).
-   Do you approve them, or will you supply your own?
-3. **Recalibrate suggestion.** Today, tapping it starts calibration at once. In the design it opens the Calibrate
-   page, so the helper can get the user into position first. OK?
-4. **Erase everything** now also returns the app to first-time setup, including the privacy page. OK?
-5. **Developer mode** is unlocked by seven taps on the version line, applies to the whole phone and survives
-   "Erase everything". Is that enough protection, or should it need a code?
-6. **Quick calibration** (5 dots, accuracy not checked, never unlocks nine tiles) stays as a secondary button for
-   helpers. Keep it or remove it?
-7. **Sign-in.** A Google account stays required before first use, as today. Please confirm.
-8. **Languages.** English only at first; all texts are prepared for translation. Which languages are needed next?
+The eight open questions were decided by engineering at the owner's request (spec section 11):
+
+1. Reading is opened, started and stopped by touch.
+2. The proposed tile phrases and reading texts are used as written.
+3. The recalibrate suggestion opens the Calibrate page.
+4. "Erase everything" returns to first-time setup.
+5. Developer tools are **not hidden for now**: a plain switch on the About page, on by default in test builds.
+6. Quick calibration stays as a secondary button.
+7. Google sign-in stays required.
+8. English only for now.
+
+New: **Share diagnostics** (About page and Developer page). It creates a file of tracking and calibration numbers and
+opens the phone's share sheet. No pictures, no account details. It is only made when the button is pressed.

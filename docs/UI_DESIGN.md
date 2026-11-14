@@ -1,6 +1,7 @@
 # Æye — UI design specification (final)
 
-Status: proposed design, awaiting the product owner's approval. Nothing here is implemented yet.
+Status: approved by the product owner on 14 Nov 2026 ("take care of the developing side"). The open questions of
+10.1 are resolved in **section 11, which overrides any earlier text it contradicts**. Implementation in progress.
 Ground truth for what exists today: `docs/UI_INVENTORY.md`. Capability numbers such as **#97** refer to the numbered
 list in section 2 of that inventory. No app code was changed to produce this document.
 
@@ -123,10 +124,11 @@ persistent diagnostics bar (**#22–46**, relocated per section 6).
 
 ### 1.6 Developer mode
 
-* **Unlock**: About ▸ tap the **Version** row 7 times (`about_version_row`). Taps 4 to 6 show an inline countdown
-  "3 more taps to turn on developer mode". The 7th tap opens `ConfirmDialog(DeveloperMode)`: "Turn on developer mode?"
-  / "Shows live tracking numbers, the camera picture, simulator controls and engineering settings. Meant for setup and
-  support, not daily use." / **Not now** / **Turn on**.
+* **Unlock (temporary, section 11 decision 5)**: a plain switch "Developer tools" on About (`developer_mode_switch`).
+  No hidden taps, no countdown, no confirmation. The seven-tap unlock described in earlier drafts is postponed until
+  the app leaves the test phase.
+* **Default**: when nothing is stored, developer mode is **on in debug builds** (`BuildConfig.DEBUG`) and off in
+  release builds. A stored choice always wins.
 * **Storage**: device-wide, not per account, never cleared by erase (`LocalTelemetryStore.isDeveloperModeEnabled()`).
   Exposed as `VM.developerModeEnabled`.
 * **When on**: the Menu gains a **Developer** row. The Menu button on Speak carries a "DEV" badge. The developer
@@ -877,13 +879,16 @@ the **user**, not the helper, is the one looking at the screen when the capture 
 
 * App mark 56 dp, headlineMedium "Æye", bodyLarge "Æye follows your eyes with the front camera so you can speak with
   tiles and read hands-free."
-* `SettingRow` "Version" (`about_version_row`), supporting "<versionName> (<versionCode>)". Seven taps → developer mode
-  (1.6). Countdown text `developer_tap_hint_text`.
+* `SettingRow` "Version" (`about_version_row`), supporting "<versionName> (<versionCode>)". Not clickable.
+* `SettingRow` "Share diagnostics" (`about_share_diagnostics_row`), supporting "Sends a file of numbers about tracking
+  and calibration. No pictures, no account details." Always visible (11.2).
+* `SettingRow` with a switch "Developer tools" (`developer_mode_switch`), supporting "Live numbers, camera picture and
+  test tools. For setup and support." (1.6, section 11 decision 5).
 * `SettingRow` "How selection works" → sheet with `selectionTimingSentence(...)` and "Look at a tile for about a second
   to select it. A helper can change the time in Settings."
 * `SettingRow` "Privacy note" → `PrivacyNoteSheet`. `SettingRow` "Open-source licenses" → the licenses activity if
   present, otherwise hidden.
-* Developer mode on: `InlineNotice(info)` "Developer mode is on." with the action "Turn off" (`developer_mode_off_button`).
+* Developer mode on: a `SettingRow` "Open developer tools" (`about_open_developer_row`) → `developer`.
 
 ### 2.16 Developer (`developer`, `ui/developer/`) — only while developer mode is on
 
@@ -1986,6 +1991,8 @@ select), the calibration method, and everything already saved: calibrations, rea
 
 ### 10.1 Decisions we need from you
 
+**All eight are resolved in section 11.**
+
 1. **Reading needs a helper.** Read is opened from the Menu by touch, and a reading is started and stopped by touch.
    A user cannot open it by gaze. Is that acceptable, or should the user be able to open Read by looking?
 2. **Wording.** The nine default tile phrases (2.10) and the three reading texts (2.5) are proposals. Approve them or
@@ -1999,6 +2006,112 @@ select), the calibration method, and everything already saved: calibrations, rea
    helpers. Keep it or remove it?
 7. **Sign-in.** A Google account stays required before first use, as today. Please confirm.
 8. **Languages.** English only at first; all texts are prepared for translation. Which languages are needed next?
+
+---
+
+## 11. Owner decisions (14 Nov 2026) and the diagnostics export
+
+The product owner handed the product decisions to engineering: "take care of the developing side. So make it user
+friendly and the data accessible to you for now". This section records the result. **It overrides any earlier text in
+this document that contradicts it.**
+
+### 11.1 The eight questions of 10.1
+
+| # | Decision |
+|---|---|
+| 1 | Reading is opened, started and stopped by touch (a helper). Accepted as designed. |
+| 2 | The nine tile phrases (2.10) and the three reading texts (2.5) are approved as written. |
+| 3 | The recalibrate suggestion opens the Calibrate page. Accepted. |
+| 4 | "Erase everything" returns the app to first-time setup, including the privacy page. Accepted. |
+| 5 | **Developer mode is not hidden for now.** It is a plain switch on About (`developer_mode_switch`), with no seven taps, no countdown and no confirmation dialog. With nothing stored it is **on in debug builds** (`BuildConfig.DEBUG`) and off in release builds. It stays device-wide and survives "Erase everything". This is temporary: the hidden unlock returns when the test phase ends, so keep the switch logic in one place (`AboutScreen` + `VM.setDeveloperModeEnabled`). `ConfirmDialog(DeveloperMode)` and the "taps left" plural are not built. The `AboutScreenTest` line "Seven taps and a confirmation turn developer mode on" becomes "the switch turns developer mode on and off". |
+| 6 | Quick calibration stays as a secondary button. |
+| 7 | A Google account stays required before first use. |
+| 8 | English only. All end-user text is still a string resource. |
+
+Everything else about developer mode in 1.6 is unchanged: the Menu row, the "DEV" badge, the developer slots, the
+simulator guards of 7.3, and the developer strip (default off).
+
+### 11.2 Share diagnostics (new)
+
+**Why.** The engineer cannot see the phone. The owner must be able to send the app's numbers in one step.
+
+**What it is.** A JSON text file of derived numbers. It is created only when a person presses the button, and it
+leaves the phone only through the Android share sheet, to the destination that person picks. It is never uploaded by
+the app.
+
+**Never in the file:** camera images or frames, face contours, e-mail, display name, UID, cloud paths, tile phrases
+typed by the user, and raw per-frame gaze traces. If the UID string occurs inside any text field, it is replaced by
+`<uid>` before writing.
+
+**Honesty.** A value that was not measured is JSON `null`, never 0. Simulated records keep their "[SIMULATED] "
+prefix and carry `"simulated": true`.
+
+**ViewModel (E2).** `fun buildDiagnosticsReportJson(nowMs: Long = System.currentTimeMillis()): String` on
+`EyeTrackingViewModel`, main thread, no side effects, pretty-printed with 2 spaces (`org.json`). Top-level keys, in
+this order:
+
+| Key | Content |
+|---|---|
+| `schema` | `"aeye-diagnostics/1"` |
+| `generatedAtUtc` | ISO-8601, UTC |
+| `app` | `versionName`, `versionCode`, `buildType` ("debug" or "release") |
+| `device` | `manufacturer`, `model`, `sdkInt`, `isEmulator`, and the gaze frame as the ViewModel knows it (`frameWidthPx`, `frameHeightPx`, physical size in mm when known, otherwise null) |
+| `state` | `gazeInputState`, `simulatorOn`, `developerMode`, `devStrip`, `cameraPermissionGranted`, `hasNoFrontCamera`, the analysis resolution tier, current frame rate, performance mode, low-light / glare / single-eye flags, face detected, eyes open — each taken from the HUD state, null when the HUD has no value |
+| `setup` | `consentAccepted`, `completed`, `skipped`, `backupChosen` (booleans) and their timestamps |
+| `settings` | the interaction settings as stored (dwell time, selection methods, sensitivity, filter mode, posture, cloud backup on/off) and `selectionTimings` |
+| `faceScan` | the enrollment baseline fields, or null |
+| `calibration` | `savedCount`, and for the active profile: `name`, `createdAtMs`, `deviceModel`, `sampleCount`, `meanErrorPct`, `worstAreaErrorPct`, `heldOutValidated`, `tiles` (4 or 9), `simulated`, `matrix` (12 numbers); `active` is null when uncalibrated |
+| `counters` | natural blinks, command blinks, brow raises, tile activations, drift corrections — whatever the ViewModel already counts in this process |
+| `readings` | the 10 newest session summaries: title, start time, duration, estimated words per minute, zone shares, blink counts, `simulated` |
+| `notices` | `noticeHistory` (at most 50): `atMs`, `key`, `technicalText` |
+
+Field names inside each object follow the existing Kotlin property names. Adding a key later is allowed; removing or
+renaming one needs a new `schema` value.
+
+**Sharing (E6, `ui/developer/DiagnosticsShare.kt`).**
+
+* `fun writeDiagnosticsFile(context: Context, json: String, nowMs: Long): File` writes
+  `cacheDir/diagnostics/aeye-diagnostics-<yyyyMMdd-HHmmss>.json` (UTC, `Locale.US`) and deletes every older file in
+  that directory.
+* `fun buildDiagnosticsShareIntent(context: Context, file: File): Intent` returns an `ACTION_SEND` chooser, type
+  `application/json`, `EXTRA_STREAM` = `FileProvider.getUriForFile(context, "${context.packageName}.diagnostics", file)`,
+  `EXTRA_SUBJECT` "Æye diagnostics", with `FLAG_GRANT_READ_URI_PERMISSION` and a matching `ClipData`.
+* `fun shareDiagnostics(context: Context, json: String)` does both and starts the chooser. If anything throws
+  (no app can receive it, provider missing), it copies the JSON to the clipboard and returns `false`; the caller then
+  shows the inline text "Copied to the clipboard instead."
+* E2 adds the `<provider>` (`androidx.core.content.FileProvider`, authority `${applicationId}.diagnostics`, not
+  exported, `grantUriPermissions="true"`) to `AndroidManifest.xml` and `res/xml/diagnostics_paths.xml`
+  (`<cache-path name="diagnostics" path="diagnostics/"/>`). The cache directory is not part of any backup.
+
+**Where the button is.**
+
+* About: `about_share_diagnostics_row` (2.15), always visible, so a helper can send a report without developer mode.
+* Developer: a first panel **Diagnostics report**, above "Live status": `share_diagnostics_button` "Share diagnostics",
+  `copy_diagnostics_button` "Copy", and one line "Numbers only. No pictures, no account details."
+* The privacy note (2.2.2) gains one sentence: "If you press Share diagnostics, Æye creates a file of tracking and
+  calibration numbers and hands it to the app you choose. It contains no pictures and no account details."
+
+**Tests.** `DiagnosticsReportTest` (E2): the text parses as JSON; `schema`; key order of the table; unmeasured values
+are null with a fresh ViewModel; a simulated calibration is flagged; the UID and e-mail never occur; notices are
+capped at 50. `DiagnosticsShareTest` (E6): the file is written under `cache/diagnostics`, older files are removed,
+the intent is `ACTION_SEND` with the stream, the type and the grant flag; the fallback copies to the clipboard.
+`ActivityRegressionTest` (E2) also pins that the provider is not exported.
+
+### 11.3 Engineering split used for the build
+
+The six owners of 9.1 are kept. E1 and E2 are split in time so that contracts exist before screens are written:
+
+| Stage | Agent | Files |
+|---|---|---|
+| A | E1 | Everything in the E1 row of 9.1. |
+| A | E2-contract | `ui/viewmodel/UiContracts.kt`, `EyeTrackingViewModel.kt` (section 7 and 11.2), `GazeModels.kt`, `LocalTelemetryStore.kt`, `ui/navigation/AppRoutes.kt`, `AndroidManifest.xml` + `res/xml/diagnostics_paths.xml`, the `content_*` strings in `strings_shell.xml`, and the ViewModel/store tests of the E2 row plus `VmContractTest`, `NoticeMappingTest`, `AppRoutesTest`, `DiagnosticsReportTest`. |
+| B | E2-shell | `ui/shell/*`, `ui/camera/*`, `NavigationTest`, `CameraPipelineHostTest`, `MenuScreenTest`. Adds `menu_*` strings to `strings_shell.xml`. |
+| B | E2-setup | `ui/auth/*`, `ui/setup/*`, `SignInScreenTest`, `SetupFlowTest`. Its strings go to a file of its own, `res/values/strings_setup.xml` (`signin_*`, `setup_*`, `consent_*`). |
+| B | E3, E4, E5, E6 | As in 9.1. E6 also owns `ui/developer/DiagnosticsShare.kt` and `DiagnosticsShareTest`. |
+| C | Integration | `MainActivity.kt`, deletion of the eight legacy files, the Activity and Auth test classes of the E2 row, `FROZEN_USED_STRINGS`, and whatever is needed across files to make the whole tree build and pass. |
+
+Until stage C the old app must keep compiling: nobody removes an existing string, colour or public function that a
+legacy file still uses.
 
 ---
 
